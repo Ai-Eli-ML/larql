@@ -139,9 +139,9 @@ pub fn estimate_ffn_covariance(
     let ffn_dim = first.shape()[1];
 
     // Accumulator — K^T K across all sampled token positions.
-    // Float64 would be safer but Array2<f32> suffices at our scales
-    // (we'll round to f32 when writing to disk anyway).
-    let mut ktk = Array2::<f32>::zeros((ffn_dim, ffn_dim));
+    // f64 is required: f32 catastrophically cancels on Gemma 4 (ffn_dim=2112,
+    // activations ~10^3) producing fake negative diagonals that break Cholesky.
+    let mut ktk = Array2::<f64>::zeros((ffn_dim, ffn_dim));
     let mut total_samples: usize = 0;
 
     // Re-process the first capture so we don't double-count it.
@@ -149,12 +149,12 @@ pub fn estimate_ffn_covariance(
     // with itself, summed across rows.
     for row in first.rows() {
         for i in 0..ffn_dim {
-            let vi = row[i];
+            let vi = row[i] as f64;
             if vi == 0.0 {
                 continue;
             }
             for j in 0..ffn_dim {
-                ktk[[i, j]] += vi * row[j];
+                ktk[[i, j]] += vi * (row[j] as f64);
             }
         }
         total_samples += 1;
@@ -170,12 +170,12 @@ pub fn estimate_ffn_covariance(
         let Some(k) = capture_ffn_activation_matrix(weights, tokens, layer) else { continue };
         for row in k.rows() {
             for i in 0..ffn_dim {
-                let vi = row[i];
+                let vi = row[i] as f64;
                 if vi == 0.0 {
                     continue;
                 }
                 for j in 0..ffn_dim {
-                    ktk[[i, j]] += vi * row[j];
+                    ktk[[i, j]] += vi * (row[j] as f64);
                 }
             }
             total_samples += 1;
@@ -186,10 +186,11 @@ pub fn estimate_ffn_covariance(
         return None;
     }
 
-    // C = (K^T K) / N
-    let scale = 1.0 / total_samples as f32;
+    // C = (K^T K) / N, then downcast to f32 at the boundary.
+    let scale = 1.0_f64 / total_samples as f64;
     ktk.mapv_inplace(|v| v * scale);
-    Some((ktk, total_samples))
+    let ktk_f32 = ktk.mapv(|v| v as f32);
+    Some((ktk_f32, total_samples))
 }
 
 /// Run a forward pass and capture both residuals and sparse activations.

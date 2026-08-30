@@ -447,9 +447,14 @@ impl Session {
             let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
                 .map_err(|e| LqlError::exec("failed to load tokenizer", e))?;
 
-            // MEMIT parameters — validated in Python reference
-            // (experiments/15_v11_model/RESULTS.md §20).
-            let ridge = 0.1;
+            // MEMIT parameters — bumped from 0.1 to 10.0 on 2026-04-21 because
+            // Gemma 4 26B-A4B's covariance estimator produces non-PSD matrices
+            // at ridge=0.1 (Cholesky fails with negative diagonal entries).
+            // Higher ridge is numerically stable at cost of slightly softer edits.
+            // Original value from Python reference (RESULTS.md §20) was 0.1 —
+            // validated on older architectures. Gemma 4's activation statistics
+            // need more regularization.
+            let ridge = 10.0;
             let target_alpha = 5.0;
 
             out.push(format!(
@@ -971,36 +976,43 @@ fn collect_memit_facts(
 
     for patch in &patched.patches {
         for op in &patch.operations {
-            if let larql_vindex::PatchOp::Insert { layer, entity, relation, target, .. } = op {
-                let rel_str = relation.as_deref().unwrap_or("relation");
-                let key = (entity.clone(), rel_str.to_string(), target.clone(), *layer);
-                if !seen.insert(key) {
-                    continue; // deduplicate
+            // Extract (layer, entity, relation, target) from Insert OR InsertKnn.
+            // Architecture B records INSERT as PatchOp::InsertKnn; previously
+            // collect_memit_facts only matched the older Architecture A variant,
+            // so COMPILE INTO MODEL became a no-op on any real session patch.
+            let (layer, entity, relation, target) = match op {
+                larql_vindex::PatchOp::Insert { layer, entity, relation, target, .. } => {
+                    let rel = relation.clone().unwrap_or_else(|| "relation".to_string());
+                    (*layer, entity.clone(), rel, target.clone())
                 }
+                larql_vindex::PatchOp::InsertKnn { layer, entity, relation, target, .. } => {
+                    (*layer, entity.clone(), relation.clone(), target.clone())
+                }
+                _ => continue,
+            };
 
-                let rel_words = rel_str.replace(['-', '_'], " ");
-                let prompt = format!("The {rel_words} of {entity} is");
-                let encoding = tokenizer.encode(prompt.as_str(), true)
-                    .map_err(|e| crate::error::LqlError::exec("tokenize MEMIT prompt", e))?;
-                let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
-
-                // Target: first token of " " + target (matches INSERT semantics)
-                let spaced = format!(" {target}");
-                let target_encoding = tokenizer.encode(spaced.as_str(), false)
-                    .map_err(|e| crate::error::LqlError::exec("tokenize MEMIT target", e))?;
-                let target_token_id = target_encoding
-                    .get_ids()
-                    .first()
-                    .copied()
-                    .unwrap_or(0);
-
-                facts.push(larql_inference::MemitFact {
-                    prompt_tokens,
-                    target_token_id,
-                    layer: *layer,
-                    label: format!("{entity} → {target} (L{layer})"),
-                });
+            let key = (entity.clone(), relation.clone(), target.clone(), layer);
+            if !seen.insert(key) {
+                continue;
             }
+
+            let rel_words = relation.replace(['-', '_'], " ");
+            let prompt = format!("The {rel_words} of {entity} is");
+            let encoding = tokenizer.encode(prompt.as_str(), true)
+                .map_err(|e| crate::error::LqlError::exec("tokenize MEMIT prompt", e))?;
+            let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+            let spaced = format!(" {target}");
+            let target_encoding = tokenizer.encode(spaced.as_str(), false)
+                .map_err(|e| crate::error::LqlError::exec("tokenize MEMIT target", e))?;
+            let target_token_id = target_encoding.get_ids().first().copied().unwrap_or(0);
+
+            facts.push(larql_inference::MemitFact {
+                prompt_tokens,
+                target_token_id,
+                layer,
+                label: format!("{entity} → {target} (L{layer})"),
+            });
         }
     }
 
