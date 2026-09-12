@@ -135,7 +135,7 @@ one about another experiment is refused rather than recorded.
 > refusal promises to provide.
 
 **Scope.** OPTIMIZER refusals — the refusal types on the actuation and
-protocol path named below. This is not a claim that every `Display` in LARQL is
+protocol and ingestion paths named below. This is not a claim that every `Display` in LARQL is
 normative: an internal diagnostic must not be pulled into a scientific-
 interface guarantee it was never designed to carry. A refusal enters this
 contract when it is part of the optimizer's answer to an operator or an agent.
@@ -159,21 +159,32 @@ message must say.
 | positive | `wrapping_a_refusal_keeps_the_inner_ones_message` — same file |
 | qualified by | PR #463 |
 
+OPT-6 extends the same refusal obligation to ingestion, with an exhaustive
+`must_say` match. Its admission and write-closure witnesses also pin the boundary
+between an independently valid artifact and evidence for an authorised experiment.
+
+| | |
+|---|---|
+| positive | `every_ingestion_refusal_preserves_its_actionable_authority` — `crates/larql-vindex/src/format/vindex3/represent/ingest/tests.rs` |
+| negative | `valid_y_is_established_then_refused_for_requested_x_without_any_scientific_change` — same file |
+| negative | `freshly_sealed_incomplete_run_with_correct_positions_and_gate_refuses` — same file |
+| negative | `each_missing_run_validity_obligation_refuses_transactionally` — same file |
+| negative | `conflicting_duplicate_preserves_both_observations_and_all_facts` — same file |
+| closure | `every_production_recording_call_has_an_exact_registered_owner` — `crates/larql-vindex/tests/ingestion_closure.rs` |
+| control | `scanner_detects_new_owners_aliases_and_macro_calls_but_excludes_test_only_code` — same file |
+
 ---
 
 ## What this index does not yet cover
 
 Stated so absence is a fact rather than an oversight.
 
-- **Ingestion.** Nothing here governs how an observation becomes part of
-  `SearchFacts`. That is OPT-6, which inherits contract 5 rather than
-  reinventing it for a nastier set of refusals — stale artifact, conflicting
-  duplicate observation, wrong protocol identity, candidate bytes that cannot
-  establish the state they claim to measure.
-- **The candidate's bytes.** Contract 1 establishes that a request names the
-  state the optimiser selected. It does NOT establish that a compiled overlay
-  presents it: a locator resolves one by state id and verifies nothing about
-  its contents (ACT1-N3).
+- **Closed-loop learning.** OPT-6 validates and commits an observation;
+  REPRESENT-LOOP-1 Transition C must separately demonstrate the predetermined
+  change in future selection after acceptance.
+- **Numerical execution truth.** Candidate and bank readers establish persisted
+  input authority. Ingestion does not independently reproduce the numerical
+  observation or certify an executor's runtime pointer/attribution reports.
 - **A second real procedure.** Contract 4's dispatch is witnessed with stub
   procedures. ACT1-N5 stays open: no semantic relationship between an
   instrument's declared procedure and an execution procedure is claimed.
