@@ -3,7 +3,7 @@
   "base": "222033cc677ecd0e8f4cca237483c2a280801b64 (#474 merged after all non-informational checks passed)",
   "branch": "represent-opt-6-ingestion",
   "date": "2026-09-12",
-  "status": "implementation and local validation complete; awaiting Transition B review and CI; not merged",
+  "status": "Transition B complete; reviewed and merged as #475 / 2a5e0d6963833d89ddd3159e1f28f2bbbab13ef2 after all normal CI workflows passed on 044b0aed. Informational mutants were pending at merge.",
   "claim": "Only deterministic ingestion can admit a newly executed observation into the measurement registry. Valid candidate Y is independently established before refusal as evidence for authorised X.",
   "architecture": {
     "capture": "ArtifactStateEvidence::establish(path) uses the public cold candidate reader. Capture its verified binding with execution and pass it alongside PreparedExperiment and Observed to MeasurementArtifact::from_execution. The immutable artifact seals the candidate binding as well as the original request/observation fields. This is the widening preregistered in OPT6-N2, not another state identity input.",
