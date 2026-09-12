@@ -1,6 +1,6 @@
 {
   "programme": "REPRESENT-LOOP-1 \u2014 independently established evidence changes future search",
-  "status": "Transition A merged; Transition B resumed; Transition C pending",
+  "status": "Transition A merged; Transition B implemented and locally validated, awaiting review and CI; Transition C pending",
   "base": "eadc43a88f5b3252e8bfe4bb463f7c7845b42a29",
   "date": "2026-09-12",
   "claim": "Accepted evidence changes future search behaviour; rejected evidence cannot.",
@@ -23,7 +23,8 @@
       "programme": "OPT-6",
       "depends_on": "A",
       "scope": "Resume the paused ingestion implementation and its existing frozen arms, consuming candidate authority earned in A.",
-      "acceptance": "A valid Y artifact independently establishes Y when requested X and the executor restates X; ingestion refuses naming both. All scientific-state inputs remain observably identical after rejection, including measurements, graph, ranking/promotion inputs and resulting snapshot/search identity. Duplicate acceptance changes facts only once."
+      "acceptance": "A valid Y artifact independently establishes Y when requested X and the executor restates X; ingestion refuses naming both. All scientific-state inputs remain observably identical after rejection, including measurements, graph, ranking/promotion inputs and resulting snapshot/search identity. Duplicate acceptance changes facts only once.",
+      "progress": "Implemented on represent-opt-6-ingestion with notes in opt-6-ingestion-notes.json; locally validated; not merged or marked complete."
     },
     {
       "id": "C",
