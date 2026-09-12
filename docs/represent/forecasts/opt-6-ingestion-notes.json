@@ -7,7 +7,7 @@
   "claim": "Only deterministic ingestion can admit a newly executed observation into the measurement registry. Valid candidate Y is independently established before refusal as evidence for authorised X.",
   "architecture": {
     "capture": "ArtifactStateEvidence::establish(path) uses the public cold candidate reader. Capture its verified binding with execution and pass it alongside PreparedExperiment and Observed to MeasurementArtifact::from_execution. The immutable artifact seals the candidate binding as well as the original request/observation fields. This is the widening preregistered in OPT6-N2, not another state identity input.",
-    "validate": "validate and ingest reopen persisted source, candidate and corpus inputs. They check the request and artifact keys, self-check protocol declarations, resolve the declared procedure and gate, compare source and candidate authority, verify bank manifest and payloads, and check observation shape and reported position/gate consistency. Candidate reading receives no requested state.",
+    "validate": "validate and ingest require the existing VerifiedFacts::complete contract after checking the artifact seal, then reopen persisted source, candidate and corpus inputs. They check the request and artifact keys, self-check protocol declarations, resolve the declared procedure and gate, compare source and candidate authority, verify bank manifest and payloads, and check observation shape and reported position/gate consistency. Candidate reading receives no requested state. Completeness is necessary; it does not independently prove the executor's historical checks.",
     "commit": "ingest validates before cloning facts, then records into the cloned registry. Only a successful new record replaces the snapshot. All other scientific facts and configuration remain identical. Identical observations are idempotent, including after selection has changed; conflicts preserve the prior snapshot and return typed key/expected/observed evidence.",
     "boundary": "AcceptedMeasurement has private fields and no Deserialize implementation. Production MeasurementRegistry::record requires this token and is scoped to REPRESENT. Raw record_fixture is compiled only for tests/test-utils. Snapshot restoration remains the existing authoritative scientific-state loading path; MeasurementArtifact deserialization grants no acceptance.",
     "closure": "tests/ingestion_closure.rs parses every non-test Rust source under crates/*/src, including other platforms. The exact file/function/call census also registers unrelated record methods so aliases cannot evade the scan by changing receiver names. Its positive control finds the actual ingestion call; hostile controls detect new owners, associated-function references and macro calls. Rust type/visibility restrictions independently prevent raw registry writes."
@@ -38,6 +38,14 @@
     "repair": "Ingestion reuses inspect_container(source, true) to verify baseline segment bytes against their declared seals, in addition to comparing independently read source semantic identity. Incoherence refuses before any scientific writes and reports the expected/observed segment hashes.",
     "boundary": "This adds physical verification of existing authority, not a new source identity input or canonicalization version. It does not repair the separately registered moe_manifest-content limitation."
   },
+  "run_completeness_finding": {
+    "freeze": "OPT6-N5 in opt-6-ingestion.json, committed as f583fc69 before the repair",
+    "pre_fix": "freshly_sealed_incomplete_run_with_correct_positions_and_gate_refuses failed: a normal from_execution artifact with a valid fresh seal, correct positions and correct gate but otherwise default VerifiedFacts was accepted. Saved locally in /private/tmp/larql-opt6-n5-before.log. The earlier happy-path fixture also omitted these obligations; its acceptance was insufficient evidence for run validity.",
+    "repair": "Ingestion calls the unchanged VerifiedFacts::complete predicate. IncompleteRun is a typed refusal naming missing compiled layers/projections, attribution coverage, seal/read witness, invariant neighbour, positions and/or gate, and retaining the full observed report. Independent candidate, source and bank authority checks remain necessary after completeness passes.",
+    "positive": "The tiny fixture now compiles only layer 0, checks that its effective compiled decisions contain seven tensors in that layer, and retains layer 1 as the invariant neighbour. Its synthetic complete report names those seven projections, layer 0 attribution and seven seal checks. Accepted-once/idempotent replay explicitly requires a complete report.",
+    "hostile_controls": "A freshly sealed positions/gate-only report refuses and names all omitted check categories. A table independently removes every complete() obligation, exercises partial attribution coverage and an all-default report, verifies the typed refusal preserves the original report, and compares the complete snapshot, serialization, next selection, frontier and promotion output after every rejection. The exhaustive refusal-rendering test includes IncompleteRun.",
+    "limit": "This enforces the existing run-validity report contract. It neither replays numerical execution nor independently attests historical pointer checks. General candidate-decision to reported layer/projection scope reconciliation is not implemented by this repair."
+  },
   "limits": [
     "This validates experiment identity and persisted input integrity. It does not independently reproduce the numerical observation or turn executor-reported runtime pointer/attribution checks into independent facts; those reports are not used as identity authority.",
     "Accepted evidence is an observation, not a passing gate result or promotion. The existing gate/ranking/promotion code interprets it downstream.",
@@ -47,13 +55,13 @@
   ],
   "validation": {
     "toolchain": "pinned Rust 1.98.0, macOS default features",
-    "vindex_suite": "cargo llvm-cov --package larql-vindex: 5086 passed, 0 failed, 7 ignored across 40 test suites; includes the 25 ingestion tests and 2 whole-estate closure controls",
+    "vindex_suite": "After OPT6-N5: cargo llvm-cov --package larql-vindex: 5088 passed, 0 failed, 7 ignored across 40 test suites; includes the 27 ingestion tests and 2 whole-estate closure controls",
     "coverage": "93.75% lines; coverage policy passes for all 470 checked files, with no new exemptions or changed debt baselines",
     "clippy": "cargo clippy -p larql-vindex --all-targets -- -D warnings passed",
     "workspace": "cargo check --workspace --all-targets passed; inherited block 0.1.6 future-incompatibility warning remains",
     "doctests": "cargo test -p larql-vindex --doc: AcceptedMeasurement deserialization compile-fail control passed; 1 unrelated existing doctest ignored",
-    "python": "2 standard-library tests of the exporter sealing helper passed; no model/PyTorch execution",
-    "documentation": "fmt-check and git diff --check passed; 102 contract witnesses resolve; 863 relative links resolve; 1447 strict documentation references checked with no broken references",
+    "python": "Exporter unchanged by OPT6-N5; its 2 standard-library sealing-helper tests passed in the preceding B validation; no model/PyTorch execution",
+    "documentation": "fmt-check and git diff --check passed; 104 contract witnesses resolve; 863 relative links resolve; 1447 strict documentation references checked with no broken references",
     "identity_boundary": "No diff to RepresentationState identity, SourceSemanticIdentity canonicalization or EvidenceBank identity implementations",
     "scope": "Local checks, not a claim that remote CI passed or that Transition C/K3 ran"
   }
