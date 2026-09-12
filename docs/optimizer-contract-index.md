@@ -179,12 +179,20 @@ between an independently valid artifact and evidence for an authorised experimen
 
 Stated so absence is a fact rather than an oversight.
 
-- **Closed-loop learning.** OPT-6 validates and commits an observation;
-  REPRESENT-LOOP-1 Transition C must separately demonstrate the predetermined
-  change in future selection after acceptance.
+- **Quality-driven improvement at scale.** Transition C's paired witness below
+  demonstrates changed selection after accepting an experiment, through the
+  existing `AlreadyObserved` rule. It does not claim quality-driven promotion
+  or a K3 optimisation result.
 - **Numerical execution truth.** Candidate and bank readers establish persisted
   input authority. Ingestion does not independently reproduce the numerical
   observation or certify an executor's runtime pointer/attribution reports.
 - **A second real procedure.** Contract 4's dispatch is witnessed with stub
   procedures. ACT1-N5 stays open: no semantic relationship between an
   instrument's declared procedure and an execution procedure is claimed.
+
+The Transition C composition claim includes both accepted and rejected evidence
+in one witness. Its expected successor is fixed before dispatch or ingestion.
+
+| | |
+|---|---|
+| paired witness | `accepted_evidence_changes_future_selection_and_rejected_evidence_cannot` — `crates/larql-vindex/src/format/vindex3/represent/ingest/loop_tests.rs` |

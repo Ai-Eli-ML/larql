@@ -1,6 +1,6 @@
 {
   "programme": "REPRESENT-LOOP-1 \u2014 independently established evidence changes future search",
-  "status": "Transitions A and B complete and merged; Transition C witness frozen before implementation",
+  "status": "Transitions A and B complete and merged; Transition C paired witness passes locally, awaiting review and CI",
   "base": "eadc43a88f5b3252e8bfe4bb463f7c7845b42a29",
   "date": "2026-09-12",
   "claim": "Accepted evidence changes future search behaviour; rejected evidence cannot.",
@@ -40,7 +40,8 @@
       "negative": "The same S0 selects A; plausible wrong or invalid evidence is refused; all scientific facts remain equivalent to S0 and the next experiment remains A.",
       "failure": "Appending an observation without a demonstrated effect on future selection does not establish the claim.",
       "forecast": "represent-loop-1-c.json",
-      "base": "2a5e0d6963833d89ddd3159e1f28f2bbbab13ef2"
+      "base": "2a5e0d6963833d89ddd3159e1f28f2bbbab13ef2",
+      "progress": "Paired acceptance/refusal witness implemented and locally validated; see represent-loop-1-c-notes.json. Not merged or marked complete."
     }
   ],
   "sequencing": "Separate reviewable transitions A, B and C, each verified before its successor. Use a fresh worktree from the stated base; do not rebase the unrelated experimental checkout. K3 follows all three gates.",
