@@ -1,6 +1,6 @@
 {
   "programme": "REPRESENT-LOOP-1 \u2014 independently established evidence changes future search",
-  "status": "Transition A merged; Transition B implemented and locally validated, awaiting review and CI; Transition C pending",
+  "status": "Transitions A and B complete and merged; Transition C paired witness passes locally, awaiting review and CI",
   "base": "eadc43a88f5b3252e8bfe4bb463f7c7845b42a29",
   "date": "2026-09-12",
   "claim": "Accepted evidence changes future search behaviour; rejected evidence cannot.",
@@ -24,7 +24,12 @@
       "depends_on": "A",
       "scope": "Resume the paused ingestion implementation and its existing frozen arms, consuming candidate authority earned in A.",
       "acceptance": "A valid Y artifact independently establishes Y when requested X and the executor restates X; ingestion refuses naming both. All scientific-state inputs remain observably identical after rejection, including measurements, graph, ranking/promotion inputs and resulting snapshot/search identity. Duplicate acceptance changes facts only once.",
-      "progress": "Implemented on represent-opt-6-ingestion with notes in opt-6-ingestion-notes.json; locally validated; not merged or marked complete."
+      "completion": {
+        "status": "complete",
+        "pr": 475,
+        "merge_commit": "2a5e0d6963833d89ddd3159e1f28f2bbbab13ef2",
+        "ci": "All normal workflows green on reviewed 044b0aede72b80b013cf4cb74b425c5679bada93; informational mutants still pending at merge."
+      }
     },
     {
       "id": "C",
@@ -33,11 +38,19 @@
       "scope": "A tiny deterministic fixture with two or three possible transitions, exercised through selection, actuation, independent verification and ingestion.",
       "positive": "S0 selects A; valid observation of A is accepted; SearchFacts changes once; S1 selects predetermined B.",
       "negative": "The same S0 selects A; plausible wrong or invalid evidence is refused; all scientific facts remain equivalent to S0 and the next experiment remains A.",
-      "failure": "Appending an observation without a demonstrated effect on future selection does not establish the claim."
+      "failure": "Appending an observation without a demonstrated effect on future selection does not establish the claim.",
+      "forecast": "represent-loop-1-c.json",
+      "base": "2a5e0d6963833d89ddd3159e1f28f2bbbab13ef2",
+      "progress": "Paired acceptance/refusal witness implemented and locally validated; see represent-loop-1-c-notes.json. Not merged or marked complete."
     }
   ],
   "sequencing": "Separate reviewable transitions A, B and C, each verified before its successor. Use a fresh worktree from the stated base; do not rebase the unrelated experimental checkout. K3 follows all three gates.",
   "parallel_debts": [
+    {
+      "id": "EXECUTION-EVIDENCE-SCOPE-1",
+      "scope": "Reconcile reported compiled scope and attribution membership with independent candidate decisions before real K3 authority measurements; see execution-evidence-scope-1.json.",
+      "blocks_loop": false
+    },
     {
       "id": "LOWERING-AUTHORITY-2",
       "scope": "Shared/exported gate-policy judgement",
