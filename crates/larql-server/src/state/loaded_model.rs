@@ -74,6 +74,18 @@ pub struct LoadedModel {
     /// once `weights` is populated, callers skip the mutex via the
     /// fast-path `OnceLock::get` check.
     pub weights_init: std::sync::Mutex<()>,
+    /// BitNet 1.58 model with native ternary weights.  Populated
+    /// when the loaded vindex was built with `--keep-quant`
+    /// (i.e. `config.bitnet_layout.is_some()`).  When present, the
+    /// route handlers prefer this over `weights` for inference
+    /// because the native-ternary path runs the full forward at
+    /// ~1.4 GB instead of ~5 GB resident.  Eager-loaded by
+    /// `force_load_bitnet_model` from `bootstrap::serve` (unless
+    /// `--lazy-weights`).
+    pub bitnet_model: std::sync::OnceLock<std::sync::RwLock<larql_inference::ternary::BitnetModel>>,
+    /// Init guard for the bitnet model load — same pattern as
+    /// `weights_init` but for the ternary path.
+    pub bitnet_init: std::sync::Mutex<()>,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
@@ -169,6 +181,71 @@ impl LoadedModel {
             return Ok(());
         }
         self.ensure_weights_cell().map(|_| ())
+    }
+
+    /// Whether this vindex was built with `--keep-quant` and
+    /// therefore has the BitNet 1.58 native-ternary artifacts
+    /// (`bitnet/` + `bitnet_layout` in index.json).  Route handlers
+    /// dispatch on this to pick the ternary forward path.
+    pub fn is_bitnet(&self) -> bool {
+        self.config.bitnet_layout.is_some()
+    }
+
+    /// Whether this vindex was built `--dense-only`: it has the
+    /// dense weights + BitNet I2_S artifacts but NO gate vectors /
+    /// HNSW clustering, so walk-mode inference cannot run against
+    /// it (the KNN store is empty).  Detected by an empty gate-layer
+    /// list in index.json (`build_vindex_dense_only` leaves
+    /// `layer_infos` empty).  Route handlers force dense-mode
+    /// inference on such vindexes regardless of the requested mode,
+    /// since walk would silently return nothing useful.
+    pub fn is_dense_only(&self) -> bool {
+        self.config.layers.is_empty()
+    }
+
+    /// Get a read guard on the lazy-loaded BitNet model.  Returns
+    /// `Err` when the vindex isn't a BitNet (callers should check
+    /// `is_bitnet()` first).
+    pub fn get_or_load_bitnet(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, larql_inference::ternary::BitnetModel>, String> {
+        let cell = self.ensure_bitnet_cell()?;
+        cell.read()
+            .map_err(|e| format!("bitnet RwLock poisoned: {e}"))
+    }
+
+    /// Eager-load the BitNet model from disk before the listener
+    /// binds.  Mirrors `force_load_weights` but for the ternary
+    /// path; called by `bootstrap::serve` when the vindex is
+    /// BitNet-shaped and `--lazy-weights` was not passed.
+    pub fn force_load_bitnet_model(&self) -> Result<(), String> {
+        if self.infer_disabled || !self.is_bitnet() {
+            return Ok(());
+        }
+        self.ensure_bitnet_cell().map(|_| ())
+    }
+
+    fn ensure_bitnet_cell(
+        &self,
+    ) -> Result<&std::sync::RwLock<larql_inference::ternary::BitnetModel>, String> {
+        // Fast path.
+        if let Some(cell) = self.bitnet_model.get() {
+            return Ok(cell);
+        }
+        // Single-flight slow path.
+        let _init_guard = self.bitnet_init.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cell) = self.bitnet_model.get() {
+            return Ok(cell);
+        }
+        if !self.is_bitnet() {
+            return Err("vindex has no bitnet_layout (not a --keep-quant build)".into());
+        }
+        let model = larql_inference::ternary::load_bitnet_model(&self.path)
+            .map_err(|e| format!("failed to load bitnet model: {e}"))?;
+        let _ = self.bitnet_model.set(std::sync::RwLock::new(model));
+        self.bitnet_model
+            .get()
+            .ok_or_else(|| "bitnet cell unset after set".to_string())
     }
 
     /// Acquire an exclusive write guard on the loaded weights.
@@ -343,6 +420,8 @@ mod loaded_model_tests {
             release_mmap_after_request: release_mmap,
             weights: std::sync::OnceLock::new(),
             weights_init: std::sync::Mutex::new(()),
+            bitnet_model: std::sync::OnceLock::new(),
+            bitnet_init: std::sync::Mutex::new(()),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
@@ -390,6 +469,58 @@ mod loaded_model_tests {
         assert!(
             f32_model.config.quant != QuantFormat::Q4K,
             "None config → f32 branch (load_model_weights_with_opts + WalkFfn::new_unlimited)"
+        );
+    }
+
+    #[test]
+    fn is_dense_only_detects_empty_gate_layers() {
+        // A normal vindex has gate layers -> not dense-only.
+        let normal = tiny_loaded_model(QuantFormat::None, false);
+        assert!(
+            !normal.is_dense_only(),
+            "vindex with gate layers must not be dense-only"
+        );
+        assert!(
+            !normal.is_bitnet(),
+            "and a plain vindex carries no bitnet_layout"
+        );
+
+        // A --dense-only BitNet vindex has zero gate layers.  Build
+        // one by emptying the layer list + setting bitnet_layout.
+        let mut cfg = tiny_config(QuantFormat::None);
+        cfg.layers = Vec::new();
+        cfg.bitnet_layout = Some(larql_vindex::config::BitnetLayout::default());
+        let mut dense_only = tiny_loaded_model(QuantFormat::None, false);
+        dense_only.config = cfg;
+        assert!(
+            dense_only.is_dense_only(),
+            "dense-only vindex (empty gate layers) must be detected"
+        );
+        assert!(dense_only.is_bitnet(), "and it is a BitNet vindex");
+    }
+
+    #[test]
+    fn bitnet_model_not_loaded_by_default() {
+        // Same lazy-load contract as `weights`: the ternary cell stays
+        // empty until `get_or_load_bitnet`, and `force_load_bitnet_model`
+        // is a no-op on a vindex that is not BitNet-shaped (rather than
+        // an error), so `bootstrap::serve` can call it unconditionally.
+        let model = tiny_loaded_model(QuantFormat::None, false);
+        assert!(
+            model.bitnet_model.get().is_none(),
+            "bitnet cell must start empty"
+        );
+        assert!(
+            model.force_load_bitnet_model().is_ok(),
+            "force_load_bitnet_model must no-op on a non-BitNet vindex"
+        );
+        assert!(
+            model.bitnet_model.get().is_none(),
+            "and must not populate the cell"
+        );
+        assert!(
+            model.get_or_load_bitnet().is_err(),
+            "explicitly asking for a bitnet model on a dense vindex is an error"
         );
     }
 
