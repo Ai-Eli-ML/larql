@@ -540,6 +540,46 @@ mod loaded_model_tests {
     }
 
     #[test]
+    fn bitnet_load_failure_names_the_container() {
+        // A container that *claims* to be BitNet (bitnet_layout present)
+        // but has no `bitnet/` artifacts on disk must fail with the load
+        // error, not the "not a --keep-quant build" refusal: the two are
+        // different operator problems. The first says "this vindex is the
+        // wrong kind", the second says "this vindex is the right kind and
+        // is broken/incomplete", and reporting the wrong one sends the
+        // operator to rebuild a container that only needs its files back.
+        //
+        // Reachable without any weights: the fixture's path points at no
+        // bitnet/ directory, which is exactly the on-disk state of a
+        // truncated or partially-copied container.
+        let mut cfg = tiny_config(QuantFormat::None);
+        cfg.bitnet_layout = Some(larql_vindex::config::BitnetLayout::default());
+        let mut model = tiny_loaded_model(QuantFormat::None, false);
+        model.config = cfg;
+        assert!(model.is_bitnet(), "fixture must be BitNet-shaped");
+
+        let Err(err) = model.get_or_load_bitnet() else {
+            unreachable!("there are no bitnet/ artifacts to load")
+        };
+        assert!(
+            err.contains("failed to load bitnet model"),
+            "a BitNet-shaped container with missing artifacts must report a \
+             load failure, not the wrong-kind refusal, got: {err}"
+        );
+        assert!(
+            !err.contains("not a --keep-quant build"),
+            "must not claim the container is the wrong kind: {err}"
+        );
+        // A failed load must leave the cell empty so a later attempt (after
+        // the operator restores the files) still tries, rather than caching
+        // the failure for the process lifetime.
+        assert!(
+            model.bitnet_model.get().is_none(),
+            "a failed load must not poison the cell"
+        );
+    }
+
+    #[test]
     fn bitnet_model_not_loaded_by_default() {
         // Same lazy-load contract as `weights`: the ternary cell stays
         // empty until `get_or_load_bitnet`, and `force_load_bitnet_model`
