@@ -500,6 +500,46 @@ mod loaded_model_tests {
     }
 
     #[test]
+    fn bitnet_guards_refuse_a_dense_vindex_with_a_useful_message() {
+        // `ensure_bitnet_cell`'s refusal path: asking a non-BitNet vindex
+        // for a ternary model must name *why* rather than surfacing a
+        // load error from a file that was never going to exist.
+        let model = tiny_loaded_model(QuantFormat::None, false);
+        // `BitnetModel` is not `Debug`, so match rather than `expect_err`.
+        let Err(err) = model.get_or_load_bitnet() else {
+            unreachable!("a dense vindex has no ternary model to hand out")
+        };
+        assert!(
+            err.contains("bitnet_layout") && err.contains("keep-quant"),
+            "the error must say the container is not a --keep-quant build, \
+             got: {err}"
+        );
+    }
+
+    #[test]
+    fn force_load_bitnet_model_is_a_noop_when_infer_disabled() {
+        // `bootstrap::serve` calls this unconditionally for every model,
+        // so it has to stay quiet on a --no-infer server even when the
+        // container *is* BitNet-shaped: eagerly loading ternary weights
+        // into a process that refuses to infer would spend the memory a
+        // --no-infer operator asked not to spend.
+        let mut cfg = tiny_config(QuantFormat::None);
+        cfg.bitnet_layout = Some(larql_vindex::config::BitnetLayout::default());
+        let mut model = tiny_loaded_model(QuantFormat::None, false);
+        model.config = cfg;
+        model.infer_disabled = true;
+        assert!(model.is_bitnet(), "fixture must be BitNet-shaped");
+        assert!(
+            model.force_load_bitnet_model().is_ok(),
+            "must no-op rather than error under --no-infer"
+        );
+        assert!(
+            model.bitnet_model.get().is_none(),
+            "and must not have loaded anything"
+        );
+    }
+
+    #[test]
     fn bitnet_model_not_loaded_by_default() {
         // Same lazy-load contract as `weights`: the ternary cell stays
         // empty until `get_or_load_bitnet`, and `force_load_bitnet_model`
