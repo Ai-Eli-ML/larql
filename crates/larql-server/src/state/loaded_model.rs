@@ -261,6 +261,29 @@ impl LoadedModel {
     pub fn lock_weights_for_gen(
         &self,
     ) -> Result<std::sync::RwLockWriteGuard<'_, ModelWeights>, String> {
+        // A BitNet `--keep-quant` container has no dense weight manifest to
+        // load, so `ensure_weights_cell` would fail here with a bare
+        // "No such file or directory" from whichever tensor file it reached
+        // first. Every non-streaming generation path funnels through this
+        // one method (`openai/completions.rs` batch loop,
+        // `openai/chat/handler.rs`, `openai/responses/engine.rs`), so
+        // naming the real reason once here covers all of them rather than
+        // three separate checks that have to stay in agreement.
+        //
+        // Refused rather than silently routed to the ternary path: these
+        // callers hold a `&mut ModelWeights` for the whole generation, and
+        // there is no dense `ModelWeights` to hand them. The ternary
+        // engine is reachable through `/v1/infer` and the streaming
+        // surfaces, which do not need one.
+        if self.is_bitnet() {
+            return Err(
+                "this vindex is a BitNet --keep-quant build and carries no dense \
+                 weights; non-streaming generation is not supported on it. Use \
+                 POST /v1/infer, or /v1/completions and /v1/chat/completions \
+                 with \"stream\": true, which take the native-ternary path."
+                    .to_string(),
+            );
+        }
         let cell = self.ensure_weights_cell()?;
         cell.write()
             .map_err(|e| format!("weights RwLock poisoned: {e}"))
@@ -576,6 +599,51 @@ mod loaded_model_tests {
         assert!(
             model.bitnet_model.get().is_none(),
             "a failed load must not poison the cell"
+        );
+    }
+
+    #[test]
+    fn lock_weights_for_gen_refuses_bitnet_with_an_actionable_message() {
+        // Regression: on a real --keep-quant container the three
+        // non-streaming generation paths (openai completions batch loop,
+        // chat handler, responses engine) all reached
+        // `ensure_weights_cell` and surfaced a bare "No such file or
+        // directory" as a 503 -- there is no dense weight manifest in such
+        // a container. Caught only against the real
+        // microsoft/bitnet-b1.58-2B-4T model, because the synthetic
+        // fixture is a dense V2 container that has those files.
+        //
+        // The message has to say what to use instead: the ternary engine
+        // *is* reachable, just not through a path that needs
+        // `&mut ModelWeights`.
+        let mut cfg = tiny_config(QuantFormat::None);
+        cfg.bitnet_layout = Some(larql_vindex::config::BitnetLayout::default());
+        let mut model = tiny_loaded_model(QuantFormat::None, false);
+        model.config = cfg;
+        assert!(model.is_bitnet(), "fixture must be BitNet-shaped");
+
+        let Err(err) = model.lock_weights_for_gen() else {
+            unreachable!("a --keep-quant container has no dense weights to lock")
+        };
+        assert!(
+            err.contains("keep-quant") && err.contains("no dense"),
+            "must name the container kind as the reason, got: {err}"
+        );
+        assert!(
+            err.contains("/v1/infer") && err.contains("stream"),
+            "must point at the paths that do work, got: {err}"
+        );
+
+        // And the dense case must be unaffected: a plain container still
+        // reaches the loader (and fails on the missing fixture files, not
+        // on this guard).
+        let dense = tiny_loaded_model(QuantFormat::None, false);
+        let Err(dense_err) = dense.lock_weights_for_gen() else {
+            unreachable!("the tiny fixture has no weight files on disk")
+        };
+        assert!(
+            !dense_err.contains("keep-quant"),
+            "a dense container must not hit the BitNet guard: {dense_err}"
         );
     }
 
