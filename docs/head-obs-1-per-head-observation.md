@@ -265,7 +265,7 @@ refusal arose (CPU path only). Arms: 4B primary g00 g12 g13 g20 g22 g26 and seco
 g15, base and target; 12B g26 g03 g00, base and target.
 
 **Gates.** First record (g00 target) and then all 22 records passed the schema gate
-(`scripts/validate_heads_record.py` in the bundle): field identities, head order, KV-head
+(the gate script validate_heads_record.py in the bundle's scripts directory): field identities, head order, KV-head
 mapping, source positions within the query, sources plus sink summing to one within 1e−7,
 basis hash equal to the case's 1a reader, one `head_sum` and H `head_write` rows per attention
 write, head-sum residual ≤ 1e−4, and the reader-projected reconstruction of every site's step
