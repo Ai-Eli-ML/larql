@@ -173,7 +173,7 @@ No live/nonblocking transport result or reference-framework parity is claimed.
 
 ```sh
 # From the repository root; paths must name new output files.
-cargo build --release -p larql-demos --example observatory_record
+# Build the separately maintained observatory_record exporter first.
 target/release/examples/observatory_record \
   ~/chris-models/granite-4.2-3b.s6.vindex3 \
   /tmp/granite-standard.json 'The capital of France is' ' Paris' ' Berlin'
