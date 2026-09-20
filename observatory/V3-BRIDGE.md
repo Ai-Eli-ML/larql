@@ -117,3 +117,8 @@ build. Local HTTP checks served the app and golden file successfully; the served
 file matched the frozen source hash. Browser automation was unavailable in this
 session, so interactive click/refresh and visual QA are not claimed. Session
 restore reuses the same byte ingestion function covered by the reopen tests.
+
+The [browser acceptance kit](qa/v3-bridge-qa-1/ACCEPTANCE.md) supplies the
+unchanged Paris recording, clearly labelled degraded/refused fixtures, and
+exact replay checkpoints. Manual acceptance remains pending; complete that
+gate before adding live execution.
