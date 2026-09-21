@@ -66,6 +66,43 @@ impl MatMul for MetalBackend {
         self.encode_f16_gemv(w_f16, x, n, k)
     }
 
+    /// bf16 weights (the top 16 bits of each f32), threshold-gated.
+    /// Encoder body and shape rule live in [`super::bf16_gemv`].
+    fn bf16_gemv(&self, w_bf16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {
+        if !Self::bf16_gemv_shape_ok(w_bf16, x, n, k) {
+            return None;
+        }
+        if 2 * n * k < self.flop_threshold.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.encode_bf16_gemv(w_bf16, x, n, k)
+    }
+
+    fn bf16_gemv_force(&self, w_bf16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {
+        if !Self::bf16_gemv_shape_ok(w_bf16, x, n, k) {
+            return None;
+        }
+        self.encode_bf16_gemv(w_bf16, x, n, k)
+    }
+
+    /// N bf16 gemvs over one shared input as one submission. Bit-identical
+    /// to N sequential `bf16_gemv_force` calls; see [`super::bf16_gemv`].
+    fn bf16_gemv_multi(
+        &self,
+        weights: &[(&[u8], usize, usize)],
+        x: &[f32],
+    ) -> Option<Vec<Vec<f32>>> {
+        for &(w, n, k) in weights {
+            if !Self::bf16_gemv_shape_ok(w, x, n, k) {
+                return None;
+            }
+        }
+        if weights.is_empty() {
+            return Some(Vec::new());
+        }
+        self.encode_bf16_gemv_multi(weights, x)
+    }
+
     /// One command buffer, one encoder, one input upload, N dispatches,
     /// one wait — same kernel and same per-dispatch arguments as the
     /// sequential path, so the results are bit-identical to N separate
@@ -122,7 +159,7 @@ impl MatMul for MetalBackend {
         }
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:125",
         );
@@ -181,7 +218,7 @@ impl MatMul for MetalBackend {
         );
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:181",
         );
@@ -272,7 +309,7 @@ impl MatMul for MetalBackend {
         }
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:269",
         );
@@ -360,7 +397,7 @@ impl MatMul for MetalBackend {
         }
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:354",
         );
@@ -447,7 +484,7 @@ impl MetalBackend {
         );
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:140",
         );
@@ -504,7 +541,7 @@ impl MetalBackend {
         let (partial_vals, partial_idxs, n_partials) = self.encode_argmax_partial(enc, &scores, n);
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:194",
         );
@@ -551,7 +588,7 @@ impl MetalBackend {
         let (partial_vals, partial_idxs, n_partials) = self.encode_argmax_partial(enc, &scores, n);
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:238",
         );
@@ -766,7 +803,7 @@ impl MetalBackend {
         let (partial_vals, partial_idxs, num_tgs) = self.encode_topk_partial(enc, &scores, n);
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:450",
         );
@@ -817,7 +854,7 @@ impl MetalBackend {
         );
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:498",
         );
@@ -862,7 +899,7 @@ impl MetalBackend {
         );
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:530",
         );
@@ -974,10 +1011,11 @@ mod tests {
         let (vals, idxs, num_tgs) = metal.encode_topk_partial(enc, &scores_buf, n);
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_checked(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:570",
-        );
+        )
+        .expect("command buffer completed");
 
         let hits = MetalBackend::reduce_topk_partial(&vals, &idxs, num_tgs, 5);
         assert_eq!(hits.len(), 5);
@@ -1007,10 +1045,11 @@ mod tests {
         let (vals, idxs, num_tgs) = metal.encode_topk_partial(enc, &scores_buf, n);
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_checked(
             cmd,
             "crates/larql-compute-metal/src/trait_impl/matmul.rs:600",
-        );
+        )
+        .expect("command buffer completed");
         let hits = MetalBackend::reduce_topk_partial(&vals, &idxs, num_tgs, 2);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, 42);

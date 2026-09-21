@@ -22,6 +22,28 @@ pub enum MoeGateRule {
     /// sigmoid's argument, and the `(up + 1)` offset. None of it is SwiGLU;
     /// see `ffn::expert_weight::gate` for the full derivation.
     ClampedGlu { limit: f32, alpha: f32 },
+    /// Kimi-K3's SiTU-GLU, transcribed from `SituAndMul.forward`
+    /// (`modeling_kimi_linear.py` L75-82):
+    ///
+    /// ```text
+    /// situ_a = beta * tanh(g / beta) * sigmoid(g)
+    /// u      = linear_beta * tanh(u / linear_beta)   // only when declared
+    /// out    = situ_a * u
+    /// ```
+    ///
+    /// A softcapped SwiGLU, and it degenerates to SwiGLU as the bounds
+    /// grow — which is why substituting SiLU looks healthy and is not.
+    /// See `ffn::expert_weight::gate` for the oracle-pinned derivation.
+    SituGlu { beta: f32, linear_beta: Option<f32> },
+    /// GLM-5.3-Flash: GPT-OSS's clamp, then ORDINARY SwiGLU —
+    /// `act(g) * u`, with neither the `alpha` scaling nor the `(u + 1)`
+    /// offset. Its reference carries the comment "Simple swiglu instead
+    /// of alpha" over exactly this line.
+    ///
+    /// A separate rule and not a flag, because the two differ by the
+    /// arithmetic and not by the clamp. Serving one for the other on
+    /// GLM's real expert bank measures relative 31.7.
+    ClampedGated { limit: f32, activation: Activation },
 }
 
 impl MoeGateRule {
@@ -38,6 +60,13 @@ impl MoeGateRule {
             larql_models::ExpertGatePolicy::ClampedGlu { limit, alpha } => {
                 Self::ClampedGlu { limit, alpha }
             }
+            larql_models::ExpertGatePolicy::SituGlu { beta, linear_beta } => {
+                Self::SituGlu { beta, linear_beta }
+            }
+            larql_models::ExpertGatePolicy::ClampedGated { limit } => Self::ClampedGated {
+                limit,
+                activation: Activation::from(activation),
+            },
         }
     }
 
@@ -60,6 +89,31 @@ impl MoeGateRule {
                 let g = g.min(limit);
                 let u = u.clamp(-limit, limit);
                 (u + 1.0) * (g * sigmoid(g * alpha))
+            }
+            // The reference upcasts both branches to f32 before the
+            // nonlinearity and rounds once at the end (L77-78, L82).
+            // These inputs are already f32, so that contract is met by
+            // construction here; the bf16 arm of `situ_oracle.json`
+            // measures what the upcast is worth (rel-L2 3.2e-3 at K3's
+            // parameters) so the statement is priced rather than assumed.
+            Self::SituGlu { beta, linear_beta } => {
+                let situ_a = beta * (g / beta).tanh() * sigmoid(g);
+                let u = match linear_beta {
+                    Some(cap) => cap * (u / cap).tanh(),
+                    None => u,
+                };
+                situ_a * u
+            }
+            // The SAME clamp, and then the ordinary gated product — no
+            // `alpha`, no `(u + 1)`.
+            Self::ClampedGated { limit, activation } => {
+                let g = g.min(limit);
+                let u = u.clamp(-limit, limit);
+                if activation.gate_up_is_gelu_tanh() {
+                    crate::cpu::ops::moe::math::gelu_tanh(g) * u
+                } else {
+                    crate::cpu::ops::moe::math::silu(g) * u
+                }
             }
         }
     }

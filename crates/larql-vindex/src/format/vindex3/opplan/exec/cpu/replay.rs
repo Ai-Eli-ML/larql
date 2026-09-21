@@ -33,11 +33,13 @@
 //! locality effect from a cost intrinsic to traversing hundreds of
 //! distinct allocations.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::executor::CpuExecutor;
 use super::physical::PhysicalProjectionPlan;
 use super::projector::WeightRows;
+use crate::format::vindex3::represent::kquant::KQuant;
 
 /// Which representation a captured operand was resident as.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,6 +48,18 @@ enum Kind {
     Bf16,
     Q8,
     Q4,
+    Nvfp4,
+    KQuant,
+    Fp8Block,
+}
+
+/// A fine-grained FP8 slab's geometry, captured by value.
+#[derive(Clone, Copy)]
+struct Fp8Slab {
+    block_rows: usize,
+    block_cols: usize,
+    scale_cols: usize,
+    row_in_tile: usize,
 }
 
 /// One projection exactly as the decode issued it.
@@ -60,7 +74,31 @@ pub struct Captured {
     primary: (usize, usize),
     /// Scales, where the format has them.
     secondary: (usize, usize),
+    /// The asymmetric path's code-sum index, where an arm built one.
+    /// Captured rather than dropped: a replay that reconstructed the
+    /// operand WITHOUT its index would silently take the symmetric code
+    /// path and price a kernel the decode never ran.
+    tertiary: (usize, usize),
     block: usize,
+    /// NVFP4's matrix-wide scale. By value because it is one f32 and not
+    /// a stream, and captured rather than defaulted: replaying the codes
+    /// against the wrong tensor scale would price the right kernel over
+    /// numerically different weights, which is exactly the substitution
+    /// this harness exists to rule out.
+    tensor_scale: f32,
+    /// A stored K-quant's codec — which layout the block stream is.
+    /// Captured for the same reason the tensor scale is: replaying the
+    /// bytes under another codec would price a kernel over garbage.
+    codec: Option<KQuant>,
+    /// Fine-grained FP8's tile and grid, and where the slab starts
+    /// within its first tile.
+    ///
+    /// Captured for the same reason the tensor scale and the codec are:
+    /// this is the only format here whose scale spans ROWS, so replaying
+    /// the codes with the wrong `row_in_tile` would price the right
+    /// kernel over weights scaled by a neighbouring tile — finite,
+    /// plausible, and not what the decode ran.
+    fp8: Option<Fp8Slab>,
     out_dim: usize,
     /// The activation the decode actually projected. Kept by value
     /// because it is tens of KB against tens of MB of weight, and
@@ -70,6 +108,16 @@ pub struct Captured {
 }
 
 impl Captured {
+    /// The address of the primary weight stream this call read — the
+    /// operand's identity.
+    ///
+    /// A capture is process-wide, so a caller that must count only the
+    /// calls IT issued selects them with this against its own operands'
+    /// [`WeightRows::primary_addr`].
+    pub fn operand_addr(&self) -> usize {
+        self.primary.0
+    }
+
     /// Rebuild the row view.
     ///
     /// # Safety
@@ -84,6 +132,10 @@ impl Captured {
             Kind::Q8 => WeightRows::Q8 {
                 codes: std::slice::from_raw_parts(p as *const i8, n),
                 scales: std::slice::from_raw_parts(s as *const f32, m),
+                sums: match self.tertiary {
+                    (0, _) | (_, 0) => &[],
+                    (a, k) => std::slice::from_raw_parts(a as *const i16, k),
+                },
                 block: self.block,
             },
             Kind::Q4 => WeightRows::Q4 {
@@ -91,6 +143,26 @@ impl Captured {
                 scales: std::slice::from_raw_parts(s as *const f32, m),
                 block: self.block,
             },
+            Kind::Nvfp4 => WeightRows::Nvfp4 {
+                packed: std::slice::from_raw_parts(p as *const u8, n),
+                scales: std::slice::from_raw_parts(s as *const u8, m),
+                tensor_scale: self.tensor_scale,
+            },
+            Kind::KQuant => WeightRows::KQuant {
+                blocks: std::slice::from_raw_parts(p as *const u8, n),
+                codec: self.codec.expect("a K-quant capture records its codec"),
+            },
+            Kind::Fp8Block => {
+                let g = self.fp8.expect("an FP8 capture records its slab geometry");
+                WeightRows::Fp8Block {
+                    codes: std::slice::from_raw_parts(p as *const u8, n),
+                    scales: std::slice::from_raw_parts(s as *const f32, m),
+                    block_rows: g.block_rows,
+                    block_cols: g.block_cols,
+                    scale_cols: g.scale_cols,
+                    row_in_tile: g.row_in_tile,
+                }
+            }
         }
     }
 
@@ -102,13 +174,33 @@ impl Captured {
 
 static CAPTURE: Mutex<Option<Vec<Captured>>> = Mutex::new(None);
 
+/// Whether a recording is open, readable WITHOUT taking the lock.
+///
+/// The idle cost of [`record`] is this one acquire load — cheaper than
+/// the lock probe it replaces — which is what lets that function block
+/// on the mutex when a capture IS open instead of dropping the call.
+///
+/// Acquire/release rather than relaxed so that a thread which observes
+/// the flag set also observes the `Some(..)` that [`start_capture`]
+/// wrote before setting it.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Begin recording projections. Any previous recording is discarded.
+///
+/// **A capture is process-wide.** It records every projection the
+/// process issues while it is open, from any thread — which is the
+/// point, since [`super::executor::CpuExecutor::parallel6`] issues
+/// KDA's q/k/v and gate branches from pool workers. A caller that needs
+/// only its OWN calls must select them by operand; see
+/// [`Captured::operand_addr`].
 pub fn start_capture() {
     *CAPTURE.lock().expect("capture lock") = Some(Vec::new());
+    ACTIVE.store(true, Ordering::Release);
 }
 
 /// Stop recording and take what was captured.
 pub fn take_capture() -> Vec<Captured> {
+    ACTIVE.store(false, Ordering::Release);
     CAPTURE
         .lock()
         .expect("capture lock")
@@ -119,30 +211,54 @@ pub fn take_capture() -> Vec<Captured> {
 /// Record one projection, if recording is on.
 ///
 /// Called from the executor's own `project`, so a captured call is the
-/// call the model made and not a reconstruction of it. Costs one
-/// uncontended lock check per projection while idle.
+/// call the model made and not a reconstruction of it. Costs one acquire
+/// load per projection while idle.
+///
+/// **Every issued projection is recorded, including concurrent ones.**
+/// This previously probed the lock with `try_lock` and returned on
+/// contention, reasoning that a racing worker "would only ever be inside
+/// a projection this call already recorded". Nothing enforces that.
+/// [`super::executor::CpuExecutor::parallel6`] exists precisely to run
+/// six independent branches — KDA's q/k/v, decay-gate, output-gate and
+/// b_proj — on separate pool workers, and those issue DISTINCT
+/// projections; the moment it is wired to a caller that goes through
+/// `project`, a lost probe becomes a silently dropped call in the very
+/// traffic this capture exists to price.
+///
+/// **As of 2026-09-01 that path is latent, not live**: `parallel6` has
+/// no production call site, and the MoE fan-out reaches
+/// `DenseProjector::project_rows` directly rather than through
+/// `project`, so no shipped measurement is known to have lost a call. A
+/// recorder whose correctness rests on no caller ever fanning out is
+/// still the wrong shape, and blocking costs nothing while idle. The
+/// operand is built before the lock is taken, so the section held is one
+/// `push`.
 pub(super) fn record(weight: WeightRows<'_>, x: &[f32], out_dim: usize) {
-    let mut slot = match CAPTURE.try_lock() {
-        Ok(slot) => slot,
-        // A worker thread racing the capture would only ever be inside a
-        // projection this call already recorded; skipping is correct and
-        // cheaper than blocking a decode.
-        Err(_) => return,
-    };
-    let Some(log) = slot.as_mut() else {
+    if !ACTIVE.load(Ordering::Acquire) {
         return;
-    };
-    let (kind, primary, secondary, block) = match weight {
-        WeightRows::F32(w) => (Kind::F32, (w.as_ptr() as usize, w.len()), (0, 0), 0),
-        WeightRows::Bf16(w) => (Kind::Bf16, (w.as_ptr() as usize, w.len()), (0, 0), 0),
+    }
+    let mut tensor_scale = 0.0f32;
+    let mut codec = None;
+    let mut fp8 = None;
+    let (kind, primary, secondary, tertiary, block) = match weight {
+        WeightRows::F32(w) => (Kind::F32, (w.as_ptr() as usize, w.len()), (0, 0), (0, 0), 0),
+        WeightRows::Bf16(w) => (
+            Kind::Bf16,
+            (w.as_ptr() as usize, w.len()),
+            (0, 0),
+            (0, 0),
+            0,
+        ),
         WeightRows::Q8 {
             codes,
             scales,
+            sums,
             block,
         } => (
             Kind::Q8,
             (codes.as_ptr() as usize, codes.len()),
             (scales.as_ptr() as usize, scales.len()),
+            (sums.as_ptr() as usize, sums.len()),
             block,
         ),
         WeightRows::Q4 {
@@ -153,13 +269,74 @@ pub(super) fn record(weight: WeightRows<'_>, x: &[f32], out_dim: usize) {
             Kind::Q4,
             (packed.as_ptr() as usize, packed.len()),
             (scales.as_ptr() as usize, scales.len()),
+            (0, 0),
             block,
         ),
+        WeightRows::Nvfp4 {
+            packed,
+            scales,
+            tensor_scale: ts,
+        } => {
+            tensor_scale = ts;
+            (
+                Kind::Nvfp4,
+                (packed.as_ptr() as usize, packed.len()),
+                (scales.as_ptr() as usize, scales.len()),
+                (0, 0),
+                // The group is 16 by the format's definition, not a
+                // policy's choice, so there is no block to carry.
+                0,
+            )
+        }
+        WeightRows::KQuant { blocks, codec: c } => {
+            codec = Some(c);
+            (
+                Kind::KQuant,
+                (blocks.as_ptr() as usize, blocks.len()),
+                (0, 0),
+                (0, 0),
+                // The block is the codec's, carried by `codec`.
+                0,
+            )
+        }
+        WeightRows::Fp8Block {
+            codes,
+            scales,
+            block_rows,
+            block_cols,
+            scale_cols,
+            row_in_tile,
+        } => {
+            fp8 = Some(Fp8Slab {
+                block_rows,
+                block_cols,
+                scale_cols,
+                row_in_tile,
+            });
+            (
+                Kind::Fp8Block,
+                (codes.as_ptr() as usize, codes.len()),
+                (scales.as_ptr() as usize, scales.len()),
+                (0, 0),
+                // The tile is two-dimensional, so it does not fit the
+                // scalar `block` every other blocked format uses; it
+                // travels in `fp8` instead.
+                0,
+            )
+        }
+    };
+    let mut slot = CAPTURE.lock().expect("capture lock");
+    let Some(log) = slot.as_mut() else {
+        return;
     };
     log.push(Captured {
         kind,
+        tensor_scale,
+        codec,
+        fp8,
         primary,
         secondary,
+        tertiary,
         block,
         out_dim,
         x: x.to_vec(),
@@ -218,7 +395,7 @@ pub unsafe fn replay(exec: &CpuExecutor, calls: &[Captured], order: ReplayOrder)
     for i in indices {
         let call = &calls[i];
         let rows = call.rows();
-        let plan = PhysicalProjectionPlan::for_resident(rows);
+        let plan = PhysicalProjectionPlan::for_resident(rows, call.x.len());
         std::hint::black_box(exec.project(plan.kernel(), rows, &call.x, call.out_dim)[0]);
     }
     started.elapsed().as_secs_f64()

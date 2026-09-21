@@ -46,6 +46,16 @@ impl MetalBackend {
             "Metal MoE dispatch has no biased-Gated expert kernel; this \
              layer's biased experts must run on the CPU path"
         );
+        // Checked HERE, at the top of the body, because everything below
+        // it — this dispatch and the zero-copy fast path it delegates to
+        // — encodes. Both carry a backstop arm on the combine match; a
+        // refusal that reached one of those would abort the process
+        // rather than report itself.
+        assert!(
+            crate::kernels::ffn::expert_activation_supported(&moe.gate_rule),
+            "{}",
+            crate::kernels::ffn::CLAMPED_GATED_REFUSAL
+        );
         debug_assert_eq!(
             moe.gate_up_cols(hidden),
             scratch.weight_cols,
@@ -250,6 +260,15 @@ impl MetalBackend {
             let u_offset = (e * inter * 4) as u64;
             let a_offset = (e * inter_padded * 4) as u64;
             match moe.gate_rule {
+                // Refused at admission by
+                // `kernels::ffn::expert_activation_supported`, which
+                // owns the reason. The backstop stays for any path that
+                // does not come through that gate — and must never be
+                // the thing that reports it, because a panic here
+                // leaves the encoder unended.
+                larql_compute::MoeGateRule::ClampedGated { .. } => {
+                    unreachable!("{}", crate::kernels::ffn::CLAMPED_GATED_REFUSAL)
+                }
                 larql_compute::MoeGateRule::ClampedGlu { limit, alpha } => {
                     let has_bias: u32 = u32::from(stage_biases);
                     let b_offset = (e * inter * 4) as u64;
@@ -263,6 +282,19 @@ impl MetalBackend {
                     enc.set_bytes(6, 4, &has_bias as *const u32 as *const c_void);
                     enc.set_bytes(7, 4, &limit as *const f32 as *const c_void);
                     enc.set_bytes(8, 4, &alpha as *const f32 as *const c_void);
+                }
+                larql_compute::MoeGateRule::SituGlu { beta, linear_beta } => {
+                    crate::kernels::ffn::bind_situ_glu(
+                        enc,
+                        &self.ffn.situ_glu_pipeline,
+                        (&scratch.g_out, g_offset),
+                        (&scratch.u_out, u_offset),
+                        (&scratch.act_buf, a_offset),
+                        inter_u32,
+                        beta,
+                        linear_beta,
+                        stage_biases,
+                    );
                 }
                 larql_compute::MoeGateRule::Gated(activation) => {
                     let pipeline = if activation.gate_up_is_gelu_tanh() {
@@ -327,7 +359,7 @@ impl MetalBackend {
         }
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
+        crate::cb_status::wait_or_abort(
             cmd,
             "crates/larql-compute-metal/src/moe_dispatch/dispatch.rs:330",
         );

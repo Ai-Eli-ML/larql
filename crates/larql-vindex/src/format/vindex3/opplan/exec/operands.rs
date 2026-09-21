@@ -10,16 +10,25 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::super::super::encode::segment::{read_segment_header, SegmentTensor};
 use super::super::super::encode::REPRESENTATION_ID_SEP;
 use super::super::super::inspect::SystemInspection;
 use super::super::OperandRef;
 use crate::error::VindexError;
+use crate::format::vindex3::auxiliary_references::OperandAddress;
+use crate::format::vindex3::represent::codec::streams::ResolvedAuxiliary;
+use crate::format::vindex3::represent::codec::{
+    admit_auxiliary_names, AuxiliaryMetadata, CodecOperands, CodecRegistry, NamedStreams,
+    RepresentationCodec, RepresentationExtent,
+};
+use crate::format::vindex3::represent::physical::{PhysicalStore, WeightRegion};
 
 /// Safetensors dtype labels this reference executor can widen to f32.
 const DTYPE_F32: &str = "F32";
 const DTYPE_BF16: &str = "BF16";
+const DTYPE_F16: &str = "F16";
 
 /// One object's segment: file path, payload origin, and tensor table.
 struct SegmentMap {
@@ -30,7 +39,17 @@ struct SegmentMap {
 
 /// Operand store over one container.
 pub struct OperandStore {
+    /// The codecs this store decodes through — the built-in registry
+    /// unless a caller binds another, which is how a representation this
+    /// build does not ship becomes executable through registration alone.
+    registry: &'static CodecRegistry,
     segments: BTreeMap<String, SegmentMap>,
+    /// Each object's segment mapped at most once, however many operands
+    /// bind regions of it — the one physical binding a bank shares.
+    mapped: std::sync::Mutex<BTreeMap<String, Arc<PhysicalStore>>>,
+    /// Regions bound through `map_region`, counted beside `loads` so a
+    /// test can prove a bank was bound and not read.
+    regions: std::sync::atomic::AtomicUsize,
     /// Which representation each object was bound to.
     selected: BTreeMap<String, SelectedRepresentation>,
     /// Under `transient`, the encoding each tensor has in the compiled
@@ -39,6 +58,18 @@ pub struct OperandStore {
     precision_map: BTreeMap<String, BTreeMap<String, String>>,
     /// The container's precision program, when it states one.
     program: Option<crate::format::vindex3::represent::map::PrecisionMap>,
+    /// Every operand's role as the operation plan binds it, keyed
+    /// `(object, tensor)`.
+    ///
+    /// The conformance check below must resolve a role exactly as the
+    /// representation compiler did, or a legitimately compiled pack
+    /// fails its own check. That is not hypothetical: when the compiler
+    /// moved to plan-derived roles and this path was left on the name
+    /// heuristics, Qwen3.8's `linear_attn.in_proj_qkv` compiled as
+    /// `recurrence-projection` and then refused to load because
+    /// `classify` still called it `unknown`. One resolution, two
+    /// readers.
+    plan_roles: crate::format::vindex3::represent::plan_roles::PlanRoles,
     /// Where representations were allowed to come from.
     source: RepresentationSource,
     /// Process-unique identity — see [`SourceStamp`].
@@ -51,12 +82,128 @@ pub struct OperandStore {
     /// test assert the shape directly: prepare, then serve N requests,
     /// then assert the count did not move.
     loads: std::sync::atomic::AtomicU64,
+    /// PHYSICAL bytes this store has actually read from disk.
+    ///
+    /// The observed half of preparation accounting. `loads` counts CALLS,
+    /// which cannot be compared against a byte ledger — two reads of a
+    /// small operand and one read of a large one are the same number.
+    /// Incremented only in [`Self::load_raw`], which is the one path that
+    /// copies payload; `map_region` binds without reading and correctly
+    /// moves neither counter.
+    read_bytes: std::sync::atomic::AtomicU64,
     /// Tensors quantised at load in this session — see
     /// [`Self::runtime_quantised`].
     runtime_quantised: std::sync::atomic::AtomicU64,
     /// Tensors bound at their stored precision rather than the format the
     /// backend asked for — see [`Self::bound_at_stored_precision`].
     stored_precision: std::sync::atomic::AtomicU64,
+    /// Objects the container describes whose segment is not on disk.
+    ///
+    /// Distinct from "not in the container": these are declared by the
+    /// graph and the index, and only their bytes are elsewhere. Keeping
+    /// them named is what lets the load path refuse by residency rather
+    /// than by absence.
+    absent: std::collections::BTreeSet<String>,
+    /// Which represented object stands for each codec's declared
+    /// dependency, as the container states it.
+    ///
+    /// Empty for every container that declares none, which is every
+    /// container written before dependencies existed. The store holds it
+    /// because the store is what resolves one: a codec asks for a
+    /// dependency by name and never learns where it came from.
+    references: crate::format::vindex3::auxiliary_references::ReferenceTable,
+    /// What this container measures about its own representations.
+    ///
+    /// Empty for every container written before attestation existed,
+    /// which is every container this build has ever read — so an empty
+    /// table is the normal case and means "nothing measured", never "the
+    /// file failed to load". A table the index NAMES and the container
+    /// does not hold is a refusal at open, on the same terms as the
+    /// reference table beside it.
+    attestations: crate::format::vindex3::representation_attestations::AttestationTable,
+    /// Whose measurements this build is willing to act on.
+    ///
+    /// [`RecognisedMethods::none`] by default, which is what a build that
+    /// has qualified no measurement should say: an attestation is carried
+    /// and checked either way, but an unrecognised one leaves the
+    /// guarantee unavailable rather than optimistic. Recognition is a
+    /// TRUST decision and belongs to the caller, not to the container
+    /// making the claim about itself.
+    recognised: crate::format::vindex3::representation_attestations::recognition::RecognisedMethods,
+    /// Which objects this store has actually resolved an operand out of.
+    ///
+    /// The consumption half of the residency ledger. `load_count` says
+    /// how much was read; this says *from where*, which is the question a
+    /// hydration set has to answer: an execution that needs three objects
+    /// must not be handed four, and the only way to know which three is
+    /// to watch a real preparation ask.
+    ///
+    /// Recorded in [`Self::load_raw`] because that is the one resolution
+    /// path — a second place to record would be a second answer.
+    touched: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// How much of each dependency to read, by the name its OWNER declared.
+///
+/// A name absent from this is read WHOLE — the container holds all of it,
+/// and reading less is a decision someone has to have made. It is the
+/// shape a pin will carry once selection chooses auxiliary extents; until
+/// then it is how a caller states the choice explicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuxiliaryExtents {
+    by_name: BTreeMap<String, RepresentationExtent>,
+}
+
+impl AuxiliaryExtents {
+    /// Every dependency read whole.
+    pub fn whole() -> Self {
+        Self::default()
+    }
+
+    pub fn with(mut self, name: impl Into<String>, extent: RepresentationExtent) -> Self {
+        self.by_name.insert(name.into(), extent);
+        self
+    }
+
+    /// The extent chosen for `name`, or `None` for "whole", which the
+    /// loader resolves against the dependency's own codec.
+    pub fn get(&self, name: &str) -> Option<RepresentationExtent> {
+        self.by_name.get(name).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+}
+
+/// One dependency the loader resolved: the name its OWNER declared, the
+/// shape the container records for it, and its decoded values. Owned,
+/// because it lives exactly as long as the decode that reads it.
+struct LoadedAuxiliary {
+    name: String,
+    shape: Vec<usize>,
+    values: Vec<f32>,
+}
+
+/// Hand `resolved` dependencies to the operands a codec will see.
+///
+/// A free function with a NAMED lifetime: the values are owned by the
+/// caller for exactly as long as the decode runs, and a closure cannot
+/// say that.
+fn attach_auxiliaries<'a>(
+    mut operands: CodecOperands<'a>,
+    resolved: &'a [LoadedAuxiliary],
+) -> CodecOperands<'a> {
+    for auxiliary in resolved {
+        operands.auxiliaries = std::mem::take(&mut operands.auxiliaries).with(
+            auxiliary.name.clone(),
+            ResolvedAuxiliary {
+                shape: &auxiliary.shape,
+                values: &auxiliary.values,
+            },
+        );
+    }
+    operands
 }
 
 /// Where an execution representation is allowed to come from.
@@ -94,6 +241,10 @@ pub struct SelectedRepresentation {
     pub encoding: String,
     /// Whether those bytes came from a compiled pack.
     pub stored: bool,
+    /// The decode ABI the pack declares, when it declares one — kept so
+    /// the admission that ran at open can run again against another
+    /// registry ([`OperandStore::with_registry`]).
+    pub codec: Option<crate::format::vindex3::represent::nvfp4_pack::CodecIdentity>,
 }
 
 impl OperandStore {
@@ -114,7 +265,27 @@ impl OperandStore {
         want: Option<&str>,
         source: RepresentationSource,
     ) -> Result<Self, VindexError> {
+        Self::open_in(root, inspection, want, source, CodecRegistry::builtin())
+    }
+
+    /// [`Self::open_for`], decoding through `registry` from the first
+    /// byte: the pack admission at open, selection, provider identity and
+    /// decode all read this one registry.
+    ///
+    /// This is the constructor an external provider needs. A pack whose
+    /// identity names a family only that provider registers is admitted
+    /// here, and would have been refused by name — before the provider's
+    /// registry was ever consulted — had the store been opened through the
+    /// built-in one and re-pointed afterwards.
+    pub fn open_in(
+        root: &Path,
+        inspection: &SystemInspection,
+        want: Option<&str>,
+        source: RepresentationSource,
+        registry: &'static CodecRegistry,
+    ) -> Result<Self, VindexError> {
         let mut segments = BTreeMap::new();
+        let mut absent: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut selected = BTreeMap::new();
         let mut precision_map: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         for object in &inspection.graph.objects {
@@ -159,7 +330,7 @@ impl OperandStore {
                     // contract this one may not implement must be refused
                     // here, before anything reads them.
                     if let Some(codec) = &entry.codec {
-                        codec.admit()?;
+                        codec.admit_in(registry)?;
                     }
                     (id.clone(), entry, true)
                 }
@@ -179,11 +350,27 @@ impl OperandStore {
             selected.insert(
                 object.id.clone(),
                 SelectedRepresentation {
+                    codec: entry.codec.clone(),
                     encoding: entry.encoding.clone(),
                     stored: is_stored,
                 },
             );
             let path = root.join(&entry.segment);
+            // A described object whose bytes are not here is NOT a
+            // malformed container. `index.json` and the system graph say
+            // what the model is, and that description is complete whether
+            // or not every segment has been hydrated yet — which is the
+            // whole basis on which a hydration set can be a SUBSET.
+            //
+            // Reading eagerly and propagating made a partly resident
+            // container unopenable, so the refusal moves to the load
+            // path, where it can name the object and say the true thing.
+            // A segment that exists but cannot be read is still an error
+            // here: that is corruption, not absence.
+            if !path.exists() {
+                absent.insert(object.id.clone());
+                continue;
+            }
             let (header, payload_start) = read_segment_header(&path)?;
             segments.insert(
                 object.id.clone(),
@@ -198,17 +385,99 @@ impl OperandStore {
                 },
             );
         }
+        // The reference table, if the index names one. A table it names
+        // and the container does not hold is a refusal here rather than a
+        // surprise at the first decode that needs it.
+        let references = match &inspection.index.auxiliary_references {
+            Some(name) => {
+                crate::format::vindex3::auxiliary_references::AuxiliaryReferences::read(root, name)?
+            }
+            None => crate::format::vindex3::auxiliary_references::ReferenceTable::empty(),
+        };
+        // The attestation table, on the same terms as the reference table
+        // above: named-but-absent is a refusal here rather than a silent
+        // loss of every guarantee at the first floor that needed one.
+        let attestations = match &inspection.index.representation_attestations {
+            Some(name) => {
+                crate::format::vindex3::representation_attestations::RepresentationAttestations::read(
+                    root, name,
+                )?
+            }
+            None => crate::format::vindex3::representation_attestations::AttestationTable::empty(),
+        };
         Ok(Self {
+            registry,
+            references,
+            attestations,
+            recognised:
+                crate::format::vindex3::representation_attestations::recognition::RecognisedMethods::none(),
+            mapped: std::sync::Mutex::new(BTreeMap::new()),
+            regions: std::sync::atomic::AtomicUsize::new(0),
             segments,
+            absent,
             selected,
             precision_map,
             program: inspection.index.precision_map.clone(),
+            // Resolved once at open, so every conformance check in the
+            // load path reads the same answer the compiler wrote.
+            plan_roles: crate::format::vindex3::represent::plan_roles::plan_roles(root, inspection),
             source,
             id: next_identity(),
             loads: std::sync::atomic::AtomicU64::new(0),
+            read_bytes: std::sync::atomic::AtomicU64::new(0),
             runtime_quantised: std::sync::atomic::AtomicU64::new(0),
             stored_precision: std::sync::atomic::AtomicU64::new(0),
+            touched: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         })
+    }
+
+    /// The same store, decoding through `registry` instead of the one it
+    /// was opened with. Selection, provider identity and decode all read
+    /// this one registry, so a codec registered here is executable end to
+    /// end and a codec absent from it is refused everywhere.
+    ///
+    /// Every pack the open admitted is admitted AGAIN, against the new
+    /// registry: a store cannot be re-pointed at a registry that does not
+    /// implement the contract its bytes were written under. A pack the
+    /// open could not admit never reaches here — open the store through
+    /// [`Self::open_in`] with the registry that knows it.
+    pub fn with_registry(mut self, registry: &'static CodecRegistry) -> Result<Self, VindexError> {
+        for selected in self.selected.values() {
+            if let (true, Some(codec)) = (selected.stored, &selected.codec) {
+                codec.admit_in(registry)?;
+            }
+        }
+        self.registry = registry;
+        Ok(self)
+    }
+
+    /// The same store, acting on measurements from these authorities and
+    /// methods. Trust is the caller's to declare — a container cannot
+    /// make itself believed by attesting more loudly.
+    pub fn with_recognised(
+        mut self,
+        recognised: crate::format::vindex3::representation_attestations::recognition::RecognisedMethods,
+    ) -> Self {
+        self.recognised = recognised;
+        self
+    }
+
+    /// The codecs this store decodes through.
+    pub fn registry(&self) -> &'static CodecRegistry {
+        self.registry
+    }
+
+    /// How many objects' segments this store has mapped — the physical
+    /// bindings a prepared image holds, one per object however many
+    /// regions were taken from it.
+    pub fn mapped_objects(&self) -> usize {
+        self.mapped.lock().unwrap().len()
+    }
+
+    /// How many regions were bound through [`Self::map_region`]: the
+    /// logical operands served by the mappings, none of them read.
+    pub fn mapped_regions(&self) -> usize {
+        self.regions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What each object was bound to.
@@ -251,6 +520,23 @@ impl OperandStore {
     /// The container's precision program, when it declares one.
     pub fn program(&self) -> Option<&crate::format::vindex3::represent::map::PrecisionMap> {
         self.program.as_ref()
+    }
+
+    /// The role the plan binds this tensor to, falling back to the name
+    /// heuristics for anything the plan does not cover — the same order
+    /// the representation compiler resolves in.
+    pub fn role_of(
+        &self,
+        object: &str,
+        tensor: &str,
+        shape: &[usize],
+    ) -> crate::format::vindex3::represent::policy::Role {
+        self.plan_roles
+            .get(&(object.to_string(), tensor.to_string()))
+            .copied()
+            .unwrap_or_else(|| {
+                crate::format::vindex3::represent::policy::classify(object, tensor, shape)
+            })
     }
 
     /// Whether this object's bytes come from a compiled pack.
@@ -306,10 +592,289 @@ impl OperandStore {
         Ok(())
     }
 
-    /// Load one operand as f32 values.
+    /// Load one operand as f32 values — the mandatory decode realization
+    /// of whichever codec the stored dtype names.
+    ///
+    /// One dispatch, through the codec registry, for every encoding a
+    /// segment can hold: a float widens, a K-quant or an NVFP4 pack
+    /// decodes through its own layout, and a dtype no codec is registered
+    /// for is refused naming the ones that are. Consumers that want the
+    /// compact form for a kernel take [`Self::load_raw`]; this is for the
+    /// ones that need values, which on a recurrence is most of them.
+    ///
+    /// The decode is lossy in exactly the way the representation is:
+    /// a pack's 4-bit values widened, not the checkpoint's originals.
+    /// That is the point — it is what makes a compact representation
+    /// measurable on a stack the device cannot run.
     pub fn load(&self, operand: &OperandRef) -> Result<Vec<f32>, VindexError> {
         let raw = self.load_raw(operand)?;
-        widen(&raw.dtype, &raw.bytes, &operand.tensor)
+        let codec = self.registry.resolve(&raw.dtype, &operand.tensor)?;
+        // Everything the representation holds: this loader is asked for
+        // values, not for a fidelity, so it asks the codec for its deepest
+        // extent rather than assuming depth 0 is the whole of it.
+        let extent = codec.terminal_extent();
+        self.decode_at(operand, codec, raw, extent)
+    }
+
+    /// One operand's values at `extent` — the loader a caller with a PINNED
+    /// extent uses, and the only path that reads fewer streams than the
+    /// container holds.
+    ///
+    /// A shallower extent is not a smaller container: every stream the
+    /// artifact holds is still on disk, and what changes is which of them
+    /// are opened. So this reads the streams the extent needs and no
+    /// others, which is a physical fact a test can check on the store's
+    /// own read ledger rather than a claim about intent.
+    pub fn load_at(
+        &self,
+        operand: &OperandRef,
+        extent: RepresentationExtent,
+    ) -> Result<Vec<f32>, VindexError> {
+        self.load_with(operand, extent, &AuxiliaryExtents::whole())
+    }
+
+    /// [`Self::load_at`], reading each dependency at the extent
+    /// `auxiliaries` names for it.
+    ///
+    /// The owner's own extent and its dependencies' are separate
+    /// decisions: the codes of a vector-quantised tensor do not change
+    /// when its codebook is read at another depth, and what the values
+    /// MEAN does. Both are the caller's to state, because both are pins.
+    pub fn load_with(
+        &self,
+        operand: &OperandRef,
+        extent: RepresentationExtent,
+        auxiliaries: &AuxiliaryExtents,
+    ) -> Result<Vec<f32>, VindexError> {
+        let raw = self.load_raw(operand)?;
+        let codec = self.registry.resolve(&raw.dtype, &operand.tensor)?;
+        self.decode_guarded(operand, codec, raw, extent, auxiliaries, &mut Vec::new())
+    }
+
+    /// The tensor a stream after the first is stored in: the operand's own
+    /// tensor, suffixed with the stream's declared name.
+    ///
+    /// The convention is the codec's declaration made physical, so a codec
+    /// with streams stored apart needs no container support of its own and
+    /// no loader knows what any particular stream means.
+    pub fn sibling_stream_tensor(tensor: &str, stream: &str) -> String {
+        format!("{tensor}.{stream}")
+    }
+
+    /// The shape the container records for an address, or `None` when it
+    /// holds no such tensor.
+    pub fn stored_shape(&self, address: &OperandAddress) -> Option<Vec<usize>> {
+        self.segments
+            .get(&address.object)?
+            .tensors
+            .get(&address.tensor)
+            .map(|tensor| tensor.shape.clone())
+    }
+
+    /// The container's declared dependencies — what a closure admission
+    /// walks, and what a decode resolves through.
+    pub fn references(&self) -> &crate::format::vindex3::auxiliary_references::ReferenceTable {
+        &self.references
+    }
+
+    /// What this container measures about its own representations.
+    pub fn attestations(
+        &self,
+    ) -> &crate::format::vindex3::representation_attestations::AttestationTable {
+        &self.attestations
+    }
+
+    /// Whose measurements this build acts on.
+    pub fn recognised(
+        &self,
+    ) -> &crate::format::vindex3::representation_attestations::recognition::RecognisedMethods {
+        &self.recognised
+    }
+
+    /// Every dependency `operand`'s codec requires at `extent`, resolved:
+    /// each target decoded through ITS own codec at ITS terminal extent.
+    ///
+    /// `visiting` is the cycle guard. Admission refuses a cyclic table
+    /// before any of this runs, but the loader does not get to assume
+    /// someone ran admission: a cycle here would be a stack overflow, and
+    /// a refusal is what a store owes its caller.
+    fn resolve_auxiliaries(
+        &self,
+        operand: &OperandRef,
+        codec: &'static dyn RepresentationCodec,
+        extent: RepresentationExtent,
+        auxiliaries: &AuxiliaryExtents,
+        visiting: &mut Vec<OperandAddress>,
+    ) -> Result<Vec<LoadedAuxiliary>, VindexError> {
+        let required = codec.required_auxiliaries(extent);
+        let owner = OperandAddress::new(&operand.object, &operand.tensor);
+        let provided = self.references.auxiliaries_of(&owner);
+        let names: Vec<&str> = provided.iter().map(|(name, _)| *name).collect();
+        admit_auxiliary_names(
+            required,
+            &names,
+            codec.encoding_label(),
+            &operand.tensor,
+            extent,
+        )?;
+        let mut resolved = Vec::with_capacity(required.len());
+        for spec in required {
+            let target = self
+                .references
+                .target(&owner, spec.name)
+                .expect("an admitted name is a provided one")
+                .clone();
+            if visiting.contains(&target) {
+                return Err(VindexError::Parse(format!(
+                    "auxiliary resolution: {} is already being resolved — the container's \
+                     declared dependencies form a cycle",
+                    target.describe()
+                )));
+            }
+            let (label, shape) = self.tensor_metadata(&target)?;
+            let target_codec = self.registry.resolve(&label, &target.tensor)?;
+            codec.validate_auxiliary(
+                spec.name,
+                &AuxiliaryMetadata {
+                    object: target.object.clone(),
+                    tensor: target.tensor.clone(),
+                    label,
+                    shape: shape.clone(),
+                    identity: Some(target_codec.identity()),
+                },
+                &operand.shape,
+                extent,
+                &operand.tensor,
+            )?;
+            let reference = OperandRef {
+                object: target.object.clone(),
+                tensor: target.tensor.clone(),
+                dtype: String::new(),
+                shape: shape.clone(),
+            };
+            // Whole unless the caller said otherwise; the dependency's
+            // own codec decides what "whole" means.
+            let read_at = auxiliaries
+                .get(spec.name)
+                .unwrap_or_else(|| target_codec.terminal_extent());
+            visiting.push(target);
+            let values = self.load_guarded(&reference, read_at, visiting);
+            visiting.pop();
+            resolved.push(LoadedAuxiliary {
+                name: spec.name.to_string(),
+                shape,
+                values: values?,
+            });
+        }
+        Ok(resolved)
+    }
+
+    /// The label and shape the container records for an address.
+    fn tensor_metadata(
+        &self,
+        address: &OperandAddress,
+    ) -> Result<(String, Vec<usize>), VindexError> {
+        self.segments
+            .get(&address.object)
+            .and_then(|segment| segment.tensors.get(&address.tensor))
+            .map(|tensor| (tensor.dtype.clone(), tensor.shape.clone()))
+            .ok_or_else(|| {
+                VindexError::Parse(format!(
+                    "auxiliary resolution: {} is referenced and the container holds no such \
+                     tensor",
+                    address.describe()
+                ))
+            })
+    }
+
+    /// [`Self::load_at`] under a cycle guard.
+    fn load_guarded(
+        &self,
+        operand: &OperandRef,
+        extent: RepresentationExtent,
+        visiting: &mut Vec<OperandAddress>,
+    ) -> Result<Vec<f32>, VindexError> {
+        let raw = self.load_raw(operand)?;
+        let codec = self.registry.resolve(&raw.dtype, &operand.tensor)?;
+        // A dependency's OWN dependencies are read whole: nothing has
+        // stated a choice for them, and the loader does not invent one.
+        self.decode_guarded(
+            operand,
+            codec,
+            raw,
+            extent,
+            &AuxiliaryExtents::whole(),
+            visiting,
+        )
+    }
+
+    /// Bind the streams `extent` needs and decode them.
+    fn decode_at(
+        &self,
+        operand: &OperandRef,
+        codec: &'static dyn RepresentationCodec,
+        first: RawOperand,
+        extent: RepresentationExtent,
+    ) -> Result<Vec<f32>, VindexError> {
+        self.decode_guarded(
+            operand,
+            codec,
+            first,
+            extent,
+            &AuxiliaryExtents::whole(),
+            &mut Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_guarded(
+        &self,
+        operand: &OperandRef,
+        codec: &'static dyn RepresentationCodec,
+        first: RawOperand,
+        extent: RepresentationExtent,
+        auxiliaries: &AuxiliaryExtents,
+        visiting: &mut Vec<OperandAddress>,
+    ) -> Result<Vec<f32>, VindexError> {
+        let specs = codec.streams();
+        let Some((values, apart)) = specs.split_first() else {
+            return Err(VindexError::Parse(format!(
+                "`{}` declares no streams",
+                codec.encoding_label()
+            )));
+        };
+        // The dependencies first, in dependency order: a codec is handed
+        // what its dependency MEANS, never where it lives.
+        let auxiliaries =
+            self.resolve_auxiliaries(operand, codec, extent, auxiliaries, visiting)?;
+        if apart.is_empty() {
+            // One stream: the codec binds the payload itself, deriving any
+            // internal split it declares.
+            let bound = codec.bind_packed(&first.bytes, &operand.shape, &operand.tensor)?;
+            let operands = attach_auxiliaries(CodecOperands::from_streams(bound), &auxiliaries);
+            codec.validate(&operands, &operand.shape, extent, &operand.tensor)?;
+            return Ok(codec.decode_all(&operands, &operand.shape, extent, &operand.tensor)?);
+        }
+        // Streams stored apart. Only those the extent reads are opened —
+        // a refinement stream the extent does not reach is never touched,
+        // and a codec that needs one says so by refusing.
+        let needed = codec.streams_at(extent, &operand.tensor)?;
+        let mut siblings: Vec<RawOperand> = Vec::with_capacity(needed.len());
+        for spec in needed.iter().skip(1) {
+            siblings.push(self.load_raw(&OperandRef {
+                object: operand.object.clone(),
+                tensor: Self::sibling_stream_tensor(&operand.tensor, spec.name),
+                dtype: operand.dtype.clone(),
+                shape: operand.shape.clone(),
+            })?);
+        }
+        let mut streams = NamedStreams::new().with(*values, &first.bytes);
+        for (spec, sibling) in needed.iter().skip(1).zip(&siblings) {
+            streams = streams.with(*spec, &sibling.bytes);
+        }
+        let operands = attach_auxiliaries(CodecOperands::from_streams(streams), &auxiliaries);
+        codec.validate(&operands, &operand.shape, extent, &operand.tensor)?;
+        Ok(codec.decode_all(&operands, &operand.shape, extent, &operand.tensor)?)
     }
 
     /// This store's process-unique identity.
@@ -321,6 +886,37 @@ impl OperandStore {
     /// opened. The residency gate reads this.
     pub fn load_count(&self) -> u64 {
         self.loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// PHYSICAL bytes read from disk — the observed figure a preparation
+    /// ledger is held against.
+    pub fn bytes_read(&self) -> u64 {
+        self.read_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether this object's bytes are on disk.
+    ///
+    /// `false` for an object the container describes but has not
+    /// hydrated, and for one it does not describe at all — the caller
+    /// asking this question wants to know if a load would succeed, and
+    /// both answers are "no".
+    pub fn is_resident(&self, object: &str) -> bool {
+        self.segments.contains_key(object)
+    }
+
+    /// Objects described by the container whose bytes are not here.
+    pub fn absent_objects(&self) -> &std::collections::BTreeSet<String> {
+        &self.absent
+    }
+
+    /// The objects this store has resolved an operand out of.
+    ///
+    /// Measured, not predicted. A hydration set computed by folding over
+    /// a plan is a claim about what an execution will ask for; this is
+    /// what it did ask for, and the two agreeing on a real model is the
+    /// only thing that makes the fold trustworthy.
+    pub fn touched_objects(&self) -> std::collections::BTreeSet<String> {
+        self.touched.lock().unwrap().clone()
     }
 
     /// The dtype the container stores this operand as — tensor-table
@@ -338,13 +934,47 @@ impl OperandStore {
             .map(|t| t.dtype.as_str())
     }
 
+    /// The length the container RECORDS for this operand's stored bytes —
+    /// tensor-table metadata only, no payload read. An instance fact: for
+    /// an entropy-coded operand it is not a function of the shape, which
+    /// is exactly why the stored footprint reads it here and never from
+    /// a codec.
+    /// The operand's whole stored footprint: its own tensor, plus any
+    /// sibling stream the codec declares apart from it.
+    ///
+    /// Every plane a progressive artifact holds counts here whatever
+    /// extent execution later selects — the footprint is what the
+    /// container stores, and an extent decides what is READ, not what is
+    /// on disk. (For a codec whose streams are stored some other way the
+    /// sum is over what is found, so this is exactly the old reading.)
+    pub fn stored_len(&self, operand: &OperandRef) -> Option<u64> {
+        let segment = self.segments.get(&operand.object)?;
+        let tensor = segment.tensors.get(&operand.tensor)?;
+        let mut total = tensor.len;
+        if let Some(codec) = self.registry.by_label(&tensor.dtype) {
+            for spec in codec.streams().iter().skip(1) {
+                let sibling = Self::sibling_stream_tensor(&operand.tensor, spec.name);
+                total += segment.tensors.get(&sibling).map_or(0, |t| t.len);
+            }
+        }
+        Some(total)
+    }
+
     /// Load one operand's stored bytes and dtype, unwidened — for a
     /// caller that converts to a representation other than f32 (and for
     /// [`Self::load`] itself, so there is exactly one resolution path).
     pub fn load_raw(&self, operand: &OperandRef) -> Result<RawOperand, VindexError> {
         self.loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.touched.lock().unwrap().insert(operand.object.clone());
         let segment = self.segments.get(&operand.object).ok_or_else(|| {
+            if self.absent.contains(&operand.object) {
+                return VindexError::Parse(format!(
+                    "object `{}` is described by this container but its segment is \
+                     not resident — it was not hydrated",
+                    operand.object
+                ));
+            }
             VindexError::Parse(format!("no segment for object `{}`", operand.object))
         })?;
         let tensor = segment.tensors.get(&operand.tensor).ok_or_else(|| {
@@ -357,10 +987,65 @@ impl OperandStore {
         file.seek(SeekFrom::Start(segment.payload_start + tensor.offset))?;
         let mut bytes = vec![0u8; tensor.len as usize];
         file.read_exact(&mut bytes)?;
+        // Counted AFTER the read succeeds and from the buffer that was
+        // filled, so the figure is what came off the disk rather than
+        // what the tensor table said would.
+        self.read_bytes
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(RawOperand {
             dtype: tensor.dtype.clone(),
             bytes,
         })
+    }
+}
+
+impl OperandStore {
+    /// One operand's stored bytes as a region of its object's mapped
+    /// segment — bound, not read: no payload byte is copied, and the
+    /// object's segment is mapped once for every region taken from it.
+    /// `expected_len` is the byte count the plan's declared geometry
+    /// implies; a region of any other length is a container disagreeing
+    /// with the declaration and is refused rather than sliced.
+    pub fn map_region(
+        &self,
+        operand: &OperandRef,
+        expected_len: u64,
+    ) -> Result<WeightRegion, VindexError> {
+        let segment = self.segments.get(&operand.object).ok_or_else(|| {
+            VindexError::Parse(format!("no segment for object `{}`", operand.object))
+        })?;
+        self.touched.lock().unwrap().insert(operand.object.clone());
+        let store = {
+            let mut mapped = self.mapped.lock().unwrap();
+            match mapped.get(&operand.object) {
+                Some(store) => store.clone(),
+                None => {
+                    let store = Arc::new(PhysicalStore::map_segment(
+                        operand.object.clone(),
+                        &segment.path,
+                    )?);
+                    mapped.insert(operand.object.clone(), store.clone());
+                    store
+                }
+            }
+        };
+        let region = store.whole(&operand.tensor).ok_or_else(|| {
+            VindexError::Parse(format!(
+                "no tensor `{}` in `{}`'s segment",
+                operand.tensor, operand.object
+            ))
+        })?;
+        if region.len() != expected_len {
+            return Err(VindexError::Parse(format!(
+                "`{}`: {} stored bytes, the declared geometry implies {expected_len}; the \
+                 container and the plan disagree",
+                operand.tensor,
+                region.len()
+            )));
+        }
+        self.regions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(region)
     }
 }
 
@@ -372,7 +1057,7 @@ pub struct RawOperand {
 }
 
 /// Widen stored bytes to f32 — judged dtypes only, fail-closed.
-pub(super) fn widen(dtype: &str, bytes: &[u8], name: &str) -> Result<Vec<f32>, VindexError> {
+pub(crate) fn widen(dtype: &str, bytes: &[u8], name: &str) -> Result<Vec<f32>, VindexError> {
     match dtype {
         DTYPE_F32 => Ok(bytes
             .chunks_exact(4)
@@ -382,6 +1067,12 @@ pub(super) fn widen(dtype: &str, bytes: &[u8], name: &str) -> Result<Vec<f32>, V
             .chunks_exact(2)
             .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
             .collect()),
+        // IEEE half. Exact — every f16 value is representable in f32 —
+        // through the one half-precision decoder the workspace already
+        // judges, not a second bit-twiddling copy. First shipped estate:
+        // mamba2-780m (the checkpoint is F16 throughout, where the prior
+        // corpus was BF16).
+        DTYPE_F16 => Ok(larql_models::quant::half::decode_f16(bytes)),
         other => Err(VindexError::Parse(format!(
             "tensor `{name}`: no judged f32 widening for dtype `{other}`"
         ))),
@@ -575,6 +1266,11 @@ impl<'a> OperandSource<'a> {
         self.base
     }
 
+    /// The codecs this source decodes through.
+    pub fn registry(&self) -> &'static CodecRegistry {
+        self.base.registry()
+    }
+
     /// This source's identity, for stamping derived artefacts.
     pub fn stamp(&self) -> SourceStamp {
         SourceStamp {
@@ -592,24 +1288,19 @@ impl<'a> OperandSource<'a> {
         Ok(values)
     }
 
-    /// Whether this operand can be held in the checkpoint's own compact
-    /// bytes.
-    ///
-    /// Two conditions, and the second is easy to forget: the container
-    /// must store bf16, AND no overlay edit may stand in the way. An edit
-    /// is an f32-space fact with no representation in stored bytes, so an
-    /// edited operand has to be widened to be honoured at all — see
-    /// [`Self::load_raw`], which refuses it.
-    ///
-    /// False on anything it cannot establish. This decides how many bytes
-    /// a weight occupies, never what it means, so an unknown answers
-    /// "widen it" and the load path reports any real problem a moment
-    /// later with the tensor's name.
-    pub fn is_stored_bf16(&self, operand: &OperandRef) -> bool {
-        if self.overrides.is_some_and(|o| o.is_overridden(operand)) {
-            return false;
-        }
-        self.base.stored_dtype(operand) == Some(DTYPE_BF16)
+    /// Whether an overlay edit stands on this operand. An edit is an
+    /// f32-space fact with no representation in stored bytes, so the only
+    /// realization that can honour it decodes — the selector reads this
+    /// beside the registry's facts, and [`Self::load_raw`] refuses it.
+    pub fn is_overridden(&self, operand: &OperandRef) -> bool {
+        self.overrides.is_some_and(|o| o.is_overridden(operand))
+    }
+
+    /// The container's recorded length for an operand's stored bytes —
+    /// the base store's record; an overlay edit changes values, not what
+    /// the container holds.
+    pub fn stored_len(&self, operand: &OperandRef) -> Option<u64> {
+        self.base.stored_len(operand)
     }
 
     /// Load one operand's stored bytes unwidened. Overlay edits are

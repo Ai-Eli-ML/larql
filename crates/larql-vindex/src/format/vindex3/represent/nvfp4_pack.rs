@@ -296,37 +296,29 @@ impl CodecIdentity {
 
     /// Refuse a pack this build cannot decode under the rules it was
     /// written under.
+    ///
+    /// The decision is the codec registry's
+    /// ([`super::codec::CodecRegistry::admit`]): every registered family
+    /// is its OWN contract — `Q4_K` and `Q6_K` are different block
+    /// layouts, and filing them under one family would let a reader that
+    /// implements one accept the other's bytes on a revision match.
+    ///
+    /// The registry is a parameter, never the built-in default: this is
+    /// the gate a container's pack meets at open, and a store opened with
+    /// an external provider's registry must admit that provider's packs
+    /// here. A built-in default would have refused them before the
+    /// registry the store decodes through was ever consulted — the F8
+    /// falsifier, one seam further in.
+    pub fn admit_in(&self, registry: &super::codec::CodecRegistry) -> Result<(), VindexError> {
+        registry.admit(self).map(|_| ()).map_err(Into::into)
+    }
+
+    /// [`Self::admit_in`] against the built-in registry — a test's
+    /// shorthand, and test-only so no production path can reach a
+    /// registry that registration cannot.
+    #[cfg(test)]
     pub fn admit(&self) -> Result<(), VindexError> {
-        let want = Self::nvfp4_v1();
-        if self.family != want.family {
-            return Err(VindexError::Parse(format!(
-                "representation family `{}` is not `{}`",
-                self.family, want.family
-            )));
-        }
-        if self.revision != want.revision {
-            return Err(VindexError::Parse(format!(
-                "`{}` ABI revision {} was compiled by another build; this one \
-                 implements revision {}. Recompile the representation from its \
-                 canonical source rather than decoding it under new rules.",
-                self.family, self.revision, want.revision
-            )));
-        }
-        // A same-revision pack whose geometry disagrees is a corrupted or
-        // hand-edited index, not a version skew — say so differently.
-        if self.group_elems != want.group_elems
-            || self.element != want.element
-            || self.group_scale != want.group_scale
-            || self.tensor_scale != want.tensor_scale
-            || self.layout != want.layout
-        {
-            return Err(VindexError::Parse(format!(
-                "`{}` revision {} declares geometry this build does not \
-                 produce ({:?}); the index disagrees with its own revision",
-                self.family, self.revision, self
-            )));
-        }
-        Ok(())
+        self.admit_in(super::codec::CodecRegistry::builtin())
     }
 }
 
@@ -357,6 +349,14 @@ pub struct EncoderRecipe {
     pub algorithm: String,
     /// Revision within that family.
     pub revision: u32,
+    /// Upstream identity, for an encoder this workspace does not own.
+    ///
+    /// Absent for LARQL's own encoders, whose identity is the recipe
+    /// name. Present for a linked reference encoder, where the upstream
+    /// revision is part of what determines the bytes — so it takes part
+    /// in equality and therefore in the reproducibility claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl EncoderRecipe {
@@ -366,6 +366,7 @@ impl EncoderRecipe {
         Self {
             algorithm: "nvfp4-nearest".into(),
             revision: 1,
+            source: None,
         }
     }
 
@@ -377,12 +378,44 @@ impl EncoderRecipe {
         Self {
             algorithm: "nvfp4-gptq".into(),
             revision: 1,
+            source: None,
         }
     }
 
     /// The recipe this build compiles with.
     pub fn current() -> Self {
         Self::nearest_v1()
+    }
+
+    /// LARQL's own K-quant encoders. Legal, correctly-laid-out bytes
+    /// with LARQL's choice of values — measured against ggml at
+    /// Q8_0 0.9967, Q4_K 1.0326, Q6_K 1.1146 reconstruction RMS.
+    ///
+    /// Fine for a self-contained artifact; NOT the encoder a comparison
+    /// against a llama.cpp-derived artifact may use, because a
+    /// bit-width-dependent codec deficit would be indistinguishable from
+    /// an allocation difference.
+    pub fn kquant_native_v1() -> Self {
+        Self {
+            algorithm: "kquant-larql-native".into(),
+            revision: 1,
+            source: None,
+        }
+    }
+
+    /// The ecosystem's own encoder, linked and pinned.
+    ///
+    /// `source` carries the upstream revision because — unlike a LARQL
+    /// recipe name, which this type's docs rightly keep free of build
+    /// ids — an external encoder's upstream identity genuinely
+    /// determines the chosen values. It participates in equality, so
+    /// `is_reproducible_by_this_build` is honest across an upstream bump.
+    pub fn kquant_ggml_reference(upstream: &str) -> Self {
+        Self {
+            algorithm: "kquant-ggml-reference".into(),
+            revision: 1,
+            source: Some(upstream.to_string()),
+        }
     }
 
     /// `nvfp4-nearest-v1`, for reports and CLI output.

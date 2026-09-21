@@ -83,7 +83,7 @@ fn bf16_bytes(values: &[f32]) -> Vec<u8> {
 /// The miniature Gemma 4 checkpoint. `perturb` names one layer-relative
 /// operand (on the full layer for attention, every layer otherwise) whose
 /// values are scaled by [`PERTURB_GAIN`].
-fn miniature_gemma4(dir: &Path, perturb: Option<&str>) {
+pub(super) fn miniature_gemma4(dir: &Path, perturb: Option<&str>) {
     let layer_types: Vec<&str> = (0..LAYERS)
         .map(|i| {
             if i == FULL_LAYER {
@@ -298,14 +298,14 @@ fn miniature_gemma4(dir: &Path, perturb: Option<&str>) {
     shard.write(dir);
 }
 
-fn encoded(dir: &Path) -> tempfile::TempDir {
+pub(super) fn encoded(dir: &Path) -> tempfile::TempDir {
     let inventory = larql_models::inventory::build_inventory(dir).unwrap();
     let container = tempfile::tempdir().unwrap();
     encode_system(&[("mini-gemma4".to_string(), inventory)], container.path()).unwrap();
     container
 }
 
-fn closure(container: &Path) -> OpPlanOutcome {
+pub(super) fn closure(container: &Path) -> OpPlanOutcome {
     let inspection = inspect_container(container, false).unwrap();
     plan_component_ops(&inspection, container, "target").unwrap()
 }
@@ -340,11 +340,11 @@ fn final_logits(trace: &ExecutionTrace) -> &[f32] {
 }
 
 fn post_layer(trace: &ExecutionTrace, layer: usize) -> &[Vec<f32>] {
-    &trace.layers[layer].post_layer
+    trace.layers[layer].post_layer.rows()
 }
 
 fn post_attention(trace: &ExecutionTrace, layer: usize) -> &[Vec<f32>] {
-    &trace.layers[layer].post_attention
+    trace.layers[layer].post_attention.rows()
 }
 
 fn max_abs_1d(a: &[f32], b: &[f32]) -> f32 {
@@ -367,7 +367,7 @@ fn a_hybrid_gemma4_plan_closes_and_executes_at_parity_on_every_backend() {
     let plan = outcome.plan.as_ref().unwrap();
     for layer in &plan.layers {
         let hybrid = match &layer.ffn {
-            LayerFfn::Hybrid(op) => op,
+            Some(LayerFfn::Hybrid(op)) => op,
             other => panic!("layer {} is not hybrid: {other:?}", layer.layer),
         };
         assert!(hybrid.routed.router_scale.is_some());

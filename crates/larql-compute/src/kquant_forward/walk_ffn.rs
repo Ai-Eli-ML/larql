@@ -47,7 +47,7 @@ pub fn kquant_ffn_forward_layer(
         let w_up = dequantize_matrix(ffn[1].0, ffn[1].1, intermediate, hidden);
         dot_proj(x, &w_up)
     };
-    let activation = if arch.activation().uses_gelu_tanh_gate_up() {
+    let activation = if arch.gate_up_is_gelu_tanh() {
         gelu_tanh_gate_up(&gate, &up)
     } else {
         silu_gate_up(&gate, &up)
@@ -116,13 +116,14 @@ pub fn kquant_ffn_forward_layer_q8k(
         ffn[1].0, // up Q4K bytes
         intermediate,
         hidden,
-    );
+    )
+    .unwrap_or_else(|e| panic!("kquant_ffn_forward_layer_q8k layer {layer}: {e}"));
 
     // Wrap into Array2 for the shared activation + down path.
     let gate = Array2::from_shape_vec((1, intermediate), gate_flat).expect("gate shape");
     let up = Array2::from_shape_vec((1, intermediate), up_flat).expect("up shape");
 
-    let activation = if arch.activation().uses_gelu_tanh_gate_up() {
+    let activation = if arch.gate_up_is_gelu_tanh() {
         gelu_tanh_gate_up(&gate, &up)
     } else {
         silu_gate_up(&gate, &up)
@@ -141,7 +142,8 @@ pub fn kquant_ffn_forward_layer_q8k(
         let activation_flat = activation.as_slice().expect("activation contiguous");
         let act_q8k = quantize_x_to_q8k(activation_flat);
         let mut out = vec![0.0f32; hidden];
-        q4k_q8k_matvec_into(&mut out, &act_q8k, ffn[2].0, hidden, intermediate);
+        q4k_q8k_matvec_into(&mut out, &act_q8k, ffn[2].0, hidden, intermediate)
+            .unwrap_or_else(|e| panic!("kquant_ffn_forward_layer_q8k layer {layer}: {e}"));
         Array2::from_shape_vec((1, hidden), out).expect("down output shape")
     } else {
         // Fallback: OnceLock cache + ndarray dot; consults `ffn[2].1` via

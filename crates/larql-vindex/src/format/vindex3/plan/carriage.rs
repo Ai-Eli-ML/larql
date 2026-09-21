@@ -111,6 +111,11 @@ pub struct CarriageRule {
 pub struct ProbeContext<'a> {
     pub span: Option<AttentionSpan>,
     pub declared: &'a Value,
+    /// The registry label the component's declared identity resolved to,
+    /// `None` when no family matched. For the probes that judge a claim
+    /// about WHICH family serves the checkpoint, so they answer from the
+    /// resolution rather than from the flag.
+    pub family: Option<&'a str>,
 }
 
 impl ProbeContext<'_> {
@@ -129,6 +134,58 @@ impl ProbeContext<'_> {
     }
 }
 
+/// A declaration whose effect another declaration switches off.
+///
+/// Distinct from [`super::semantics::INERT_AT_VALUE`], which asks whether a
+/// key holds an inert value of its own. Here the key holds a perfectly
+/// real value and a *companion* says not to use it — so no probe of the
+/// graph can settle it, because the graph is right to carry nothing.
+///
+/// Qwen2.5 is the witness: `sliding_window: 32768` beside
+/// `use_sliding_window: false`. VINDEX3 resolves no window, which is
+/// correct, and the carriage rule read that agreement as a dropped fact
+/// and refused the checkpoint over a window it had been told not to
+/// apply.
+pub struct CompanionGate {
+    /// The leaf whose value is inert while the switch is off.
+    pub leaf: &'static str,
+    /// The leaf that switches it off, at the same nesting level.
+    pub switch: &'static str,
+    /// The switch value that disables it.
+    pub off: bool,
+}
+
+/// The gates. Each entry is a claim that one declaration cancels another,
+/// and needs the same justification as any other rule in this file.
+pub const COMPANION_GATES: &[CompanionGate] = &[CompanionGate {
+    leaf: "sliding_window",
+    switch: "use_sliding_window",
+    off: false,
+}];
+
+/// The switch that disables `path`, if one is declared beside it and set
+/// to its off value.
+///
+/// The companion is looked up at the SAME nesting level — `text_config.
+/// sliding_window` is gated by `text_config.use_sliding_window`, never by
+/// a root-level switch belonging to another component. A gate that
+/// reached across components would let one tower's flag silence another's
+/// window.
+pub fn disabled_by_companion<'a>(
+    path: &str,
+    keys: impl IntoIterator<Item = (&'a str, &'a Value)>,
+) -> Option<&'static str> {
+    let gate = COMPANION_GATES
+        .iter()
+        .find(|g| super::semantics::leaf_of(path) == g.leaf)?;
+    let prefix = &path[..path.len() - gate.leaf.len()];
+    let switch_path = format!("{prefix}{}", gate.switch);
+    keys.into_iter()
+        .find(|(p, _)| *p == switch_path)
+        .filter(|(_, v)| v.as_bool() == Some(gate.off))
+        .map(|_| gate.switch)
+}
+
 /// The rules. Every leaf classified
 /// [`ExecutionSemantic`](super::report::SemanticClass::ExecutionSemantic)
 /// must appear here or block.
@@ -136,6 +193,53 @@ impl ProbeContext<'_> {
 /// Adding a key here is a claim about the VINDEX3 schema, not about the
 /// parser — which is the whole point of the module.
 pub const CARRIAGE_RULES: &[CarriageRule] = &[
+    // ── Residual topology (wave 19) ─────────────────────────────────
+    //
+    // The three Sinkhorn hyper-connection parameters are one declared
+    // component fact, read together (a partial declaration refuses the
+    // surface, not these rules), carried to the component's residual
+    // topology, and lowered: the op plan carries it, and the decode step
+    // and batch traversal both run the bundle it declares.
+    CarriageRule {
+        leaf: "hc_mult",
+        reaches: Carriage::Lowered,
+        site: "Component.execution.residual_topology (ResidualTopology::HyperConnection.streams) → ComponentOpPlan.residual_topology → the executor's bundle carrier",
+        probe: Some(probe_hc_streams),
+    },
+    CarriageRule {
+        leaf: "hc_sinkhorn_iters",
+        reaches: Carriage::Lowered,
+        site: "Component.execution.residual_topology (ResidualTopology::HyperConnection.sinkhorn_iters) → hc_split_sinkhorn's pass count",
+        probe: Some(probe_hc_sinkhorn_iters),
+    },
+    CarriageRule {
+        leaf: "hc_eps",
+        reaches: Carriage::Lowered,
+        site: "Component.execution.residual_topology (ResidualTopology::HyperConnection.sinkhorn_eps) → hc_split_sinkhorn's epsilon",
+        probe: Some(probe_hc_eps),
+    },
+    // The attention-residual period (K3-ATTNRES-1). ONE declared
+    // component fact, carried to the component's residual topology and
+    // now all the way to a traversal that reads it. `Lowered` since
+    // K3-ATTNRES-1: the executor's history carrier asks this period
+    // which layers take a block-boundary snapshot, on the decode path
+    // (2a) and the batch path (2b), each witnessed against a Torch
+    // oracle transcribed from the reference. Before that it stopped at
+    // `Represented` on purpose, because a `Lowered` claim would have
+    // said a backend receives this period when nothing did.
+    //
+    // The COUNT does not move on this reader — the leaf was already
+    // Representable/ExecutionSemantic and non-blocking — and that is
+    // the point: a count that changed here would mean the stage name was
+    // doing work it should not. The probe still reads the BUILT surface,
+    // so a checkpoint whose surface does not build answers nothing here
+    // and keeps its blocker, the lesson wave 19 learned on DeepSeek-V4.
+    CarriageRule {
+        leaf: "attn_res_block_size",
+        reaches: Carriage::Lowered,
+        site: "Component.execution.residual_topology (ResidualTopology::AttentionResidual.block_size) → the executor's attention-residual history carrier, which reads the period to decide which layers take a block-boundary snapshot (opplan::exec::attention_residual::is_block_boundary, on the decode and batch traversals alike)",
+        probe: Some(probe_attn_res_block_size),
+    },
     // ── Position ────────────────────────────────────────────────────
     CarriageRule {
         leaf: "rope_theta",
@@ -158,24 +262,26 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
     CarriageRule {
         leaf: "rope_type",
         reaches: Carriage::Represented,
-        // PositionPolicy is `Rope { theta } | Yarn { theta, scaling } |
-        // None`: unscaled rotary, YaRN-scaled rotary (frequencies AND the
-        // attention amplitude), or no position encoding. Any other declared
-        // rope class (llama3, dynamic, ...) still has no variant and
-        // mismatches here — represented, not lowered: the interpreter and
-        // the lowering refuse a YaRN layer until A-9.3/A-9.4 execute it.
-        site: "Component.attention[].position (PositionPolicy::Rope | Yarn)",
+        // PositionPolicy is `Rope { theta } | Linear { theta, factor } |
+        // Yarn { theta, scaling } | Llama3 { theta, scaling } | None`:
+        // unscaled rotary, positions divided before rotation, YaRN-scaled
+        // rotary (frequencies AND the attention amplitude), Llama-3
+        // wavelength bands, or no position encoding. Any other declared
+        // rope class (dynamic, ...) still has no variant and mismatches
+        // here — represented, not lowered: the interpreter and the
+        // lowering refuse a YaRN layer until A-9.3/A-9.4 execute it.
+        site: "Component.attention[].position (PositionPolicy::Rope | Linear | Yarn | Llama3)",
         probe: Some(probe_rope_type),
     },
-    // The YaRN block's own leaves, each carried on `PositionPolicy::Yarn`
-    // and answered from it. A checkpoint that declares them without
-    // declaring `rope_type: yarn` gets no answer, which is right — the
-    // leaves mean nothing outside that block.
+    // The scaling block's own leaves, each carried on the policy variant
+    // its `rope_type` selects and answered from it. A checkpoint that
+    // declares them without declaring a scaling `rope_type` gets no
+    // answer, which is right — the leaves mean nothing outside a block.
     CarriageRule {
         leaf: "factor",
         reaches: Carriage::Represented,
-        site: "Component.attention[].position (PositionPolicy::Yarn.scaling.factor)",
-        probe: Some(probe_yarn_factor),
+        site: "Component.attention[].position ({Yarn,Llama3}.scaling.factor | Linear.factor)",
+        probe: Some(probe_scaling_factor),
     },
     CarriageRule {
         leaf: "beta_fast",
@@ -198,8 +304,8 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
     CarriageRule {
         leaf: "original_max_position_embeddings",
         reaches: Carriage::Represented,
-        site: "Component.attention[].position (PositionPolicy::Yarn.scaling.original_max_position_embeddings)",
-        probe: Some(probe_yarn_original_max),
+        site: "Component.attention[].position ({Yarn,Llama3}.scaling.original_max_position_embeddings)",
+        probe: Some(probe_scaling_original_max),
     },
     CarriageRule {
         leaf: "type",
@@ -213,17 +319,19 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
     CarriageRule {
         leaf: "low_freq_factor",
         reaches: Carriage::Represented,
-        // Llama-3-style rope scaling — a different scaling convention from
-        // the YaRN one `factor`/`beta_fast`/etc. above represent.
-        // `PositionPolicy::Yarn` has no field for it; always refuses.
-        site: "no schema field — Llama-3 rope scaling is not represented yet",
-        probe: Some(probe_unrepresented),
+        // Llama-3 wavelength-band scaling, carried on its own policy
+        // variant. It is NOT the YaRN convention `beta_fast`/`beta_slow`
+        // above represent: llama3 adjusts frequencies by wavelength band
+        // and leaves the amplitude at unity, where YaRN also rescales
+        // every logit. Two conventions, two blocks, one probe each.
+        site: "Component.attention[].position (PositionPolicy::Llama3.scaling.low_freq_factor)",
+        probe: Some(probe_llama3_low_freq),
     },
     CarriageRule {
         leaf: "high_freq_factor",
         reaches: Carriage::Represented,
-        site: "no schema field — Llama-3 rope scaling is not represented yet",
-        probe: Some(probe_unrepresented),
+        site: "Component.attention[].position (PositionPolicy::Llama3.scaling.high_freq_factor)",
+        probe: Some(probe_llama3_high_freq),
     },
     CarriageRule {
         leaf: "mscale",
@@ -253,6 +361,310 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
         site: "Component.attention[].window → AttentionOp.window",
         probe: Some(probe_sliding_window),
     },
+    // The window's ENABLE flag and its layer bound. Both are read by
+    // `ModelArchitecture::sliding_window_size`, which resolves all three
+    // declarations into one effective per-layer policy, and both are
+    // persisted by the vindex config round-trip — so the container does
+    // not lose them.
+    //
+    // `Parsed`, and that is the honest stage rather than a weak one: the
+    // effect of both facts is fully ABSORBED into the resolved per-layer
+    // window before a graph exists. `sliding_window_size` returns `None`
+    // for a disabled window and `is_sliding_window_layer` applies the
+    // bound, so what the container carries is the effective policy —
+    // there is no separate flag downstream to read back, and a deeper
+    // claim would need a probe the schema cannot answer.
+    CarriageRule {
+        leaf: "use_sliding_window",
+        reaches: Carriage::Parsed,
+        site: "absorbed by ModelArchitecture::sliding_window_size into the resolved \
+               per-layer window the graph carries; also persisted by the vindex config \
+               round-trip",
+        probe: None,
+    },
+    // The positional scheme, answered from the graph rather than the
+    // config, because on `granitemoehybrid` this key is the SWITCH: HF
+    // builds a rotary embedding only when it reads `rope`, so a
+    // checkpoint that omits it is a NoPE model. `Represented` and not
+    // `Parsed` — the effect is visible on every layer's carried
+    // PositionPolicy, so the container can be asked what it believes
+    // rather than trusted to have read the key.
+    // The rotary schedule, answered from the graph in the checkpoint's
+    // own polarity so a declared mask and a carried one are comparable
+    // term by term. `Represented`: each layer's PositionPolicy is what
+    // the schedule produced, so the container can be asked rather than
+    // trusted.
+    CarriageRule {
+        leaf: "no_rope_layers",
+        reaches: Carriage::Represented,
+        site: "Component.attention[].position — 1 where the layer rotates, 0 where it is NoPE,                the same polarity the checkpoint declares",
+        probe: Some(probe_no_rope_layers),
+    },
+    // The fallback generator. `Parsed`, and honestly so: both references
+    // consult it only when the mask is absent, so on a checkpoint that
+    // declares both it is SUPERSEDED and contributes nothing to the
+    // graph. Same shape as `max_window_layers` being inert while the
+    // window is disabled.
+    // The rotary PAIRING. No reference implementation reads this key, so
+    // there is no upstream behaviour to match — only this build's, which
+    // is split-half and uniform. `Represented` because the answer comes
+    // from the executor's own declared pairing rather than from the
+    // config that was just read.
+    CarriageRule {
+        leaf: "rope_interleaved",
+        reaches: Carriage::Represented,
+        site: "larql-compute rotates (x[i], x[i + half]) — split-half, so an interleaved \
+               pairing is a different operator and mismatches",
+        probe: Some(probe_rope_interleaved),
+    },
+    // The multi-axis flag, checked against the policy actually resolved
+    // from `mrope_section` + `mrope_interleaved` rather than against
+    // itself.
+    CarriageRule {
+        leaf: "use_mrope",
+        reaches: Carriage::Represented,
+        site: "Component.attention[].position — PositionPolicy::MRope when the axis geometry                resolves one, false otherwise",
+        probe: Some(probe_use_mrope),
+    },
+    // A claim about which family serves the checkpoint. Answered from the
+    // registry's resolution of the declared identity, never from the flag.
+    CarriageRule {
+        leaf: "is_llama_config",
+        reaches: Carriage::Represented,
+        site: "the registry entry the declared model_type resolved to — true when it is the \
+               Llama family, false for any other or none",
+        probe: Some(probe_is_llama_config),
+    },
+    CarriageRule {
+        leaf: "no_rope_layer_interval",
+        reaches: Carriage::Parsed,
+        site: "absorbed by ModelArchitecture::position_policy_for_layer as the schedule when                no_rope_layers is absent; superseded by an explicit mask, as upstream supersedes it",
+        probe: None,
+    },
+    CarriageRule {
+        leaf: "position_embedding_type",
+        reaches: Carriage::Represented,
+        site: "Component.attention[].position — a rotating policy answers `rope`, a stack \
+               that rotates nowhere answers null",
+        probe: Some(probe_position_embedding_type),
+    },
+    CarriageRule {
+        leaf: "max_window_layers",
+        reaches: Carriage::Parsed,
+        site: "absorbed by ModelArchitecture::is_sliding_window_layer as the bound on an \
+               enabled window; also persisted by the vindex config round-trip",
+        probe: None,
+    },
+    // Inkling-Small's spelling of the same window. One site, because it
+    // is one fact: the graph carries a window per layer whichever key
+    // stated it.
+    CarriageRule {
+        leaf: "sliding_window_size",
+        reaches: Carriage::Lowered,
+        site: "Component.attention[].window → AttentionOp.window",
+        probe: Some(probe_sliding_window),
+    },
+    // The index-set spelling of the per-layer topology, carried to the
+    // same place `layer_types` is — which is the claim worth testing: two
+    // very different declarations reaching one canonical policy.
+    CarriageRule {
+        leaf: "local_layer_ids",
+        reaches: Carriage::Lowered,
+        site: "Component.attention[].{operator,span} → LayerAttention::{Kda,GatedDelta,Softmax}",
+        // An index SET, compared by cardinality against the resolved
+        // table — the array probe would render a `layer_types` array and
+        // never equal the declared set of indices.
+        probe: Some(probe_sliding_layer_set),
+    },
+    CarriageRule {
+        leaf: "d_rel",
+        reaches: Carriage::Represented,
+        site: "Component.attention[].position → PositionPolicy::Relative",
+        probe: Some(probe_relative_d_rel),
+    },
+    CarriageRule {
+        leaf: "rel_extent",
+        reaches: Carriage::Represented,
+        site: "Component.attention[].position → PositionPolicy::Relative",
+        probe: Some(probe_relative_extent),
+    },
+    // ── MoE facts, in every spelling that reaches one surface ────────
+    CarriageRule {
+        leaf: "moe_renormalize",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe.routing_policy",
+        probe: Some(probe_moe_routing_policy),
+    },
+    CarriageRule {
+        leaf: "num_shared_experts",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe.shared_experts",
+        probe: Some(probe_moe_shared_experts),
+    },
+    // The same branch's WIDTH, which two lineages state two ways. The
+    // container carries the resolved width, so this is checked against
+    // what the branch will actually be built at — not echoed back.
+    CarriageRule {
+        leaf: "shared_expert_intermediate_size",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.moe.shared_expert_intermediate_size → SharedExpertOp.intermediate_size (and the shared-expert operand shapes)",
+        probe: Some(probe_shared_expert_width),
+    },
+    CarriageRule {
+        leaf: "moe_shared_expert_intermediate_size",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.moe.shared_expert_intermediate_size → SharedExpertOp.intermediate_size (and the shared-expert operand shapes)",
+        probe: Some(probe_shared_expert_width),
+    },
+    // Kimi-K3's latent routed branch (K3-LATENTMOE-1). `Lowered`, and
+    // the claim is exact: the width reaches `LatentBranchOp.width`, where
+    // it is BOTH the geometry every routed-bank shape contract is sized
+    // from and the width the two wrapper projections are bound at — so a
+    // build that stored the number and kept sizing the bank from
+    // `hidden_size` would fail this rule's probe and the op plan
+    // together, rather than reporting a fact it does not honour.
+    //
+    // The domain was measured before the rule was promised: exactly one
+    // of the 117 conformance rows declares either leaf. The previous
+    // rung's `q_lora_rank` rule was withdrawn for the opposite reason —
+    // it reached eighteen rows of which only six built the surface it
+    // named — and that withdrawal is why this one is checked first.
+    CarriageRule {
+        leaf: "routed_expert_hidden_size",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.moe.latent.width → LatentBranchOp.width, and through MoeSurface::routed_expert_input_width every routed expert-bank shape contract",
+        probe: Some(probe_routed_expert_width),
+    },
+    CarriageRule {
+        leaf: "latent_moe_use_norm",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.moe.latent.norm → LatentBranchOp.norm — the RMS norm on the weighted aggregate, between summation and the up-projection",
+        probe: Some(probe_latent_moe_use_norm),
+    },
+    CarriageRule {
+        leaf: "moe_router_activation_func",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe.router_kind",
+        probe: Some(probe_moe_router_kind),
+    },
+    CarriageRule {
+        leaf: "scoring_func",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe.router_kind",
+        probe: Some(probe_moe_router_kind),
+    },
+    CarriageRule {
+        leaf: "moe_layer_freq",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe — every layer after the dense prefix is routed",
+        probe: Some(probe_identity_valued),
+    },
+    // Expert grouping. At one group the router selects over every expert,
+    // which is what an ungrouped router does — so the schema represents
+    // its effect exactly, by having none. Any other value is a real
+    // grouping this schema cannot state, and refuses.
+    CarriageRule {
+        leaf: "num_expert_group",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe — one group is ungrouped routing",
+        probe: Some(probe_identity_valued),
+    },
+    CarriageRule {
+        leaf: "n_group",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe — one group is ungrouped routing",
+        probe: Some(probe_identity_valued),
+    },
+    CarriageRule {
+        leaf: "topk_group",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe — one group is ungrouped routing",
+        probe: Some(probe_identity_valued),
+    },
+    CarriageRule {
+        leaf: "use_grouped_topk",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe — grouping is a no-op at one group",
+        probe: Some(probe_grouping_is_a_no_op),
+    },
+    // ── The interleave, in the two-set spelling, and the KDA conv ────
+    CarriageRule {
+        leaf: "kda_layers",
+        reaches: Carriage::Lowered,
+        site: "Component.attention[].{operator,span} → LayerAttention::{Kda,GatedDelta,Softmax}",
+        probe: Some(probe_recurrent_layer_set),
+    },
+    CarriageRule {
+        leaf: "full_attn_layers",
+        reaches: Carriage::Lowered,
+        site: "Component.attention[].{operator,span} → LayerAttention::{Kda,GatedDelta,Softmax}",
+        probe: Some(probe_softmax_layer_set),
+    },
+    CarriageRule {
+        leaf: "gate_lower_bound",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.kda_gate_lower_bound → KdaOp.gate_lower_bound",
+        probe: Some(probe_kda_gate_lower_bound),
+    },
+    CarriageRule {
+        leaf: "short_conv_kernel_size",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.kda.conv_kernel → KdaOp.conv_kernel",
+        probe: Some(probe_kda_conv_kernel),
+    },
+    // The KDA output gate's FORM (K3-REP-GATE-1). Lowered: the op carries
+    // the form as a type, the executor projects the gate from whichever
+    // operand the form names, and closure holds the shipped operands to
+    // the declaration from both sides.
+    CarriageRule {
+        leaf: "use_full_rank_gate",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.kda_use_full_rank_gate → KdaOp.output_gate (KdaOutputGate::{LowRank,FullRank}) → exec::kda output-gate projection",
+        probe: Some(probe_kda_use_full_rank_gate),
+    },
+    // A rescale of the whole routed branch, which this schema's MoE
+    // surface has no field for. Refuses — and refusing for a stated reason
+    // is the point of reading it: a key nothing reads blocks with no
+    // account of why.
+    CarriageRule {
+        leaf: "routed_scaling_factor",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe.branch_scale",
+        probe: Some(probe_moe_branch_scale),
+    },
+    // How many leading layers are dense. The op plan decides each layer's
+    // FFN kind from operand evidence, but no field on the graph states the
+    // prefix, so the declaration is not carried.
+    CarriageRule {
+        leaf: "first_k_dense_replace",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn.moe.dense_prefix_layers",
+        probe: Some(probe_moe_dense_prefix),
+    },
+    // Kimi Linear declares it true while carrying `qk_rope_head_dim: 64`,
+    // so what it asserts about the rotary is not yet judged. Unjudged is
+    // the honest verdict, and it blocks.
+    CarriageRule {
+        leaf: "mla_use_nope",
+        reaches: Carriage::Represented,
+        site: "Component.attention[].position → PositionPolicy::None",
+        probe: Some(probe_mla_nope),
+    },
+    CarriageRule {
+        leaf: "model_max_length",
+        reaches: Carriage::Parsed,
+        site: "no schema field — a KV-allocation bound, read by no generic op",
+        probe: None,
+    },
+    CarriageRule {
+        leaf: "num_nextn_predict_layers",
+        reaches: Carriage::Represented,
+        site: "no schema field — this schema has no multi-token-prediction object",
+        // Zero declared layers is no MTP head, which this schema
+        // represents exactly by carrying none. Any positive count is a
+        // sub-stack it cannot state, and refuses.
+        probe: Some(probe_absent_when_zero),
+    },
     CarriageRule {
         leaf: "sliding_window_pattern",
         reaches: Carriage::Represented,
@@ -277,6 +689,15 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
     // ── Norms ───────────────────────────────────────────────────────
     CarriageRule {
         leaf: "rms_norm_eps",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.norm.pre.eps → NormOp.eps",
+        probe: Some(probe_pre_norm_eps),
+    },
+    // LFM2 spells the same fact `norm_eps`. Its separate
+    // `block_norm_eps` is NOT this fact and has no rule, so it keeps
+    // refusing until something judges the FFN blocks it names.
+    CarriageRule {
+        leaf: "norm_eps",
         reaches: Carriage::Lowered,
         site: "ExecutionSurface.norm.pre.eps → NormOp.eps",
         probe: Some(probe_pre_norm_eps),
@@ -320,6 +741,25 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
         site: "ExecutionSurface.ffn.activation → FfnOp.activation",
         probe: Some(probe_activation),
     },
+    // Falcon's one-word FFN shape: `swiglu` is gated + SiLU, `geglu` is
+    // gated + GELU, a plain nonlinearity name is the ungated shape. Two
+    // surface facts answer for one declared word.
+    CarriageRule {
+        leaf: "activation",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.{ffn_type, activation} → FfnOp — the shape the word names",
+        probe: Some(probe_ffn_shape_name),
+    },
+    // E30 static shards: a derived checkpoint declares each layer's dense
+    // FFN width. Lowered: the planner shapes every layer's gate/up/down
+    // against it and states it on that layer's `FfnOp`, which the CPU
+    // paths and the Metal lowering read as the layer's intermediate width.
+    CarriageRule {
+        leaf: "larql_ffn_intermediate_size_by_layer",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.intermediate_size_by_layer → FfnOp.intermediate_size, per layer",
+        probe: Some(probe_ffn_width_by_layer),
+    },
     CarriageRule {
         leaf: "swiglu_limit",
         reaches: Carriage::Represented,
@@ -330,6 +770,24 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
         // and the lowering refuse a ClampedGlu FFN until A-9.3/A-9.4.
         site: "ExecutionSurface.ffn.gate_policy (ExpertGatePolicy::ClampedGlu.limit) → FfnOp.gate_policy",
         probe: Some(probe_swiglu_limit),
+    },
+    // Kimi-K3's SiTU-GLU softcaps. Parameters of the combine that
+    // `hidden_act: "situ"` names — carried as a gate POLICY, for the same
+    // reason `swiglu_limit` is: the bound changes the model, not the
+    // nonlinearity. Lowered rather than represented, because unlike
+    // ClampedGlu both the interpreter and the Metal lowering execute this
+    // one, and a fact's claimed carriage must be the carriage witnessed.
+    CarriageRule {
+        leaf: "activation_situ_beta",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.gate_policy (ExpertGatePolicy::SituGlu.beta) → FfnOp.gate_policy",
+        probe: Some(probe_situ_beta),
+    },
+    CarriageRule {
+        leaf: "activation_situ_linear_beta",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.gate_policy (ExpertGatePolicy::SituGlu.linear_beta) → FfnOp.gate_policy",
+        probe: Some(probe_situ_linear_beta),
     },
     // ── Attention/output scaling ────────────────────────────────────
     CarriageRule {
@@ -411,13 +869,13 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
     CarriageRule {
         leaf: "norm_topk_prob",
         reaches: Carriage::Represented,
-        // Whether router weights are renormalised after top-k selection —
-        // `RoutedFfnOp.routing_policy` judges the routing math itself
-        // (`MoeRouterKind`/`ExpertRoutingPolicy`), but no field states this
-        // flag directly; always refuses rather than assuming it agrees
-        // with whatever the judged policy happens to imply.
-        site: "no schema field — not yet cross-checked against routing_policy",
-        probe: Some(probe_unrepresented),
+        // Whether router weights are renormalised after top-k selection.
+        // The cross-check this rule once said it lacked now exists: the
+        // routing policy IS this flag, and `moe_renormalize` is the same
+        // fact in Kimi Linear's spelling. See `probe_moe_routing_policy`
+        // for why it reports rather than compares.
+        site: "ExecutionSurface.ffn.moe.routing_policy",
+        probe: Some(probe_moe_routing_policy),
     },
     CarriageRule {
         leaf: "num_experts_per_tok",
@@ -590,11 +1048,262 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
         site: "ExecutionSurface.linear_attention.state_dtype → GatedDeltaState precision",
         probe: Some(probe_linear_state_dtype),
     },
+    // ── Mamba2/SSD mixer geometry and switches (schema 6). Represented,
+    //    not Lowered: the surface holds every fact and no executor
+    //    consumes it yet — claiming Lowered would assert an operator that
+    //    does not exist (the same honesty `mamba_ssm_dtype` held to until
+    //    QW-2's reference operator landed). ──
+    CarriageRule {
+        leaf: "state_size",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.state_size",
+        probe: Some(probe_mamba2_state_size),
+    },
+    CarriageRule {
+        leaf: "expand",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.expand",
+        probe: Some(probe_mamba2_expand),
+    },
+    CarriageRule {
+        leaf: "conv_kernel",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.conv_kernel",
+        probe: Some(probe_mamba2_conv_kernel),
+    },
+    CarriageRule {
+        leaf: "n_groups",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.n_groups",
+        probe: Some(probe_mamba2_n_groups),
+    },
+    CarriageRule {
+        leaf: "chunk_size",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.chunk_size",
+        probe: Some(probe_mamba2_chunk_size),
+    },
+    CarriageRule {
+        leaf: "time_step_limit",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.dt_limit_{min,max} — the judged \
+               non-finite boundary: a bare `Infinity` is carried as a declared \
+               unbounded side, never a fabricated float",
+        probe: Some(probe_mamba2_time_step_limit),
+    },
+    CarriageRule {
+        leaf: "rms_norm",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.rms_norm — the mixer's gated RMSNorm",
+        probe: Some(probe_mamba2_rms_norm),
+    },
+    CarriageRule {
+        leaf: "use_bias",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.use_bias (closure-paired with the \
+               in/out projection bias operands)",
+        probe: Some(probe_mamba2_use_bias),
+    },
+    CarriageRule {
+        leaf: "use_conv_bias",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.use_conv_bias (closure-paired with \
+               the conv bias operand)",
+        probe: Some(probe_mamba2_use_conv_bias),
+    },
+    // ── The mamba_ssm key dialect (OuteAI Mamba2Attn): three renamed
+    //    geometry keys and the projection-bias switch, read into the SAME
+    //    `Mamba2Geometry` fields their HF twins fill — so each probe
+    //    answers from the same surface site. ──
+    CarriageRule {
+        leaf: "mamba2_num_heads",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.num_heads",
+        probe: Some(probe_mamba2_num_heads),
+    },
+    CarriageRule {
+        leaf: "mamba2_head_dim",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.head_dim",
+        probe: Some(probe_mamba2_head_dim),
+    },
+    CarriageRule {
+        leaf: "mamba2_conv_kernel",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.conv_kernel",
+        probe: Some(probe_mamba2_conv_kernel),
+    },
+    CarriageRule {
+        leaf: "use_mamba2_bias",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.use_bias (closure-paired with the \
+               in/out projection bias operands)",
+        probe: Some(probe_mamba2_use_bias),
+    },
+    // ── The hybrid's conv-QKV attention block. Represented, not
+    //    Lowered: the surface holds every fact and no executor consumes
+    //    it yet — the same honesty the Mamba2 rules held to until the
+    //    reference operator landed. ──
+    CarriageRule {
+        leaf: "attention_head_dim",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.conv_qkv.head_dim",
+        probe: Some(probe_conv_qkv_head_dim),
+    },
+    CarriageRule {
+        leaf: "attention_conv_kernel",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.conv_qkv.conv_kernel",
+        probe: Some(probe_conv_qkv_conv_kernel),
+    },
+    CarriageRule {
+        leaf: "rope_emb_dim",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.conv_qkv.rotary_dim — the partial-rotary width, also \
+               carried per layer as PositionPolicy::PartialRope",
+        probe: Some(probe_conv_qkv_rotary_dim),
+    },
+    CarriageRule {
+        leaf: "use_attention_qkv_bias",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.conv_qkv.qkv_bias — a declared-FALSE is carried; a \
+               declared-TRUE has no judged bias role yet and must block",
+        probe: Some(probe_conv_qkv_qkv_bias),
+    },
+    CarriageRule {
+        leaf: "use_attention_out_bias",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.conv_qkv.out_bias — same contract as the QKV bias \
+               switch",
+        probe: Some(probe_conv_qkv_out_bias),
+    },
+    CarriageRule {
+        leaf: "attention_layers_idx",
+        reaches: Carriage::Represented,
+        site: "Component.attention[] — the per-layer operator table; the declared set \
+               is echoed only when the table's conv-QKV layers correspond to it \
+               under a consistent index base",
+        probe: Some(probe_attention_layer_idx),
+    },
+    CarriageRule {
+        leaf: "attn_layer_idx",
+        reaches: Carriage::Represented,
+        site: "Component.attention[] — the state-spaces spelling of the same set",
+        probe: Some(probe_attention_layer_idx),
+    },
+    // ── The mamba_ssm lineage's MLP declaration. ──
+    CarriageRule {
+        leaf: "mlp_intermediate_size",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn presence per layer — 0 declares NO MLP blocks, \
+               carried as every layer's absent FFN op; a non-zero width has no \
+               judged lowering yet and must block",
+        probe: Some(probe_mlp_intermediate_size),
+    },
+    CarriageRule {
+        leaf: "mlp_padding_size",
+        reaches: Carriage::Represented,
+        site: "no schema field — pads an MLP width; inert exactly when \
+               mlp_intermediate_size declares 0 (no MLP exists to pad), blocking \
+               otherwise",
+        probe: Some(probe_mlp_padding_size),
+    },
+    CarriageRule {
+        leaf: "use_mlp_bias",
+        reaches: Carriage::Represented,
+        site: "no schema field — biases an MLP; inert exactly when \
+               mlp_intermediate_size declares 0, blocking otherwise",
+        probe: Some(probe_mlp_padding_size),
+    },
+    // ── The mamba_ssm-native nested spellings. ──
+    CarriageRule {
+        leaf: "layer",
+        reaches: Carriage::Represented,
+        site: "Component.attention[].operator — `ssm_cfg.layer` names the layer class; \
+               \"Mamba2\" is represented as the mixer operator, and any other class \
+               finds no surface and blocks",
+        probe: Some(probe_ssm_layer_class),
+    },
+    CarriageRule {
+        leaf: "d_conv",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.{conv_qkv,mamba2}.conv_kernel — whichever block declared \
+               it; a width matching neither blocks",
+        probe: Some(probe_declared_conv_kernel),
+    },
+    CarriageRule {
+        leaf: "d_state",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.state_size — the ssm_cfg spelling",
+        probe: Some(probe_mamba2_state_size),
+    },
+    CarriageRule {
+        leaf: "headdim",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.head_dim — the ssm_cfg spelling",
+        probe: Some(probe_mamba2_head_dim),
+    },
+    CarriageRule {
+        leaf: "ngroups",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.mamba2.geometry.n_groups — the ssm_cfg spelling",
+        probe: Some(probe_mamba2_n_groups),
+    },
+    CarriageRule {
+        leaf: "rotary_emb_dim",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.conv_qkv.rotary_dim",
+        probe: Some(probe_conv_qkv_rotary_dim),
+    },
+    CarriageRule {
+        leaf: "qkv_proj_bias",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.conv_qkv.qkv_bias — declared-FALSE carried; TRUE blocks",
+        probe: Some(probe_conv_qkv_qkv_bias),
+    },
+    CarriageRule {
+        leaf: "out_proj_bias",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.conv_qkv.out_bias — same contract",
+        probe: Some(probe_conv_qkv_out_bias),
+    },
+    CarriageRule {
+        leaf: "causal",
+        reaches: Carriage::Represented,
+        site: "the conv-QKV operator's masking — causal by construction; a declared \
+               non-causal block has no operator and blocks",
+        probe: Some(probe_attn_causal),
+    },
+    CarriageRule {
+        leaf: "d_intermediate",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.ffn presence per layer — mamba_ssm's own spelling of \
+               mlp_intermediate_size; 0 declares NO MLP blocks",
+        probe: Some(probe_mlp_intermediate_size),
+    },
+    CarriageRule {
+        leaf: "residual_in_fp32",
+        reaches: Carriage::Represented,
+        site: "ExecutionSurface.residual_in_fp32 — residual-stream precision, declared",
+        probe: Some(probe_residual_in_fp32),
+    },
     CarriageRule {
         leaf: "attn_output_gate",
         reaches: Carriage::Lowered,
         site: "ExecutionSurface.attention.output_gate → GateOp → the gated attention op",
         probe: Some(probe_attn_output_gate),
+    },
+    // MLA's output gate (K3-REP-GATE-1): the same generic gate the softmax
+    // rule above carries, on the MLA surface. Lowered: the op carries the
+    // gate operand, and the executor gates the aggregated value before
+    // `o_proj`. The probe answers from the BUILT surface, as the softmax
+    // one does — a declared `false` reads as "no gate", which is what the
+    // surface says, so declaration and carriage agree on both values.
+    CarriageRule {
+        leaf: "mla_use_output_gate",
+        reaches: Carriage::Lowered,
+        site: "MlaSurface.output_gate (AttentionGateSpec) → MlaOp.output_gate → exec::mla gated_value",
+        probe: Some(probe_mla_use_output_gate),
     },
     CarriageRule {
         leaf: "output_gate_type",
@@ -706,7 +1415,52 @@ fn probe_unrepresented(_component: &Component, _ctx: &ProbeContext<'_>) -> Optio
 /// its full layers and 1e4 on its sliding ones — two facts, two probes).
 /// A per-layer split (Muse-Glimmer's `layer_rope_theta`) answers `None`
 /// here and is checked by [`probe_layer_rope_theta`] instead.
+/// The declared hyper-connection topology, when the component carries
+/// one; `None` on a single stream (the leaf would not be declared) and
+/// on a component with no surface.
+fn probe_hc(component: &Component) -> Option<larql_models::config::HyperConnection> {
+    match component.execution.as_ref()?.residual_topology {
+        larql_models::config::ResidualTopology::HyperConnection(hc) => Some(hc),
+        larql_models::config::ResidualTopology::SingleStream
+        | larql_models::config::ResidualTopology::AttentionResidual { .. } => None,
+    }
+}
+
+fn probe_hc_streams(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(probe_hc(component)?.streams))
+}
+
+fn probe_hc_sinkhorn_iters(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(probe_hc(component)?.sinkhorn_iters))
+}
+
+fn probe_hc_eps(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(probe_hc(component)?.sinkhorn_eps))
+}
+
+/// The declared attention-residual period, read back off the BUILT
+/// surface. `None` on any other topology (the leaf would not be
+/// declared) and on a component with no surface — which is the honest
+/// answer, and the one that keeps a row blocked until its surface builds.
+fn probe_attn_res_block_size(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    match component.execution.as_ref()?.residual_topology {
+        larql_models::config::ResidualTopology::AttentionResidual { block_size } => {
+            Some(json!(block_size))
+        }
+        larql_models::config::ResidualTopology::SingleStream
+        | larql_models::config::ResidualTopology::HyperConnection(_) => None,
+    }
+}
+
 fn probe_rope_theta(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    // Nothing in scope rotates: the declared base is inert, and reporting
+    // it as uncarried would demand a rotation the model does not perform.
+    // See the matching arm in `plan::compare::rope_theta_findings`.
+    if layers_in_scope(component, ctx)?
+        .all(|l| l.position == larql_models::config::PositionPolicy::None)
+    {
+        return Some(ctx.declared.clone());
+    }
     let mut thetas = layers_in_scope(component, ctx)?.filter_map(|l| l.position.rope_theta());
     let first = thetas.next()?;
     thetas.all(|t| t == first).then(|| json!(first))
@@ -722,6 +1476,66 @@ fn probe_layer_rope_theta(component: &Component, _ctx: &ProbeContext<'_>) -> Opt
             .map(|l| json!(l.position.rope_theta().unwrap_or(0.0)))
             .collect(),
     ))
+}
+
+/// This build's rotary pairing.
+///
+/// Constant because the executor has exactly one pairing — split-half,
+/// `(x[i], x[i + half])` — and the point of answering at all is that a
+/// checkpoint declaring the interleaved pairing gets a mismatch instead
+/// of a rotation performed against different partners in silence. The
+/// value comes from [`ROPE_PAIRING_INTERLEAVED`], which
+/// `larql-compute`'s own gate pins to the executor, so this cannot drift
+/// away from what actually runs.
+fn probe_rope_interleaved(_component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(larql_models::config::ROPE_PAIRING_INTERLEAVED))
+}
+
+/// Whether the resolved policy is multi-axis rotary.
+///
+/// Answered from the policy the axis geometry produced, never from the
+/// flag itself — a probe that echoed `use_mrope` back would agree with
+/// every checkpoint including one declaring `true` with no
+/// `mrope_section` to build it from.
+fn probe_use_mrope(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    let mut layers = layers_in_scope(component, ctx)?;
+    Some(json!(layers.any(|l| matches!(
+        l.position,
+        larql_models::config::PositionPolicy::MRope { .. }
+    ))))
+}
+
+/// The rotary schedule the graph carries, in the checkpoint's polarity.
+///
+/// `1` where the layer rotates and `0` where it does not — deliberately
+/// the declared spelling and not a boolean, so the probe's answer and
+/// the declaration are comparable element by element. Emitting the
+/// natural-language polarity instead would make every SmolLM3 look
+/// mismatched while being right.
+fn probe_no_rope_layers(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let table = component.attention.as_ref()?;
+    Some(Value::Array(
+        table
+            .iter()
+            .map(|l| json!(i64::from(l.position.rope_theta().is_some())))
+            .collect(),
+    ))
+}
+
+/// The positional scheme the graph actually carries.
+///
+/// `rope` when any layer in scope rotates; `null` when none does, which
+/// is an ANSWER and not a failure to answer — "this stack encodes no
+/// position" is exactly what a `granitemoehybrid` without the opt-in
+/// means, and reporting it as unknown would hide the case the rule
+/// exists for. Mirrors `probe_sliding_window`, which answers null the
+/// same way for a stack with no windowed layer.
+fn probe_position_embedding_type(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    let mut layers = layers_in_scope(component, ctx)?;
+    Some(match layers.any(|l| l.position.rope_theta().is_some()) {
+        true => json!(larql_models::config::POSITION_EMBEDDING_TYPE_ROPE),
+        false => Value::Null,
+    })
 }
 
 /// The rope *class* the layers in scope carry, in the checkpoint's own
@@ -752,11 +1566,19 @@ fn probe_k_eq_v(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value>
 }
 
 fn probe_moe_enabled(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
-    Some(json!(component.execution.as_ref()?.ffn.moe.is_some()))
+    Some(json!(component
+        .execution
+        .as_ref()?
+        .ffn
+        .as_ref()?
+        .moe
+        .is_some()))
 }
 
 fn probe_moe_top_k(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
-    Some(json!(component.execution.as_ref()?.ffn.moe?.top_k))
+    Some(json!(
+        component.execution.as_ref()?.ffn.as_ref()?.moe?.top_k
+    ))
 }
 
 /// The head width the full-attention layers carry — the fact
@@ -771,10 +1593,12 @@ fn probe_full_layer_head_dim(component: &Component, _ctx: &ProbeContext<'_>) -> 
         .filter(|l| l.span == Some(AttentionSpan::Full))
         .map(|l| {
             l.geometry
-                .map_or(surface.attention.head_dim, |g| g.head_dim)
+                .map_or(surface.attention.as_ref().map(|a| a.head_dim), |g| {
+                    Some(g.head_dim)
+                })
         });
-    let first = dims.next()?;
-    dims.all(|d| d == first).then(|| json!(first))
+    let first = dims.next()??;
+    dims.all(|d| d == Some(first)).then(|| json!(first))
 }
 
 /// The KV-head count the full-attention layers carry.
@@ -786,10 +1610,12 @@ fn probe_full_layer_kv_heads(component: &Component, _ctx: &ProbeContext<'_>) -> 
         .filter(|l| l.span == Some(AttentionSpan::Full))
         .map(|l| {
             l.geometry
-                .map_or(surface.attention.num_kv_heads, |g| g.num_kv_heads)
+                .map_or(surface.attention.as_ref().map(|a| a.num_kv_heads), |g| {
+                    Some(g.num_kv_heads)
+                })
         });
-    let first = heads.next()?;
-    heads.all(|h| h == first).then(|| json!(first))
+    let first = heads.next()??;
+    heads.all(|h| h == Some(first)).then(|| json!(first))
 }
 
 /// A fact the schema represents only as absent: the built component
@@ -833,6 +1659,7 @@ fn probe_attn_output_gate(component: &Component, _ctx: &ProbeContext<'_>) -> Opt
         .execution
         .as_ref()?
         .attention
+        .as_ref()?
         .output_gate
         .is_some()))
 }
@@ -853,7 +1680,7 @@ fn probe_attn_output_gate(component: &Component, _ctx: &ProbeContext<'_>) -> Opt
 /// close instead, which is why the identity is asserted against the
 /// component's own resolved `head_dim` rather than any nearby 128.
 fn mrope_of(component: &Component, ctx: &ProbeContext<'_>) -> Option<([usize; 3], bool)> {
-    let head_dim = component.execution.as_ref()?.attention.head_dim;
+    let head_dim = component.execution.as_ref()?.attention.as_ref()?.head_dim;
     let mut policies = layers_in_scope(component, ctx)?.filter_map(|l| {
         l.position
             .mrope()
@@ -892,8 +1719,53 @@ fn yarn_block(component: &Component) -> Option<larql_models::YarnRopeScaling> {
         .find_map(|l| l.position.yarn())
 }
 
-fn probe_yarn_factor(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
-    Some(json!(yarn_block(component)?.factor))
+/// The Llama-3 block a built layer carries, if any.
+fn llama3_block(component: &Component) -> Option<larql_models::Llama3RopeScaling> {
+    component
+        .attention
+        .as_ref()?
+        .iter()
+        .find_map(|l| l.position.llama3())
+}
+
+/// `factor` means the same thing in both scaling families — the extension
+/// ratio — so it is answered from whichever block the layer carries.
+///
+/// Asked of both deliberately. Before Llama-3 had a variant this probe
+/// read the YaRN block alone, so a checkpoint declaring `rope_type:
+/// "llama3"` had its `factor` reported as unanswered and blocked: the
+/// carriage rule claimed a home the schema did not yet have. Answering
+/// from one family and defaulting the other would have been the worse
+/// fix, since the two are alternatives and a wrong `factor` is a wrong
+/// long-context model.
+fn probe_scaling_factor(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let factor = yarn_block(component)
+        .map(|y| y.factor)
+        .or_else(|| llama3_block(component).map(|l| l.factor))
+        .or_else(|| linear_block(component))?;
+    Some(json!(factor))
+}
+
+/// The linear position divisor a built layer carries, if any layer does.
+///
+/// Asked of every layer, not the first: on Gemma 3 the declaration
+/// reaches the full-attention layers only, and the sliding layers
+/// rotate plain — so the first layer of the table answers nothing while
+/// the block is carried five layers in.
+fn linear_block(component: &Component) -> Option<f64> {
+    component
+        .attention
+        .as_ref()?
+        .iter()
+        .find_map(|l| l.position.linear())
+}
+
+fn probe_llama3_low_freq(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(llama3_block(component)?.low_freq_factor))
+}
+
+fn probe_llama3_high_freq(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(llama3_block(component)?.high_freq_factor))
 }
 
 fn probe_yarn_beta_fast(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
@@ -908,10 +1780,13 @@ fn probe_yarn_truncate(component: &Component, _ctx: &ProbeContext<'_>) -> Option
     Some(json!(yarn_block(component)?.truncate))
 }
 
-fn probe_yarn_original_max(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
-    Some(json!(
-        yarn_block(component)?.original_max_position_embeddings
-    ))
+/// The pre-trained context window, from whichever scaling block declares
+/// it. Both families define their bands against it.
+fn probe_scaling_original_max(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let original = yarn_block(component)
+        .map(|y| y.original_max_position_embeddings)
+        .or_else(|| llama3_block(component).map(|l| l.original_max_position_embeddings))?;
+    Some(json!(original))
 }
 
 /// Per-layer span kinds in the checkpoint's own vocabulary, so the
@@ -986,6 +1861,193 @@ fn probe_linear_conv_kernel(component: &Component, _ctx: &ProbeContext<'_>) -> O
     ))
 }
 
+/// The Mamba2 surface's geometry, when the component carries one.
+fn mamba2_geometry(component: &Component) -> Option<larql_models::config::Mamba2Geometry> {
+    Some(component.execution.as_ref()?.mamba2?.geometry)
+}
+
+fn probe_mamba2_state_size(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.state_size))
+}
+
+fn probe_mamba2_expand(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.expand))
+}
+
+fn probe_mamba2_conv_kernel(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.conv_kernel))
+}
+
+fn probe_mamba2_n_groups(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.n_groups))
+}
+
+fn probe_mamba2_chunk_size(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.chunk_size))
+}
+
+/// Echoes the clamp in the checkpoint's own spelling: a finite side as
+/// its number, an unbounded side as the non-finite literal the judged
+/// boundary quoted (`-Infinity` below, `Infinity` above) — the inverse of
+/// [`DtBound::from_declared`](larql_models::config::DtBound::from_declared),
+/// positional because unboundedness below and above are different signs.
+fn probe_mamba2_time_step_limit(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    use larql_models::config::DtBound;
+    let geometry = mamba2_geometry(component)?;
+    let side = |bound: DtBound, unbounded: &str| match bound {
+        DtBound::Finite(v) => json!(v),
+        DtBound::Unbounded => json!(unbounded),
+    };
+    Some(json!([
+        side(geometry.dt_limit_min, "-Infinity"),
+        side(geometry.dt_limit_max, "Infinity"),
+    ]))
+}
+
+fn probe_mamba2_rms_norm(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.rms_norm))
+}
+
+fn probe_mamba2_use_bias(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.use_bias))
+}
+
+fn probe_mamba2_use_conv_bias(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.use_conv_bias))
+}
+
+fn probe_mamba2_num_heads(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.num_heads))
+}
+
+fn probe_mamba2_head_dim(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(mamba2_geometry(component)?.head_dim))
+}
+
+fn conv_qkv_geometry(component: &Component) -> Option<larql_models::config::ConvQkvAttnGeometry> {
+    component.execution.as_ref()?.conv_qkv
+}
+
+fn probe_conv_qkv_head_dim(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(conv_qkv_geometry(component)?.head_dim))
+}
+
+fn probe_conv_qkv_conv_kernel(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(conv_qkv_geometry(component)?.conv_kernel))
+}
+
+fn probe_conv_qkv_rotary_dim(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(conv_qkv_geometry(component)?.rotary_dim))
+}
+
+/// A declared-FALSE bias switch is genuinely carried — closure requires
+/// no bias operand, and none exists. A declared-TRUE one has no judged
+/// operand role yet, so the probe must NOT echo it: answering `None`
+/// blocks, which is the fail-closed direction for a bias the plan would
+/// silently drop.
+fn probe_conv_qkv_qkv_bias(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    match conv_qkv_geometry(component)?.qkv_bias {
+        false => Some(json!(false)),
+        true => None,
+    }
+}
+
+fn probe_conv_qkv_out_bias(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    match conv_qkv_geometry(component)?.out_bias {
+        false => Some(json!(false)),
+        true => None,
+    }
+}
+
+/// Echo the declared attention-layer index set only when the component's
+/// per-layer table corresponds to it under SOME consistent index base:
+/// the same conv-QKV layer count, and every declared index landing on a
+/// conv-QKV layer. The base itself was proven upstream from tensor
+/// evidence; this re-derivation keeps the carriage claim honest without
+/// re-running that proof.
+fn probe_attention_layer_idx(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    let declared: Vec<i64> = ctx
+        .declared
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_i64)
+        .collect();
+    let table = component.attention.as_ref()?;
+    let conv_layers: Vec<usize> = table
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.operator.is_conv_qkv())
+        .map(|(i, _)| i)
+        .collect();
+    if conv_layers.len() != declared.len() {
+        return None;
+    }
+    for offset in [0i64, 1] {
+        let mapped: Vec<i64> = conv_layers.iter().map(|l| *l as i64 + offset).collect();
+        if mapped == declared {
+            return Some(json!(declared));
+        }
+    }
+    None
+}
+
+/// `0` is the one judged declaration: no MLP blocks exist, carried as
+/// every layer's absent FFN op — verified against the per-layer table
+/// really holding only mixer and conv-QKV operators. A non-zero width
+/// has no judged lowering in this lineage yet and must block.
+fn probe_mlp_intermediate_size(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let table = component.attention.as_ref()?;
+    let mixer_lineage_only = !table.is_empty()
+        && table
+            .iter()
+            .all(|l| l.operator.is_mamba2() || l.operator.is_conv_qkv());
+    mixer_lineage_only.then(|| json!(0))
+}
+
+/// Inert exactly when the MLP itself is declared absent — the same
+/// evidence [`probe_mlp_intermediate_size`] answers from. The declared
+/// value is echoed because with no MLP anywhere, ANY padding/bias value
+/// parameterises nothing a forward pass reads.
+fn probe_mlp_padding_size(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    let table = component.attention.as_ref()?;
+    let mixer_lineage_only = !table.is_empty()
+        && table
+            .iter()
+            .all(|l| l.operator.is_mamba2() || l.operator.is_conv_qkv());
+    mixer_lineage_only.then(|| ctx.declared.clone())
+}
+
+/// `ssm_cfg.layer` — the layer CLASS the package instantiates, which is
+/// also its identity declaration. "Mamba2" is represented exactly when
+/// the mixer surface exists; any other class name finds nothing here
+/// and blocks, which is the fail-closed direction for a lineage this
+/// build has not judged.
+fn probe_ssm_layer_class(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    mamba2_geometry(component).map(|_| json!("Mamba2"))
+}
+
+/// `d_conv` — declared by whichever block's config section carries it.
+/// The declared width is echoed only when it matches a surface that
+/// really holds it (the conv-QKV block's kernel or the mixer's); a
+/// width matching neither blocks.
+fn probe_declared_conv_kernel(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    let declared = ctx.declared.as_u64()? as usize;
+    let conv_qkv = conv_qkv_geometry(component).map(|g| g.conv_kernel);
+    let mamba2 = mamba2_geometry(component).map(|g| g.conv_kernel);
+    (Some(declared) == conv_qkv || Some(declared) == mamba2).then(|| json!(declared))
+}
+
+/// `attn_cfg.causal` — the operator IS causal by construction, so a
+/// declared `true` is carried and a declared `false` finds no operator
+/// and blocks.
+fn probe_attn_causal(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    conv_qkv_geometry(component).map(|_| json!(true))
+}
+
+fn probe_residual_in_fp32(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(component.execution.as_ref()?.residual_in_fp32?))
+}
+
 /// The recurrence's state precision, echoed in the checkpoint's own
 /// spelling.
 ///
@@ -1007,7 +2069,15 @@ fn probe_linear_state_dtype(component: &Component, _ctx: &ProbeContext<'_>) -> O
 fn probe_sliding_window(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
     let table = component.attention.as_ref()?;
     let mut windows = table.iter().filter_map(|l| l.window);
-    let first = windows.next()?;
+    let Some(first) = windows.next() else {
+        // No layer carries a window. That is an ANSWER, not a failure to
+        // answer: the graph states that this component attends fully
+        // everywhere. A checkpoint declaring `sliding_window: null` — the
+        // whole Qwen3 generation — agrees with it, and one declaring a
+        // window that reaches no layer genuinely disagrees and should
+        // read as mismatched rather than as an unanswered probe.
+        return Some(Value::Null);
+    };
     windows.all(|w| w == first).then(|| json!(first))
 }
 
@@ -1023,44 +2093,224 @@ fn probe_post_norm_eps(component: &Component, _ctx: &ProbeContext<'_>) -> Option
 /// spelling is an alias of the judged variant (`gelu_pytorch_tanh` →
 /// `GeluTanh`); the schema's spelling otherwise, so a genuine
 /// disagreement still reads as one.
+/// The per-layer dense-FFN widths the surface carries, as the array the
+/// checkpoint declared them in.
+fn probe_ffn_width_by_layer(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let ffn = component.execution.as_ref()?.ffn.as_ref()?;
+    serde_json::to_value(ffn.intermediate_size_by_layer.as_ref()?).ok()
+}
+
 fn probe_activation(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
-    let activation = component.execution.as_ref()?.ffn.activation;
+    // The FFN's activation on an FFN-bearing component; the MIXER's on a
+    // mixer-only one — `hidden_act` is one declared fact, and whichever
+    // op consumes it answers for it.
+    let surface = component.execution.as_ref()?;
+    let activation = match (&surface.ffn, &surface.mamba2) {
+        (Some(ffn), _) => ffn.activation,
+        (None, Some(mixer)) => mixer.activation,
+        (None, None) => return None,
+    };
+    // `hidden_act` can name the whole COMBINE rather than the gate's
+    // nonlinearity (`situ`), and then the surface's `Activation` is inert
+    // and cannot answer for it. Asking the FFN's gate policy first is what
+    // lets a correctly-carried SiTU FFN report as carried instead of
+    // reading `mismatched` forever against a field it never used.
     if let Some(declared) = ctx.declared.as_str() {
+        let combine = surface
+            .ffn
+            .as_ref()
+            .and_then(|ffn| larql_models::config::hf_combine_name(ffn.gate_policy, activation));
+        if combine.as_deref() == Some(declared) {
+            return Some(json!(declared));
+        }
         if larql_models::config::Activation::from_hf_name(declared) == Some(activation) {
             return Some(json!(declared));
         }
+        // The FFN computes a combine no HF word names (`ClampedGlu`), or
+        // there is no FFN. Fall through to the schema's own spelling, so
+        // a genuine disagreement still reads as one.
     }
     serde_json::to_value(activation).ok()
 }
 
-/// The clamp bound the FFN surface carries, when its gate policy is the
-/// clamped GLU. A plain-gated surface has no limit to answer with — a
-/// checkpoint declaring `swiglu_limit` that resolved to plain gating is
-/// then reported as unrepresented, which is the truth.
+/// The FFN shape that runs, in the checkpoint's own word when that word
+/// names it (`swiglu` for a gated SiLU FFN); the schema's word for the
+/// shape otherwise, so a disagreement reads as one — `geglu` declared on
+/// a SiLU-gated stack resolves to `swiglu`, and a plain `silu` on the
+/// same stack resolves to `swiglu` too, because the plain name is the
+/// ungated shape. Both directions come from one table in
+/// `larql_models::config::activation`.
+fn probe_ffn_shape_name(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    let ffn = component.execution.as_ref()?.ffn.as_ref()?;
+    if let Some(declared) = ctx.declared.as_str() {
+        if larql_models::config::ffn_shape_from_hf_name(declared)
+            == Some((ffn.ffn_type, ffn.activation))
+        {
+            return Some(json!(declared));
+        }
+    }
+    larql_models::config::ffn_shape_hf_name(ffn.ffn_type, ffn.activation).map(Value::String)
+}
+
+/// Whether the declared identity resolved to the Llama family. The
+/// answer comes from [`ProbeContext::family`] — the registry's resolution
+/// — so a checkpoint declaring `true` under a `model_type` no entry
+/// matches is refused rather than believed.
+fn probe_is_llama_config(_component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(
+        ctx.family == Some(larql_models::detect::registry::LLAMA_FAMILY)
+    ))
+}
+
+/// The clamp bound the FFN surface carries, when its gate policy has
+/// one. A plain-gated surface has no limit to answer with — a checkpoint
+/// declaring `swiglu_limit` that resolved to plain gating is then
+/// reported as unrepresented, which is the truth.
+///
+/// BOTH clamped policies answer, and that is the point: the bound is the
+/// same declaration in each, while the arithmetic around it differs
+/// (`(u+1)·g·σ(αg)` against `act(g)·u`). Answering only for one would
+/// have reported GLM-5.3-Flash's declared clamp as uncarried while its
+/// executor applied it.
+/// Where the routed experts run, off the BUILT surface.
+///
+/// `None` under the uniform form covers the only two states that reach
+/// it — a component with no routed block at all, and one whose routed
+/// experts run at `hidden_size` — and in both the declared width found
+/// no home, which is what an unrepresented finding says. It is
+/// deliberately NOT answered with `hidden_size`: that would report a
+/// checkpoint's declared bottleneck as carried by a build that has none.
+fn probe_routed_expert_width(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    component
+        .execution
+        .as_ref()?
+        .ffn
+        .as_ref()?
+        .moe
+        .as_ref()?
+        .latent
+        .map(|latent| json!(latent.width))
+}
+
+/// Whether the latent branch normalises its aggregate.
+///
+/// Answers `false` as readily as `true`, because the declaration this is
+/// compared against is a BOOLEAN: a checkpoint declaring
+/// `latent_moe_use_norm: false` beside a width has its "no norm" carried
+/// exactly, and reporting that as unrepresented would grade agreement as
+/// a dropped fact.
+///
+/// Under the uniform form it answers `None` — and this is the flag's own
+/// finding, not the width's. The reference nests the norm inside the
+/// wrapper, so a `latent_moe_use_norm: true` with no
+/// `routed_expert_hidden_size` builds no norm THERE either: the flag is
+/// inert in the model, and reporting it unrepresented is the honest
+/// reading of a declaration nothing acts on.
+fn probe_latent_moe_use_norm(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    component
+        .execution
+        .as_ref()?
+        .ffn
+        .as_ref()?
+        .moe
+        .as_ref()?
+        .latent
+        .map(|latent| json!(latent.norm.is_some()))
+}
+
 fn probe_swiglu_limit(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
-    match component.execution.as_ref()?.ffn.gate_policy {
-        larql_models::ExpertGatePolicy::ClampedGlu { limit, .. } => Some(json!(limit)),
-        larql_models::ExpertGatePolicy::Gated => None,
+    match component.execution.as_ref()?.ffn.as_ref()?.gate_policy {
+        // BOTH clamped policies answer, and that is the point: the
+        // bound is the same declaration in each, while the arithmetic
+        // around it differs (`(u+1)*g*sigma(a*g)` against `act(g)*u`).
+        // Answering for only one would report GLM-5.3-Flash's declared
+        // clamp as uncarried while its executor applied it.
+        larql_models::ExpertGatePolicy::ClampedGlu { limit, .. }
+        | larql_models::ExpertGatePolicy::ClampedGated { limit } => Some(json!(limit)),
+        // A checkpoint declaring `swiglu_limit` whose FFN resolved to
+        // some OTHER policy has no limit to answer with, and is reported
+        // unrepresented — which is the truth for both of these.
+        larql_models::ExpertGatePolicy::Gated | larql_models::ExpertGatePolicy::SituGlu { .. } => {
+            None
+        }
+    }
+}
+
+/// SiTU-GLU's gate softcap, when the FFN's policy is SiTU.
+///
+/// Reads the value off the BUILT surface rather than off the config, so
+/// the finding says whether the declaration reached the op plan, not
+/// whether it was declared. A component whose FFN resolved to any other
+/// policy has no beta to answer with and the leaf reports unrepresented.
+fn probe_situ_beta(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    match component.execution.as_ref()?.ffn.as_ref()?.gate_policy {
+        larql_models::ExpertGatePolicy::SituGlu { beta, .. } => Some(json!(beta)),
+        larql_models::ExpertGatePolicy::Gated
+        | larql_models::ExpertGatePolicy::ClampedGlu { .. }
+        | larql_models::ExpertGatePolicy::ClampedGated { .. } => None,
+    }
+}
+
+/// SiTU-GLU's up-branch softcap, when the FFN's policy is SiTU and the
+/// checkpoint declared one.
+///
+/// `None` covers two different states on purpose — the policy is not SiTU,
+/// or it is SiTU with no up cap — because in both the checkpoint's
+/// declared `activation_situ_linear_beta` found no home, which is exactly
+/// what an unrepresented finding says. A SiTU policy that DID carry the
+/// value answers with it.
+fn probe_situ_linear_beta(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    match component.execution.as_ref()?.ffn.as_ref()?.gate_policy {
+        larql_models::ExpertGatePolicy::SituGlu { linear_beta, .. } => {
+            linear_beta.map(|v| json!(v))
+        }
+        larql_models::ExpertGatePolicy::Gated
+        | larql_models::ExpertGatePolicy::ClampedGlu { .. }
+        | larql_models::ExpertGatePolicy::ClampedGated { .. } => None,
     }
 }
 
 fn probe_attention_bias(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
     Some(json!(
-        component.execution.as_ref()?.attention.attention_bias?
+        component
+            .execution
+            .as_ref()?
+            .attention
+            .as_ref()?
+            .attention_bias?
     ))
 }
 
 fn probe_query_scale(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
-    Some(json!(component.execution.as_ref()?.attention.query_scale?))
+    Some(json!(
+        component
+            .execution
+            .as_ref()?
+            .attention
+            .as_ref()?
+            .query_scale?
+    ))
 }
 
 fn probe_score_scale(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
-    Some(json!(component.execution.as_ref()?.attention.score_scale))
+    Some(json!(
+        component
+            .execution
+            .as_ref()?
+            .attention
+            .as_ref()?
+            .score_scale
+    ))
 }
 
 fn probe_attn_softcap(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
     Some(json!(
-        component.execution.as_ref()?.attention.logit_softcapping?
+        component
+            .execution
+            .as_ref()?
+            .attention
+            .as_ref()?
+            .logit_softcapping?
     ))
 }
 
@@ -1115,4 +2365,202 @@ fn probe_embed_scale(component: &Component, _ctx: &ProbeContext<'_>) -> Option<V
 
 fn probe_residual_scale(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
     Some(json!(component.execution.as_ref()?.residual_scale?))
+}
+
+/// The relative-position scheme, as the graph carries it.
+///
+/// Each parameter answers with its own value, because the carriage check
+/// compares against the declared leaf: a composite would never equal the
+/// scalar the checkpoint wrote and would read as a mismatch on a policy
+/// that is carried correctly.
+///
+/// Reports the declaration rather than a rotation. A checkpoint declaring
+/// `d_rel`/`rel_extent` does not rotate, and before this variant the
+/// policy resolved to `Rope` at the parser's default base on every layer.
+fn relative_position(component: &Component) -> Option<(usize, usize)> {
+    match component.attention.as_ref()?.first()?.position {
+        larql_models::config::PositionPolicy::Relative { d_rel, extent } => Some((d_rel, extent)),
+        _ => None,
+    }
+}
+
+fn probe_relative_d_rel(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    relative_position(component).map(|(d_rel, _)| json!(d_rel))
+}
+
+fn probe_relative_extent(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    relative_position(component).map(|(_, extent)| json!(extent))
+}
+
+/// Whether the surface's routing policy renormalises over the selected
+/// experts.
+///
+/// Answers as a **boolean**, because that is what the checkpoint declares
+/// (`moe_renormalize` / `norm_topk_prob`). Returning the policy enum would
+/// never equal the declared value and would read as a mismatch on a fact
+/// carried exactly.
+///
+/// **This is a report, not a comparison, and the distinction is stated
+/// because it matters.** The routing policy is *derived from this very
+/// key*, so an equality check against it could not fail — a gate that
+/// cannot fail is not a gate, and writing one here would be worse than
+/// writing none, since it would look like verification. What this probe
+/// establishes is the weaker, true claim: the fact reached the surface
+/// rather than stopping at the parser. The same caveat the `layer_types`
+/// probe carries, for the same reason.
+fn probe_moe_routing_policy(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let moe = component.execution.as_ref()?.ffn.as_ref()?.moe.as_ref()?;
+    Some(json!(matches!(
+        moe.routing_policy,
+        larql_models::config::ExpertRoutingPolicy::NormalisedOverSelected
+    )))
+}
+
+fn probe_moe_shared_experts(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let moe = component.execution.as_ref()?.ffn.as_ref()?.moe.as_ref()?;
+    Some(json!(moe.shared_experts))
+}
+
+/// The width the shared branch will be built at.
+///
+/// A checkpoint that declares this key and a container that resolved the
+/// branch to some other width disagree about a real projection, and the
+/// mismatch must show: Qwen1.5-MoE declares 5632 where the routed width
+/// times the shared count is 1408.
+fn probe_shared_expert_width(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let moe = component.execution.as_ref()?.ffn.as_ref()?.moe.as_ref()?;
+    Some(json!(moe.shared_expert_intermediate_size?))
+}
+
+fn probe_moe_router_kind(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let moe = component.execution.as_ref()?.ffn.as_ref()?.moe.as_ref()?;
+    Some(json!(moe.router_kind.as_str()))
+}
+
+/// A declared parameter sitting at its **identity value** — one group, one
+/// layer of period — has no effect for the schema to carry, so it is
+/// represented exactly by the schema having no field for it.
+///
+/// Value-dependent on purpose. The alternative, classifying the *key* as
+/// representable, would also pass a checkpoint declaring eight expert
+/// groups, which this schema genuinely cannot state.
+fn probe_identity_valued(_component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    (ctx.declared.as_u64() == Some(1)).then(|| ctx.declared.clone())
+}
+
+/// Zero of something is the absence this schema already represents.
+fn probe_absent_when_zero(_component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    (ctx.declared.as_u64() == Some(0)).then(|| ctx.declared.clone())
+}
+
+/// Grouped routing is a no-op when the component's own grouping is one
+/// group; the flag alone says nothing without the count beside it.
+fn probe_grouping_is_a_no_op(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    // The flag is only carried when the surface shows ungrouped routing,
+    // which is what one group produces.
+    component.execution.as_ref()?.ffn.as_ref()?.moe.as_ref()?;
+    Some(ctx.declared.clone())
+}
+
+/// The KDA conv width the surface carries.
+fn probe_kda_conv_kernel(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(component.execution.as_ref()?.kda?.conv_kernel))
+}
+
+/// An index-set declaration is carried when the graph holds exactly as
+/// many layers of that kind as the set named.
+///
+/// Compared by **cardinality against the resolved table**, not by
+/// re-rendering the set: the declaration's index base is a fact of the
+/// checkpoint (zero on GLM-5.3-Flash, one on Kimi Linear) and re-emitting
+/// it here would require this probe to re-derive a base the resolver
+/// already proved — two implementations of one rule, free to drift.
+///
+/// It is still a real check. A resolution that dropped, doubled or
+/// misplaced a layer changes the count, and the paired sets check each
+/// other: `kda_layers` and `full_attn_layers` must both close against the
+/// same table.
+fn probe_layer_set(
+    component: &Component,
+    ctx: &ProbeContext<'_>,
+    is_kind: impl Fn(&AttentionLayerPolicy) -> bool,
+) -> Option<Value> {
+    let declared = ctx.declared.as_array()?;
+    let carried = component
+        .attention
+        .as_ref()?
+        .iter()
+        .filter(|l| is_kind(l))
+        .count();
+    (carried == declared.len()).then(|| ctx.declared.clone())
+}
+
+fn probe_recurrent_layer_set(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    probe_layer_set(component, ctx, |l| l.operator.is_recurrent())
+}
+
+fn probe_softmax_layer_set(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    probe_layer_set(component, ctx, |l| !l.operator.is_recurrent())
+}
+
+fn probe_moe_branch_scale(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let moe = component.execution.as_ref()?.ffn.as_ref()?.moe.as_ref()?;
+    moe.branch_scale.map(|s| json!(s))
+}
+
+fn probe_moe_dense_prefix(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let moe = component.execution.as_ref()?.ffn.as_ref()?.moe.as_ref()?;
+    moe.dense_prefix_layers.map(|n| json!(n))
+}
+
+/// `mla_use_nope` carried onto the per-layer position policy.
+///
+/// Carries only the combination the reference implements: `true`, with
+/// every layer resolving to no positional encoding. `false` is a
+/// combination Kimi Linear's own class refuses (`assert self.use_nope`),
+/// so this build has no ground truth for it and declines rather than
+/// answering — which blocks, as an unjudged declaration should.
+fn probe_mla_nope(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    if ctx.declared.as_bool() != Some(true) {
+        return None;
+    }
+    let table = component.attention.as_ref()?;
+    table
+        .iter()
+        .all(|l| l.position == larql_models::config::PositionPolicy::None)
+        .then(|| ctx.declared.clone())
+}
+
+fn probe_sliding_layer_set(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
+    probe_layer_set(component, ctx, |l| l.span == Some(AttentionSpan::Sliding))
+}
+
+/// The KDA decay clamp the surface carries.
+fn probe_kda_use_full_rank_gate(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let execution = component.execution.as_ref()?;
+    // A gate FORM is carried only where there is a KDA block whose gate it
+    // describes; declared on a component with no KDA geometry it reaches
+    // nothing, and saying so is the honest answer.
+    execution.kda.as_ref()?;
+    execution
+        .kda_use_full_rank_gate
+        .map(|full_rank| json!(full_rank))
+}
+
+fn probe_mla_use_output_gate(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(component
+        .execution
+        .as_ref()?
+        .mla
+        .as_ref()?
+        .output_gate
+        .is_some()))
+}
+
+fn probe_kda_gate_lower_bound(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    component
+        .execution
+        .as_ref()?
+        .kda_gate_lower_bound
+        .map(|b| json!(b))
 }

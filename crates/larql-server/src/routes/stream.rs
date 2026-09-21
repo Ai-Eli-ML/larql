@@ -196,9 +196,9 @@ async fn stream_describe_messages(
         None => return vec![ws_error("missing entity")],
     };
 
-    let model = match state.model(None) {
-        Some(m) => m,
-        None => return vec![ws_error("no model loaded")],
+    let model = match state.v2_or_unsupported(None) {
+        Ok(m) => m,
+        Err(e) => return vec![ws_error(e.message())],
     };
 
     let band = request["band"].as_str().unwrap_or("all");
@@ -300,10 +300,10 @@ async fn handle_stream_infer(
         }
     };
 
-    let model = match state.model(None) {
-        Some(m) => m,
-        None => {
-            send_error(socket, "no model loaded").await;
+    let model = match state.v2_or_unsupported(None) {
+        Ok(m) => m,
+        Err(e) => {
+            send_error(socket, e.message()).await;
             return;
         }
     };
@@ -407,10 +407,10 @@ async fn handle_stream_generate(
         .as_u64()
         .unwrap_or(DEFAULT_STREAM_MAX_TOKENS) as usize;
 
-    let model = match state.model(None) {
-        Some(m) => m,
-        None => {
-            send_error(socket, "no model loaded").await;
+    let model = match state.v2_or_unsupported(None) {
+        Ok(m) => m,
+        Err(e) => {
+            send_error(socket, e.message()).await;
             return;
         }
     };
@@ -705,6 +705,8 @@ mod tests {
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
             weights_init: std::sync::Mutex::new(()),
+            bitnet_model: std::sync::OnceLock::new(),
+            bitnet_init: std::sync::Mutex::new(()),
             probe_labels: labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),

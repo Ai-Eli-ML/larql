@@ -5,12 +5,30 @@ use larql_vindex::format::vindex3::opplan::{
 };
 
 use super::optional_op::scalar;
+use super::realizations;
 use super::OpsArgs;
 
 pub(super) fn run_ops(args: OpsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inspection =
         larql_vindex::format::vindex3::inspect::inspect_container(&args.container, false)?;
     let outcome = plan_component_ops(&inspection, &args.container, &args.component)?;
+    if args.realizations {
+        let plan = outcome
+            .plan
+            .as_ref()
+            .ok_or("the component did not close; nothing to prepare")?;
+        return realizations::report(
+            plan,
+            &args.container,
+            &inspection,
+            realizations::Ask {
+                budget_gib: args.budget_gib,
+                bandwidth_gbs: args.bandwidth_gbs,
+                target_tok_s: args.target_tok_s,
+                bind: args.bind,
+            },
+        );
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&outcome)?);
     } else if let Some(plan) = &outcome.plan {
@@ -52,6 +70,50 @@ pub(super) fn run_ops(args: OpsArgs) -> Result<(), Box<dyn std::error::Error>> {
                             layer_plan.operands_accounted,
                             layer_plan.operands_present,
                         ),
+                        LayerAttention::Kda(op) => println!(
+                            "layer {:3}: KDA({} heads x {}) state {} elems  \
+                             {}/{} operands accounted",
+                            layer_plan.layer,
+                            op.num_heads,
+                            op.head_dim,
+                            op.state_elements(),
+                            layer_plan.operands_accounted,
+                            layer_plan.operands_present,
+                        ),
+                        LayerAttention::Mla(op) => println!(
+                            "layer {:3}: MLA({} heads, q {} / kv {} compressed) \
+                             {}/{} operands accounted",
+                            layer_plan.layer,
+                            op.num_heads,
+                            op.q_head_dim(),
+                            op.compressed_kv_width(),
+                            layer_plan.operands_accounted,
+                            layer_plan.operands_present,
+                        ),
+                        LayerAttention::Mamba2(op) => println!(
+                            "layer {:3}: Mamba2({} heads x {}x{}) state {} elems  \
+                             {}/{} operands accounted",
+                            layer_plan.layer,
+                            op.geometry.num_heads,
+                            op.geometry.head_dim,
+                            op.geometry.state_size,
+                            op.state_elements(),
+                            layer_plan.operands_accounted,
+                            layer_plan.operands_present,
+                        ),
+                        LayerAttention::ConvQkv(op) => println!(
+                            "layer {:3}: ConvQkvAttention({}q/{}kv heads x {}, conv {}, \
+                             rotary {}/{})  {}/{} operands accounted",
+                            layer_plan.layer,
+                            op.geometry.num_heads,
+                            op.geometry.num_kv_heads,
+                            op.geometry.head_dim,
+                            op.geometry.conv_kernel,
+                            op.geometry.rotary_dim,
+                            op.geometry.head_dim,
+                            layer_plan.operands_accounted,
+                            layer_plan.operands_present,
+                        ),
                     }
                 }
             }
@@ -86,29 +148,55 @@ pub(super) fn run_ops(args: OpsArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// The object one line of `bank=…` names: the fused bank's own object for
+/// `ExpertBank::Packed`, or the first of `experts` independent objects for
+/// `ExpertBank::PerExpert` — the summary line names ONE object either way,
+/// with the per-expert count so a reader does not mistake it for a fused
+/// bank of one.
+fn bank_object(bank: &larql_vindex::format::vindex3::opplan::ExpertBank) -> String {
+    use larql_vindex::format::vindex3::opplan::ExpertBank;
+    match bank {
+        ExpertBank::Packed { gate_up, .. } => gate_up.weights.object.clone(),
+        ExpertBank::PerExpert { gate, .. } => match gate.first() {
+            Some(first) => format!("{} (per-expert × {})", first.object, gate.len()),
+            None => "per-expert (0 experts)".to_string(),
+        },
+    }
+}
+
 fn print_layer(component: &str, layer: &LayerPlan) {
     println!("{component}.layer[{}]", layer.layer);
     let norm = |op: &NormOp, site: &str| {
         println!("  {:?}({site}, eps {:e})", op.kind, op.eps);
     };
-    norm(&layer.pre_attention_norm, "pre_attention");
+    // Absent under post-norm placement; printing nothing is the honest
+    // rendering of a site the layer does not have.
+    if let Some(op) = &layer.pre_attention_norm {
+        norm(op, "pre_attention");
+    }
     match &layer.attention {
         LayerAttention::Softmax(op) => print_softmax(op),
         LayerAttention::GatedDelta(op) => print_gated_delta(op),
+        LayerAttention::Kda(op) => print_kda(op),
+        LayerAttention::Mla(op) => print_mla(op),
+        LayerAttention::Mamba2(op) => print_mamba2(op),
+        LayerAttention::ConvQkv(op) => print_conv_qkv(op),
     }
     println!("  residual");
     if let Some(op) = &layer.post_attention_norm {
         norm(op, "post_attention");
     }
-    norm(&layer.pre_ffn_norm, "pre_ffn");
+    if let Some(op) = &layer.pre_ffn_norm {
+        norm(op, "pre_ffn");
+    }
     match &layer.ffn {
-        larql_vindex::format::vindex3::opplan::LayerFfn::Dense(ffn) => println!(
+        Some(larql_vindex::format::vindex3::opplan::LayerFfn::Dense(ffn)) => println!(
             "  {}FFN({:?}, {})",
             if ffn.gate.is_some() { "Gated" } else { "" },
             ffn.activation,
             ffn.intermediate_size
         ),
-        larql_vindex::format::vindex3::opplan::LayerFfn::Routed(ffn) => println!(
+        Some(larql_vindex::format::vindex3::opplan::LayerFfn::Routed(ffn)) => println!(
             "  RoutedFFN({} experts, top-{}, {:?}, {:?}, {}, {:?}{}) router={}/{}, bank={}",
             ffn.experts,
             ffn.top_k,
@@ -123,9 +211,12 @@ fn print_layer(component: &str, layer: &LayerPlan) {
             },
             ffn.router.object,
             ffn.router.tensor,
-            ffn.gate_up.weights.object,
+            bank_object(&ffn.bank),
         ),
-        larql_vindex::format::vindex3::opplan::LayerFfn::Hybrid(ffn) => {
+        // A mixer-only (Mamba2) layer: no FFN exists — saying so is the
+        // honest print, not an omission.
+        None => println!("  (no FFN — mixer-only layer)"),
+        Some(larql_vindex::format::vindex3::opplan::LayerFfn::Hybrid(ffn)) => {
             println!(
                 "  HybridFFN: dense {}FFN({:?}, {}) → post_dense_norm  +  routed({} experts, \
                  top-{}, {:?}, {:?}, {}, {:?}{}) over pre_experts_norm(residual) → \
@@ -150,14 +241,17 @@ fn print_layer(component: &str, layer: &LayerPlan) {
                 },
                 ffn.routed.router.object,
                 ffn.routed.router.tensor,
-                ffn.routed.gate_up.weights.object,
+                bank_object(&ffn.routed.bank),
             );
         }
     }
     if let Some(op) = &layer.post_ffn_norm {
         norm(op, "post_ffn");
     }
-    println!("  residual");
+    // A mixer-only layer has one residual add, printed after its mixer.
+    if layer.ffn.is_some() {
+        println!("  residual");
+    }
     if let Some(scale) = &layer.layer_scale {
         println!("  × layer_scale {}/{}", scale.object, scale.tensor);
     }
@@ -217,6 +311,83 @@ fn print_softmax(attention: &AttentionOp) {
 /// Deliberately does NOT reuse the softmax vocabulary: there is no span,
 /// no window and no KV head count to print, and the one number a reader
 /// most needs — the recurrent state's size — has no softmax counterpart.
+/// Kimi Delta Attention. Prints the geometry that separates it from Gated
+/// DeltaNet — one head count, a gate rank, and a per-channel `dt_bias` —
+/// rather than a shape a reader would have to compare by hand.
+fn print_kda(op: &larql_vindex::format::vindex3::opplan::KdaOp) {
+    println!("  KDA (Kimi Delta Attention)");
+    println!(
+        "    geometry: {} heads x {} (value width {}), conv kernel {}, gate rank {}",
+        op.num_heads,
+        op.head_dim,
+        op.value_width(),
+        op.conv_kernel,
+        op.gate_rank
+    );
+    println!(
+        "    decay clamp: {}",
+        op.gate_lower_bound
+            .map_or_else(|| "undeclared".to_string(), |b| format!("{b}"))
+    );
+    println!(
+        "    state: {} elements/layer — constant in sequence length",
+        op.state_elements()
+    );
+    println!("    output gate: {} (declared)", op.output_gate.form());
+    let mut operands: Vec<(&str, &larql_vindex::format::vindex3::opplan::OperandRef)> = vec![
+        ("q_proj", &op.q_proj),
+        ("k_proj", &op.k_proj),
+        ("v_proj", &op.v_proj),
+        ("q_conv1d", &op.q_conv1d),
+        ("k_conv1d", &op.k_conv1d),
+        ("v_conv1d", &op.v_conv1d),
+        ("f_a_proj", &op.f_a_proj),
+        ("f_b_proj", &op.f_b_proj),
+    ];
+    operands.extend(op.output_gate.operands());
+    operands.extend([
+        ("b_proj", &op.b_proj),
+        ("a_log", &op.a_log),
+        ("dt_bias", &op.dt_bias),
+        ("o_norm", &op.o_norm),
+        ("out_proj", &op.out_proj),
+    ]);
+    for (name, operand) in operands {
+        println!("    {name}: {}/{}", operand.object, operand.tensor);
+    }
+}
+
+fn print_mla(op: &larql_vindex::format::vindex3::opplan::MlaOp) {
+    println!("  MLA (Multi-Latent Attention)");
+    println!(
+        "    geometry: {} heads, q/k {} (nope {} + rope {}), v {}, kv_lora_rank {}",
+        op.num_heads,
+        op.q_head_dim(),
+        op.qk_nope_head_dim,
+        op.qk_rope_head_dim,
+        op.v_head_dim,
+        op.kv_lora_rank
+    );
+    println!(
+        "    compressed KV cache: {} elements/position (vs {} decompressed)",
+        op.compressed_kv_width(),
+        op.num_heads * (op.qk_nope_head_dim + op.v_head_dim)
+    );
+    // The query's operands under whichever form the layer declared,
+    // then the KV side. A factorised query prints three lines at their
+    // own spellings rather than one under a borrowed name.
+    let mut operands = op.query.operands();
+    operands.extend([
+        ("kv_a_proj", &op.kv_a_proj),
+        ("kv_a_norm", &op.kv_a_norm),
+        ("kv_b_proj", &op.kv_b_proj),
+        ("out_proj", &op.out_proj),
+    ]);
+    for (name, operand) in operands {
+        println!("    {name}: {}/{}", operand.object, operand.tensor);
+    }
+}
+
 fn print_gated_delta(op: &GatedDeltaOp) {
     println!("  GatedDeltaNet");
     println!(
@@ -250,5 +421,58 @@ fn print_gated_delta(op: &GatedDeltaOp) {
             "    {name} = {}/{} {:?}",
             operand.object, operand.tensor, operand.shape
         );
+    }
+}
+
+fn print_conv_qkv(op: &larql_vindex::format::vindex3::opplan::conv_qkv::ConvQkvOp) {
+    println!("  ConvQkvAttention (conv over fused QKV, partial rotary)");
+    println!(
+        "    geometry: {}q/{}kv heads x {}, conv {} (no activation), rotary {}/{} theta {}",
+        op.geometry.num_heads,
+        op.geometry.num_kv_heads,
+        op.geometry.head_dim,
+        op.geometry.conv_kernel,
+        op.geometry.rotary_dim,
+        op.geometry.head_dim,
+        op.geometry.rope_theta,
+    );
+    println!(
+        "    in_proj [{} x hidden]  out_proj [hidden x {}]  conv bias: {}",
+        op.geometry.qkv_rows(),
+        op.geometry.attn_out_width(),
+        op.conv1d_bias.is_some(),
+    );
+}
+
+fn print_mamba2(op: &larql_vindex::format::vindex3::opplan::Mamba2Op) {
+    println!("  Mamba2 (SSD mixer)");
+    println!(
+        "    geometry: {} heads x {}, state {}, conv {}, groups {}, chunk {}, d_inner {}x hidden",
+        op.geometry.num_heads,
+        op.geometry.head_dim,
+        op.geometry.state_size,
+        op.geometry.conv_kernel,
+        op.geometry.n_groups,
+        op.geometry.chunk_size,
+        op.geometry.expand,
+    );
+    println!(
+        "    recurrent state: {} elements (constant in sequence length)",
+        op.state_elements()
+    );
+    let mut operands: Vec<(&str, &larql_vindex::format::vindex3::opplan::OperandRef)> =
+        vec![("in_proj", &op.in_proj), ("conv1d", &op.conv1d)];
+    if let Some(bias) = &op.conv1d_bias {
+        operands.push(("conv1d_bias", bias));
+    }
+    operands.push(("a_log", &op.a_log));
+    operands.push(("d", &op.d));
+    operands.push(("dt_bias", &op.dt_bias));
+    if let Some(norm) = &op.gated_norm {
+        operands.push(("gated_norm", &norm.weight));
+    }
+    operands.push(("out_proj", &op.out_proj));
+    for (name, operand) in operands {
+        println!("    {name}: {} {:?}", operand.tensor, operand.shape);
     }
 }

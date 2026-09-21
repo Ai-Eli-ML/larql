@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 
 use larql_models::inventory::{build_inventory, ArchitectureInventory};
-use larql_vindex::format::vindex3::plan::plan_system;
+use larql_vindex::format::vindex3::plan::plan_resolved;
 
 /// Extension distinguishing a saved inventory JSON from a checkpoint dir.
 const INVENTORY_EXT: &str = "json";
@@ -28,6 +28,12 @@ pub enum Vindex3Command {
     /// Reconstruct and check a container solely from its own contents —
     /// no source checkpoint, no architecture registry (the G3 gate).
     Inspect(InspectArgs),
+    /// The dependencies a container declares between its own tensors —
+    /// today, the `scales` grid of every fine-grained FP8 weight. With
+    /// `--declare`, derive them from the segment headers and write the
+    /// table, for a container encoded before the encoder declared them;
+    /// the rule is the encoder's own, applied late.
+    References(ReferencesArgs),
     /// Prove source ≡ encoded (the G4 gate): four-authority semantic
     /// comparison plus per-representation byte equivalence, both ends
     /// re-hashed now. Exits non-zero on any disagreement.
@@ -50,6 +56,11 @@ pub enum Vindex3Command {
     /// and marked approximate, and a profile then selects between
     /// representations that exist.
     Represent(RepresentArgs),
+    /// Observe a prompt through the canonical decode session and write a
+    /// lossless run record (V3-OBS-1 + V3-STREAM-1): carrier writes with
+    /// norms and a fixed projection, provenance, a verified receipt, and
+    /// the final position's top candidates on stdout.
+    Observe(observe::ObserveArgs),
     /// SENSITIVITY-1A: score every eligible tensor by the relative error
     /// quantising it introduces, from the weights alone and with no forward
     /// pass. One screen scores every candidate precision map.
@@ -69,6 +80,33 @@ pub enum ExecBackend {
     Reference,
     /// The `larql-compute` kernels.
     Production,
+    /// The `larql-compute` kernels, asking for a compiled NVFP4 pack.
+    ///
+    /// The CPU sibling of the `metal-nvfp4*` arms, and the only way to
+    /// execute an NVFP4 representation of a model the device cannot run.
+    /// Qwen3.8 is the case that forced it: 48 Gated DeltaNet layers with
+    /// no Metal kernel, so before this arm its NVFP4 pack could be
+    /// compiled and verified and then executed nowhere, and its
+    /// behavioural fidelity was unmeasurable in principle.
+    ///
+    /// Separate from [`Self::Production`] rather than a flag on it: the
+    /// backend is what declares which representation execution wants, and
+    /// silently changing that for every existing `production` run would
+    /// reinterpret every result already taken with it.
+    ProductionNvfp4,
+    /// The `larql-compute` kernels, asking for a compiled Q8_0 pack.
+    ///
+    /// These three exist for the same reason `ProductionNvfp4` does: the
+    /// BACKEND declares which representation execution wants, so a
+    /// container's compiled K-quant pack is bound instead of its
+    /// canonical bytes. One arm per encoding rather than one arm plus a
+    /// flag, because `wanted_representation` is exhaustive on purpose —
+    /// a new arm is a compile error until someone states what it runs.
+    ProductionQ8,
+    /// The `larql-compute` kernels, asking for a compiled Q6_K pack.
+    ProductionQ6k,
+    /// The `larql-compute` kernels, asking for a compiled Q4_K pack.
+    ProductionQ4k,
     /// GPU matmuls via `larql-compute-metal` (rung 1: matrix work on
     /// the device, elementwise glue on the CPU).
     #[cfg(all(feature = "gpu", target_os = "macos"))]
@@ -172,10 +210,43 @@ pub struct ExecArgs {
 
     /// Greedy-decode this many new tokens after the prompt, printing
     /// per-step timing and a decode report instead of a single-forward
-    /// summary. Every step re-runs the full forward — the interpreter
-    /// has no KV cache yet, and the report says so.
+    /// summary. Runs on a `DecodeSession`: operands are loaded once and
+    /// each token advances one position against the session's
+    /// continuation state (KV cache, or recurrent state), so the report
+    /// prices weight load, prompt ingestion and steady decode separately.
     #[arg(long, conflicts_with_all = ["dump_layers", "resume"])]
     pub generate: Option<usize>,
+
+    /// With `--generate`: observe the prepared image's residency BETWEEN
+    /// tokens — mapped address space against the pages of it physically
+    /// resident, page faults, peak RSS, and where each token's time went
+    /// (attention against FFN) — beside what the plan predicted before a
+    /// byte was read. The residency curve of the K3 vertical's rung 7.
+    #[arg(long, requires = "generate")]
+    pub residency_curve: bool,
+
+    /// With `--residency-curve`: run the same prompt and decode this many
+    /// times on ONE prepared image, each pass with fresh continuation
+    /// state. The first pass is cold; every later pass is what the page
+    /// cache kept — the warm number the cold one is compared against.
+    #[arg(long, default_value_t = 1, requires = "residency_curve")]
+    pub repeat: usize,
+    /// Passes excluded from the residency curve's statistics (they still
+    /// run and print); the counted passes are `repeat - warmup`.
+    #[arg(long, default_value_t = 0, requires = "residency_curve")]
+    pub warmup: usize,
+    /// Run the residency curve even when the machine probe disqualifies
+    /// the machine (battery, load, background CPU); the report is then
+    /// labelled UNQUALIFIED and says why. Without it, a disqualified
+    /// machine is refused before any weight is bound.
+    #[arg(long, requires = "residency_curve")]
+    pub unquiet_ok: bool,
+    /// How a mapped expert bank's selected experts are brought in per
+    /// token: `demand` (the loop faults each page), `advise` (the kernel
+    /// is told ahead), `touch` (pages are faulted concurrently ahead of
+    /// the loop). The same lossless bytes under every policy.
+    #[arg(long, default_value = "demand", requires = "residency_curve")]
+    pub expert_access: String,
 
     /// Teacher-force a whole quality bank through ONE resident model,
     /// writing `<--dump-dir>/<id>.f32` per entry.
@@ -203,6 +274,19 @@ pub struct ExecArgs {
     #[arg(long, conflicts_with_all = ["dump_layers", "resume", "generate"])]
     pub logit_dump: Option<PathBuf>,
 
+    /// Execute only the first N layers, then the component's own final
+    /// norm and output head — a reduced-depth *model*, not a shard.
+    ///
+    /// One semantic effect: `ExecutionSlice::Draft { end: N }`. Nothing
+    /// else about the run changes, which is the point — a draft measured
+    /// through a different code path than its target would confound
+    /// depth with harness.
+    ///
+    /// Omitted, or equal to the layer count, is the whole stack and is
+    /// bit-identical to leaving the flag off.
+    #[arg(long)]
+    pub draft_depth: Option<usize>,
+
     /// Lowered backends only: attribute each decode token's GPU time to
     /// its stage classes (stage-boundary timestamp counters) and print
     /// the ledger against the bytes each class reads. Sampling drains the
@@ -228,6 +312,36 @@ pub struct OpsArgs {
     /// Print the full plan as JSON instead of the summary.
     #[arg(long)]
     pub json: bool,
+
+    /// Prepare the plan against the production CPU backend WITHOUT
+    /// reading a payload byte: select and pin a realization per planned
+    /// operand, or print every refusal; then price the pins — declared
+    /// resident bytes, staging, stored footprint, execution touch — from
+    /// the container's tensor tables alone.
+    #[arg(long)]
+    pub realizations: bool,
+
+    /// A memory budget in GiB to hold the declared working set against
+    /// (with `--realizations`). Omitted: the machine's physical memory.
+    #[arg(long)]
+    pub budget_gib: Option<f64>,
+
+    /// With `--realizations`, and only when the plan fits the budget:
+    /// PREPARE the plan — bind every pin to its object — and reconcile
+    /// what the loader bound against what the pins declared, reporting
+    /// what was mapped, what is physically resident, and what was read.
+    #[arg(long)]
+    pub bind: bool,
+
+    /// Host bandwidth in GB/s the plan may stream per second (with
+    /// `--target-tok-s`, a per-token touch budget). Omitted: no
+    /// throughput constraint.
+    #[arg(long)]
+    pub bandwidth_gbs: Option<f64>,
+
+    /// The token rate the throughput budget is held at.
+    #[arg(long, default_value_t = 20.0)]
+    pub target_tok_s: f64,
 }
 
 #[derive(Args)]
@@ -248,7 +362,12 @@ pub struct VerifyArgs {
 
 #[derive(Args)]
 pub struct EncodeArgs {
-    /// Checkpoint directories or inventory JSON files (one per artifact).
+    /// Checkpoint directories, inventory JSON files, or `hf://` repos
+    /// (one per artifact).
+    ///
+    /// An `hf://org/name[@revision]` artifact is admitted from its
+    /// safetensors headers alone — a few MB staged locally, standing in
+    /// for a checkpoint that is never downloaded.
     #[arg(required = true)]
     pub artifacts: Vec<PathBuf>,
 
@@ -311,14 +430,19 @@ pub struct RepresentArgs {
     #[arg(long = "object")]
     pub objects: Vec<String>,
 
-    /// Compile a role the conservative default preserves. Repeat to name
-    /// several. Roles: decoder-linear, expert-weight, embedding,
-    /// output-head, norm, router, small-vector, unknown.
+    /// Compile a role the conservative default preserves. Repeat to
+    /// name several.
     ///
-    /// The default compiles decoder-linear and expert-weight only —
-    /// the parameter mass — and preserves the surfaces where 4-bit is
-    /// known to be delicate. This flag is how a profile becomes more
+    /// The default compiles the parameter mass — the decoder's and a
+    /// recurrence's bulk projections, and routed experts — and
+    /// preserves the surfaces where 4-bit is known to be delicate or
+    /// where error compounds. This flag is how a profile becomes more
     /// aggressive deliberately rather than by accident.
+    ///
+    /// The role names are not listed here on purpose: this comment
+    /// enumerated them once, and was silently wrong the moment a role
+    /// was added. Pass any name to be refused by one that names the
+    /// current set.
     #[arg(long = "include-role")]
     pub include_roles: Vec<String>,
 
@@ -376,8 +500,24 @@ pub struct InspectArgs {
 }
 
 #[derive(Args)]
+pub struct ReferencesArgs {
+    /// Container directory.
+    pub container: PathBuf,
+
+    /// Derive the table from the segment headers and write it. Refuses a
+    /// container that already declares one.
+    #[arg(long)]
+    pub declare: bool,
+}
+
+#[derive(Args)]
 pub struct PlanArgs {
-    /// Checkpoint directories or inventory JSON files (one per artifact).
+    /// Checkpoint directories, inventory JSON files, or `hf://` repos
+    /// (one per artifact).
+    ///
+    /// Planning an `hf://` repo costs its safetensors headers and
+    /// nothing else — the admission verdict for a 328 GB checkpoint,
+    /// before deciding whether to spend the download.
     #[arg(required = true)]
     pub artifacts: Vec<PathBuf>,
 
@@ -391,23 +531,31 @@ pub fn run(cmd: Vindex3Command) -> Result<(), Box<dyn std::error::Error>> {
         Vindex3Command::Plan(args) => run_plan(args),
         Vindex3Command::Encode(args) => run_encode(args),
         Vindex3Command::Inspect(args) => run_inspect(args),
+        Vindex3Command::References(args) => run_references(args),
         Vindex3Command::Verify(args) => run_verify(args),
         Vindex3Command::Ops(args) => run_ops(args),
         Vindex3Command::Exec(args) => run_exec(args),
         Vindex3Command::Represent(args) => run_represent(args),
+        Vindex3Command::Observe(args) => observe::run(args),
         Vindex3Command::Sensitivity(args) => sensitivity::run(args),
         Vindex3Command::Consequence(args) => consequence::run(args),
     }
 }
 
+mod artifact;
 mod bank;
 mod consequence;
+pub(crate) mod decode;
 mod exec;
 mod generate;
+mod intervention;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 mod lowered;
+mod observe;
 mod ops;
 mod optional_op;
+pub(crate) mod prepare;
+mod realizations;
 mod sensitivity;
 mod teacher_force;
 use exec::run_exec;
@@ -416,6 +564,20 @@ use ops::run_ops;
 fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut named = Vec::new();
     for path in &args.artifacts {
+        // Verification re-reads every payload byte to re-hash it, so an
+        // `hf://` artifact would re-transfer the whole checkpoint — the
+        // one thing the remote encode exists to avoid. Refuse by name
+        // rather than let it look like a path that does not exist.
+        if artifact::is_remote_spec(path) {
+            return Err(format!(
+                "`{}` is a repo, and verification re-reads every payload byte to \
+                 re-hash it — pointing it at a repo would re-transfer the whole \
+                 checkpoint. Verify against a local checkpoint, or check the \
+                 container's own recorded payload_sha256.",
+                path.display()
+            )
+            .into());
+        }
         named.push((artifact_name(path), load_artifact(path)?));
     }
     let verification =
@@ -469,46 +631,103 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_encode(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut named = Vec::new();
-    for path in &args.artifacts {
-        named.push((artifact_name(path), load_artifact(path)?));
-    }
-    let outcome = match args.capability {
-        Some(capability) => {
-            eprintln!(
-                "admission scoped to {:?}; whole-model completeness is NOT asserted",
-                capability
-            );
-            larql_vindex::format::vindex3::encode::encode_system_for_capability(
-                &named,
-                &args.output,
-                capability.into(),
-            )?
-        }
-        None => larql_vindex::format::vindex3::encode::encode_system(&named, &args.output)?,
+/// What staging one repo-backed artifact cost, and what it stands in for.
+///
+/// The library returns these figures rather than printing them, so this is
+/// where `larql vindex3` gets its voice back. Headers and metadata are
+/// quoted separately and then totalled: the header figure alone
+/// understates the transfer, since a tokenizer can outweigh every shard
+/// header put together.
+fn report_staging(entry: &artifact::ResolvedArtifact) {
+    let Some(report) = entry.staging() else {
+        return;
     };
-    // Capability snapshot: tokenizer + HF metadata from the first
-    // artifact directory that carries them (the inventory records its
-    // source dir, so this covers both checkpoint-dir and saved-inventory
-    // inputs). A container without them binds with token-id capability
-    // only — which is why the granite smoke needed a manual copy before
-    // this existed.
-    for (_, inventory) in &named {
-        let copied =
-            larql_vindex::format::vindex3::encode::checkpoint::snapshot_checkpoint_capabilities(
-                std::path::Path::new(&inventory.path),
-                &args.output,
-            )?;
-        if !copied.is_empty() {
-            eprintln!("capabilities: {}", copied.join(", "));
-            break;
-        }
+    if let Some(commit) = entry.commit() {
+        eprintln!("artifact `{}` pinned at commit {commit}", entry.name);
+    }
+    if let Some(revision) = entry.unpinned_revision() {
+        eprintln!(
+            "warning: the hub named no commit for `{revision}` — provenance records \
+             the revision name, which can move"
+        );
     }
     eprintln!(
-        "encoded {} representation(s), {:.2} GB payload → {}",
+        "staged {} ({} of headers over {} shard(s), {} of metadata)",
+        artifact::size(report.staged_bytes()),
+        artifact::size(report.header_bytes),
+        report.shards,
+        artifact::size(report.metadata_bytes),
+    );
+    match &report.payload_bytes {
+        Ok(payload) => {
+            eprintln!(
+                "  standing in for {} of tensor payload",
+                artifact::size(*payload)
+            );
+            // Only when the index disagrees with its own headers: tied
+            // weights are counted once there and serialised twice in the
+            // file, and a silent 7% gap reads like a units bug.
+            if let Some(declared) = report.declared_total.filter(|d| d != payload) {
+                eprintln!(
+                    "  note: the shard index declares {} — {} {} its own headers sum to; \
+                     the header sum is what transfers",
+                    artifact::size(declared),
+                    artifact::size(declared.abs_diff(*payload)),
+                    if declared < *payload {
+                        "less than"
+                    } else {
+                        "more than"
+                    },
+                );
+            }
+        }
+        // A census failure is not a reason to abort: the encode reads the
+        // same headers and will fail with a better message.
+        Err(err) => eprintln!("warning: could not total the staged headers: {err}"),
+    }
+}
+
+fn run_encode(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved = artifact::resolve_all(&args.artifacts)?;
+    for entry in &resolved {
+        report_staging(entry);
+    }
+    if let Some(capability) = args.capability {
+        eprintln!(
+            "admission scoped to {:?}; whole-model completeness is NOT asserted",
+            capability
+        );
+    }
+
+    // One ingest, shared with `vindex encode`. Two orchestrations here
+    // would be free to differ on the capability snapshot alone, and a
+    // container that binds with token-ids only is not obviously wrong —
+    // it just answers differently.
+    let outcome =
+        artifact::encode_from_specs(resolved, &args.output, args.capability.map(Into::into))?;
+
+    for transfer in &outcome.transfers {
+        eprintln!(
+            "{}: fetched {} of {} declared ({:.1}%) across {} tensor(s); \
+             the checkpoint was never on this disk",
+            transfer.name,
+            artifact::size(transfer.fetched),
+            artifact::size(transfer.declared),
+            if transfer.declared == 0 {
+                0.0
+            } else {
+                100.0 * transfer.fetched as f64 / transfer.declared as f64
+            },
+            transfer.tensors,
+        );
+    }
+    if !outcome.capabilities.is_empty() {
+        eprintln!("capabilities: {}", outcome.capabilities.join(", "));
+    }
+    eprintln!(
+        "encoded {} representation(s), {} payload → {}",
         outcome.representations,
-        outcome.total_payload_bytes as f64 / 1e9,
+        artifact::size(outcome.total_payload_bytes),
         outcome.container.display(),
     );
     Ok(())
@@ -524,8 +743,21 @@ fn run_represent(args: RepresentArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let mut roles = larql_vindex::format::vindex3::represent::policy::RolePolicy::default();
     for name in &args.include_roles {
-        let role = larql_vindex::format::vindex3::represent::policy::Role::parse(name)
-            .ok_or_else(|| format!("unknown role `{name}`"))?;
+        let role = larql_vindex::format::vindex3::represent::policy::Role::parse(name).ok_or_else(
+            || {
+                // Derived, never restated: a hand-written list is wrong
+                // one commit after a role is added, and this message is
+                // the only place the caller learns what is valid.
+                let known: Vec<&str> = larql_vindex::format::vindex3::represent::policy::Role::ALL
+                    .iter()
+                    .map(|r| r.name())
+                    .collect();
+                format!(
+                    "unknown role `{name}` — the roles are: {}",
+                    known.join(", ")
+                )
+            },
+        )?;
         roles = roles.including(role);
     }
     let mut protect = larql_vindex::format::vindex3::represent::policy::Protections::default();
@@ -662,6 +894,34 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn run_references(args: ReferencesArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use larql_vindex::format::vindex3::auxiliary_references::AuxiliaryReferences;
+    if args.declare {
+        let declared = larql_vindex::format::vindex3::encode::declare_references(&args.container)?;
+        if declared == 0 {
+            println!("no dependency to declare; nothing written");
+        } else {
+            println!("declared {declared} reference(s)");
+        }
+        return Ok(());
+    }
+    let inspection =
+        larql_vindex::format::vindex3::inspect::inspect_container(&args.container, false)?;
+    let Some(name) = &inspection.index.auxiliary_references else {
+        println!("the container declares no dependencies");
+        return Ok(());
+    };
+    let table = AuxiliaryReferences::read(&args.container, name)?;
+    println!("{} reference(s) in {name}:", table.len());
+    for row in table.stored().references {
+        println!(
+            "  {}/{}  --{}-->  {}/{}",
+            row.owner.object, row.owner.tensor, row.auxiliary, row.target.object, row.target.tensor
+        );
+    }
+    Ok(())
+}
+
 fn run_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inspection =
         larql_vindex::format::vindex3::inspect::inspect_container(&args.container, args.verify)?;
@@ -716,30 +976,55 @@ fn run_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("execution surfaces:");
             for component in &inspection.graph.components {
                 match &component.execution {
-                    Some(surface) => println!(
-                        "  {:8} attention {}q/{}kv head {} q-scale {:.4} s-scale {:.4}{}, \
-                         ffn {:?} {:?} {}, norm {:?} eps {:e}{}",
-                        component.id,
-                        surface.attention.num_q_heads,
-                        surface.attention.num_kv_heads,
-                        surface.attention.head_dim,
-                        optional_op::scalar(surface.attention.query_scale),
-                        surface.attention.score_scale,
-                        if surface.attention.output_gate.is_some() {
-                            " gated"
-                        } else {
-                            ""
-                        },
-                        surface.ffn.activation,
-                        surface.ffn.ffn_type,
-                        surface.ffn.intermediate_size,
-                        surface.norm.pre.kind,
-                        surface.norm.pre.eps,
-                        match &surface.head {
-                            Some(head) => format!(", head vocab {}", head.vocab_size),
+                    Some(surface) => {
+                        // Presence follows the program (schema 6): each
+                        // group prints only when the component runs it,
+                        // and absence is said in words — a pure-SSM
+                        // component has no attention/FFN to describe.
+                        let attention = match &surface.attention {
+                            Some(a) => format!(
+                                "attention {}q/{}kv head {} q-scale {:.4} s-scale {:.4}{}",
+                                a.num_q_heads,
+                                a.num_kv_heads,
+                                a.head_dim,
+                                optional_op::scalar(a.query_scale),
+                                a.score_scale,
+                                if a.output_gate.is_some() {
+                                    " gated"
+                                } else {
+                                    ""
+                                },
+                            ),
+                            None => "attention absent".to_string(),
+                        };
+                        let ffn = match &surface.ffn {
+                            Some(f) => format!(
+                                "ffn {:?} {:?} {:?}",
+                                f.activation, f.ffn_type, f.intermediate_size
+                            ),
+                            None => "ffn absent".to_string(),
+                        };
+                        let mixer = match &surface.mamba2 {
+                            Some(m) => format!(
+                                ", mamba2 mixer {}h×{}×{} conv {}",
+                                m.geometry.num_heads,
+                                m.geometry.head_dim,
+                                m.geometry.state_size,
+                                m.geometry.conv_kernel
+                            ),
                             None => String::new(),
-                        },
-                    ),
+                        };
+                        println!(
+                            "  {:8} {attention}, {ffn}{mixer}, norm {:?} eps {:e}{}",
+                            component.id,
+                            surface.norm.pre.kind,
+                            surface.norm.pre.eps,
+                            match &surface.head {
+                                Some(head) => format!(", head vocab {}", head.vocab_size),
+                                None => String::new(),
+                            },
+                        )
+                    }
                     None => println!("  {:8} (no execution surface)", component.id),
                 }
             }
@@ -804,11 +1089,11 @@ fn load_artifact(path: &Path) -> Result<ArchitectureInventory, Box<dyn std::erro
 }
 
 fn run_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut named = Vec::new();
-    for path in &args.artifacts {
-        named.push((artifact_name(path), load_artifact(path)?));
+    let resolved = artifact::resolve_all(&args.artifacts)?;
+    for entry in &resolved {
+        report_staging(entry);
     }
-    let plan = plan_system(&named);
+    let plan = plan_resolved(&args.artifacts, resolved)?;
     let json = serde_json::to_string_pretty(&plan)?;
     match &args.output {
         Some(path) => {

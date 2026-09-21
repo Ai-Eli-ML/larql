@@ -32,6 +32,7 @@ use std::path::Path;
 
 use crate::detect::ModelError;
 
+pub use components::is_operator_config_section;
 pub use report::{
     ArchitectureInventory, AttentionSummary, ConfigKeyFact, Detection, Identity, InterfaceFact,
     KeyStatus, LayerPolicy, ResolvedExecution, ResolvedTopology, TensorFact, TensorGroup,
@@ -56,10 +57,17 @@ pub fn build_inventory(model_dir: &Path) -> Result<ArchitectureInventory, ModelE
         return Err(ModelError::ConfigMissing(config_path));
     }
     let text = std::fs::read_to_string(&config_path)?;
-    let config: serde_json::Value = serde_json::from_str(&text)?;
+    // The judged non-finite boundary: HF configs carry Python's bare
+    // `Infinity`/`NaN` literals; they parse here as the strings they
+    // spell, and nowhere else (config::nonfinite_json).
+    let config: serde_json::Value = crate::config::nonfinite_json::parse_config_json(&text)?;
 
     let identity = resolved::read_identity(&config);
-    let (detection, topology) = resolved::resolve(&config, &identity);
+    // Tensors first: the resolution may need the estate as evidence for a
+    // declared ambiguity (`resolve_with_tensor_evidence`, J5).
+    let tensor_inventory = tensors::scan_tensors(model_dir)?;
+    let (detection, topology) =
+        resolved::resolve_with_tensor_evidence(&config, &identity, &tensor_inventory.tensors);
     // Nested components first: their recorded reads feed classification.
     let component_readings = components::read_components(&config);
     let mut recorded_reads: std::collections::BTreeSet<String> = component_readings
@@ -70,6 +78,10 @@ pub fn build_inventory(model_dir: &Path) -> Result<ArchitectureInventory, ModelE
     // The stored-representation reader is the second recorded reader:
     // `quantization_config` is credited only because something read it and
     // stored what it read.
+    // The parser reads two leaves of `linear_attn_config` by path; credit
+    // exactly those, never the container, so its unread siblings stay
+    // honestly unconsumed.
+    recorded_reads.extend(config_keys::path_read_leaves(&config));
     let representation_reading = representation::read_stored_representation(&config);
     let stored_representation = representation_reading.map(|r| {
         recorded_reads.extend(r.consumed_paths);
@@ -85,7 +97,6 @@ pub fn build_inventory(model_dir: &Path) -> Result<ArchitectureInventory, ModelE
     });
     let config_facts = config_keys::classify_config(&config, &recorded_reads);
     let interfaces = config_keys::find_interfaces(&config_facts);
-    let tensor_inventory = tensors::scan_tensors(model_dir)?;
     // The architecture names its expert banks in its own key namespace
     // (post-strip: `layers.3.mlp.experts`); the graph binds source names.
     // Resolve each bank prefix against the tensors actually present, so

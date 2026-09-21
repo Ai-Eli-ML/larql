@@ -35,7 +35,9 @@ use larql_inference::vindex3::{
 };
 use larql_inference::{EosConfig, SamplingConfig};
 use larql_kv::CanonicalKvState;
-use larql_vindex::format::vindex3::opplan::exec::production::ProductionBackend;
+use larql_vindex::format::vindex3::opplan::exec::lowering::{
+    LoweringIdentity, LoweringRegistry, SharedProvider,
+};
 use larql_vindex::tokenizers;
 
 use crate::error::ServerError;
@@ -55,7 +57,7 @@ pub struct V3Model {
     /// The program with its operands already lowered into the
     /// backend's execution form — model lifetime, shared by every
     /// request. Requests contribute only continuation state.
-    pub runtime: PreparedVindex3<ProductionBackend>,
+    pub runtime: PreparedVindex3<SharedProvider>,
     /// Tokenizer for the text-facing API (`tokenizer.json` in the
     /// container directory).
     pub tokenizer: tokenizers::Tokenizer,
@@ -66,6 +68,15 @@ pub struct V3Model {
     /// directory basename, so id-substring matching answers "plain" for
     /// any container whose folder is not named after its family.
     pub family: String,
+    /// The end-of-turn tokens the container declares
+    /// (`generation_config.json::eos_token_id`), resolved once at load
+    /// through the same authority the CLI's V3 arm uses. The V3 driver
+    /// judges EOS on ids alone — it has no tokenizer to re-decode a
+    /// special token's surface form the way the V2 loop does — so a
+    /// route that starts from the empty built-in set runs every
+    /// generation to `max_tokens`. Every V3 route builds its request
+    /// EOS on top of this.
+    pub eos: EosConfig,
     /// Count of in-flight generations on this container — the V3
     /// counterpart of `LoadedModel.requests_in_flight`, which V3 had
     /// none of before this (no walk-ffn/grid participation to have
@@ -123,10 +134,17 @@ pub fn resolve_chat_template(family: &str, id: &str) -> larql_inference::prompt:
 /// and operand store (refusing closure defects), and load the
 /// container's tokenizer — the text API cannot serve ids-only.
 pub fn load_v3_model(path: &Path) -> Result<V3Model, Box<dyn std::error::Error + Send + Sync>> {
-    let runtime = Vindex3Runtime::open(path, SERVED_COMPONENT, ProductionBackend::new())
-        .map_err(|e| format!("open VINDEX3 container: {e}"))?
-        .prepare()
-        .map_err(|e| format!("prepare VINDEX3 operands: {e}"))?;
+    // The served provider is resolved from the shipped registry by
+    // identity, never constructed here (LOWERING-PLUGIN-1, L3).
+    let runtime = Vindex3Runtime::open_via(
+        path,
+        SERVED_COMPONENT,
+        std::sync::Arc::new(LoweringRegistry::shipped()),
+        &LoweringIdentity::cpu_production(),
+    )
+    .map_err(|e| format!("open VINDEX3 container: {e}"))?
+    .prepare()
+    .map_err(|e| format!("prepare VINDEX3 operands: {e}"))?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(path)
         .map_err(|e| format!("VINDEX3 container has no servable tokenizer.json: {e}"))?;
     // The container names itself (`index.model`); the directory name is
@@ -147,6 +165,7 @@ pub fn load_v3_model(path: &Path) -> Result<V3Model, Box<dyn std::error::Error +
         runtime,
         tokenizer,
         family,
+        eos: EosConfig::from_vindex_dir(path),
         requests_in_flight: Arc::new(AtomicU32::new(0)),
     };
     if matches!(

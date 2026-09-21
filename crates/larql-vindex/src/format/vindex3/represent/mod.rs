@@ -45,10 +45,48 @@
 //! [`super::variants`] already states, and the reason a compiler is needed
 //! at all: a profile cannot turn one encoding's bytes into another's.
 
+pub mod activation;
+pub mod actuate;
+pub mod arena;
+pub mod assessment;
+pub mod bank;
+pub mod byte_ledger;
+pub mod candidate_authority;
+pub mod codec;
+pub mod compile;
+pub mod compiler;
+pub mod constraint;
+pub mod decision;
+pub mod diagnostic;
+pub mod execution_cost;
+pub mod experiment;
 pub mod gptq;
+pub mod ingest;
+pub mod kda_candidate;
+pub mod kquant;
 pub mod map;
+pub mod measure;
+#[cfg(test)]
+mod measure_tests;
+pub mod measurement;
 pub mod nvfp4_pack;
+pub mod participation;
+pub mod physical;
+pub mod plan_roles;
+#[cfg(test)]
+mod plan_roles_tests;
 pub mod policy;
+pub mod promotion;
+pub mod quality;
+#[cfg(feature = "reference-encoder")]
+pub mod reference_encoder;
+pub mod search_evidence;
+pub mod selection;
+pub mod source_bank;
+pub mod source_identity;
+pub mod state;
+pub mod statistic;
+pub mod view;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -126,8 +164,9 @@ impl CompiledObject {
 /// Which objects to compile, and into what.
 #[derive(Debug, Clone)]
 pub struct RepresentSpec {
-    /// Target encoding. Only [`DTYPE_NVFP4`] today; the match below is the
-    /// single place a second encoding is added.
+    /// Target encoding: [`DTYPE_NVFP4`], or any name [`kquant::lookup`]
+    /// recognises. The `Target` dispatch below is the single place a
+    /// further encoding is added.
     pub encoding: String,
     /// Objects to compile. Empty means every object carrying a tensor the
     /// policy admits.
@@ -188,17 +227,123 @@ impl RepresentSpec {
 /// targeted object. Untouched segments are hard-linked where the
 /// filesystem allows, so adding a representation costs the pack's bytes,
 /// not the container's.
+/// Which compiler writes an encoding's bytes.
+///
+/// ## The eligibility rule a search must not get wrong
+///
+/// K-quant eligibility is **not** `n_elements % block == 0`. It is
+/// `inner_dim % block == 0`, with every outer-index row framed into
+/// blocks independently, because that is how ggml lays a row out.
+///
+/// ```text
+/// WRONG   N_elements mod B == 0
+/// RIGHT   D_inner    mod B == 0     (each row blocked on its own)
+/// ```
+///
+/// `[2, 128]` is the fixture that separates them: 256 elements, exactly
+/// one Q6_K super-block, so the wrong rule admits it — and the resulting
+/// block spans the end of row 0 and the start of row 1 under a single
+/// shared scale. Nothing crashes. The bytes serialise, the segment table
+/// is self-consistent, the container loads, and the arm produces
+/// plausible behavioural numbers from semantically invalid bytes.
+///
+/// **This matters most once REPRESENT searches automatically.** The
+/// optimiser enumerates candidate scopes; under the wrong rule it can
+/// discover scopes that look valid, measure them, and fold the results
+/// into a Pareto curve that is quietly part fiction. A representation
+/// error that fails loudly costs an afternoon; this one would cost the
+/// curve's credibility. `KQuant::plan` is where the rule lives, and
+/// `a_shape_whose_total_divides_but_whose_row_does_not_is_refused`
+/// asserts both halves so it cannot be "simplified" back to the total.
+///
+/// NVFP4 is a split pack — codes, then group scales, then a tensor scale
+/// — whose planner derives a layout from a 2-D shape. A K-quant is
+/// contiguous ggml blocks running along the row. The two share this
+/// function's plan-then-write skeleton and nothing else, which is why
+/// this is a target rather than a flag on one path.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    Nvfp4,
+    KQuant(kquant::KQuant),
+}
+
+/// One tensor's decided encoding. `None` at the call sites means the
+/// tensor is carried verbatim — because the policy preserves its role,
+/// or because its shape cannot hold the encoding.
+#[derive(Debug, Clone, Copy)]
+enum TensorEncoding {
+    Nvfp4(PackLayout),
+    /// The encoding and the byte length its shape implies.
+    KQuant(kquant::KQuant, usize),
+}
+
+impl TensorEncoding {
+    /// Bytes this tensor occupies once encoded — what the segment table
+    /// is planned with, before any payload is written.
+    fn len(self) -> usize {
+        match self {
+            Self::Nvfp4(layout) => layout.total_len,
+            Self::KQuant(_, len) => len,
+        }
+    }
+}
+
+/// Which encoder chooses a K-quant pack's values.
+///
+/// **The control is architectural, not a runtime flag.** The feature
+/// being compiled in IS the switch, so a comparative campaign cannot
+/// accidentally call the native encoder, and a later regression in
+/// `quantize_q6_k` cannot perturb an experiment that never called it.
+///
+/// Paired with [`kquant_encoder_recipe`] and derived in this one place,
+/// so the bytes and the provenance that describes them cannot disagree.
+#[cfg(feature = "reference-encoder")]
+fn encode_kquant(
+    k: kquant::KQuant,
+    values: &[f32],
+    row_len: usize,
+    tensor: &str,
+) -> Result<Vec<u8>, VindexError> {
+    reference_encoder::encode(k, values, row_len, tensor)
+}
+
+#[cfg(not(feature = "reference-encoder"))]
+fn encode_kquant(
+    k: kquant::KQuant,
+    values: &[f32],
+    _row_len: usize,
+    tensor: &str,
+) -> Result<Vec<u8>, VindexError> {
+    k.encode(values, tensor)
+}
+
+/// The provenance for whichever encoder [`encode_kquant`] is.
+#[cfg(feature = "reference-encoder")]
+fn kquant_encoder_recipe() -> EncoderRecipe {
+    EncoderRecipe::kquant_ggml_reference(reference_encoder::PINNED_UPSTREAM)
+}
+
+#[cfg(not(feature = "reference-encoder"))]
+fn kquant_encoder_recipe() -> EncoderRecipe {
+    EncoderRecipe::kquant_native_v1()
+}
+
 pub fn compile_representation(
     src: &Path,
     out: &Path,
     spec: &RepresentSpec,
 ) -> Result<RepresentReport, VindexError> {
-    if spec.encoding != DTYPE_NVFP4 {
+    let target = if spec.encoding == DTYPE_NVFP4 {
+        Target::Nvfp4
+    } else if let Some(k) = kquant::lookup(&spec.encoding) {
+        Target::KQuant(k)
+    } else {
         return Err(VindexError::Parse(format!(
-            "encoding `{}` has no representation compiler; known: {DTYPE_NVFP4}",
-            spec.encoding
+            "encoding `{}` has no representation compiler; known: {DTYPE_NVFP4}, {}",
+            spec.encoding,
+            kquant::compilable_names()
         )));
-    }
+    };
 
     let raw_index = std::fs::read_to_string(src.join(INDEX_JSON))?;
     let mut index: Vindex3Index = serde_json::from_str(&raw_index)
@@ -225,6 +370,17 @@ pub fn compile_representation(
             .map(|o| o.id.clone())
             .collect()
     };
+    // The plan's own operand bindings, which outrank tensor spellings.
+    // Best-effort: a component whose plan does not build contributes
+    // nothing here and its tensors fall back to name classification.
+    let declared_roles = plan_roles::plan_roles(src, &inspection);
+    let mut candidate = candidate_authority::producer::CompilationAuthority::new(
+        src,
+        &index,
+        PrecisionMap::from_policy(spec.map_name(), &spec.encoding, &spec.roles, &spec.protect),
+        &primary_text,
+        &declared_roles,
+    )?;
     let store = OperandStore::open(src, &inspection)?;
     let source = OperandSource::from(&store);
 
@@ -267,7 +423,7 @@ pub fn compile_representation(
         // each becomes. Nothing is written until every length is known,
         // because the segment writer needs the table before the payload.
         let mut planned: Vec<PlannedTensor> = Vec::new();
-        let mut layouts: Vec<(String, Option<PackLayout>)> = Vec::new();
+        let mut layouts: Vec<(String, Option<TensorEncoding>)> = Vec::new();
         let mut compiled_tensors = 0usize;
         let mut carried_tensors = 0usize;
         let mut source_bytes = 0u64;
@@ -277,32 +433,72 @@ pub fn compile_representation(
             // Role first, shape second. A tensor the policy preserves is
             // carried whatever its shape; a tensor the policy admits is
             // still refused by the layout if its `k` cannot be grouped.
-            let role = classify_in(
-                primary_text.contains(&entry.object),
-                &entry.object,
-                &t.name,
-                &t.shape,
-            );
+            // The plan first: it bound this tensor to the role its
+            // operator computes with, and that is the container's own
+            // judgement. The name heuristics answer only for what the
+            // plan does not cover — object-level roles, components with
+            // no plan. A shape that cannot hold the encoding is still
+            // refused below, whatever the role says.
+            let role = declared_roles
+                .get(&(entry.object.clone(), t.name.clone()))
+                .copied()
+                .filter(|_| primary_text.contains(&entry.object))
+                .unwrap_or_else(|| {
+                    classify_in(
+                        primary_text.contains(&entry.object),
+                        &entry.object,
+                        &t.name,
+                        &t.shape,
+                    )
+                });
             // Role says the encoding applies; protection says whether to
             // spend it here. A protected tensor is carried, and counted as
             // preserved under its own role so the report says what the map
             // actually held back.
             let eligible = spec.roles.compiles(role) && !spec.protect.protects(&t.name);
-            match PackLayout::derive(&t.shape, &t.name) {
-                Ok(layout) if eligible => {
+            // The role decided whether to spend the encoding here; the
+            // shape decides only whether the encoding FITS. Asking the
+            // target keeps that second question with the format that
+            // owns it — NVFP4 needs a 2-D matrix, a K-quant needs a row
+            // length that is a whole number of blocks, and neither rule
+            // belongs to the other.
+            let encoded = eligible
+                .then(|| match target {
+                    Target::Nvfp4 => PackLayout::derive(&t.shape, &t.name)
+                        .ok()
+                        .map(TensorEncoding::Nvfp4),
+                    Target::KQuant(k) => k
+                        .plan(&t.shape, &t.name)
+                        .ok()
+                        .map(|len| TensorEncoding::KQuant(k, len)),
+                })
+                .flatten();
+            candidate.decided(
+                &entry.object,
+                &t.name,
+                match encoded {
+                    Some(_) => state::ResolvedEncoding::Compiled(spec.encoding.clone()),
+                    None if eligible => state::ResolvedEncoding::LayoutRefused {
+                        encoding: spec.encoding.clone(),
+                    },
+                    None => state::ResolvedEncoding::Source,
+                },
+            );
+            match encoded {
+                Some(encoding) => {
                     source_bytes += t.len;
                     compiled_tensors += 1;
                     *preserved_roles.entry(role).or_insert(0) += 0;
                     planned.push(PlannedTensor {
                         relative_name: t.name.clone(),
                         source_name: t.name.clone(),
-                        dtype: DTYPE_NVFP4.to_string(),
+                        dtype: spec.encoding.clone(),
                         shape: t.shape.clone(),
-                        len: layout.total_len as u64,
+                        len: encoding.len() as u64,
                     });
-                    layouts.push((t.name.clone(), Some(layout)));
+                    layouts.push((t.name.clone(), Some(encoding)));
                 }
-                _ => {
+                None => {
                     // Either the policy preserves this role, or the shape
                     // cannot hold the encoding. Carried verbatim so the
                     // pack is a complete object, not a partial one its
@@ -363,7 +559,41 @@ pub fn compile_representation(
                 .and_then(|(_, l)| *l);
 
             match layout {
-                Some(layout) => {
+                Some(TensorEncoding::KQuant(k, planned_len)) => {
+                    // Same shape as the NVFP4 arm below and for the same
+                    // reason: load through `OperandSource::load`, then run
+                    // exactly the encoder a transient arm would run, so
+                    // persisted bytes are the transient ones.
+                    let values = source.load(&OperandRef {
+                        object: entry.object.clone(),
+                        tensor: tensor.name.clone(),
+                        dtype: tensor.dtype.clone(),
+                        shape: tensor.shape.clone(),
+                    })?;
+                    // Row length, not a flattened count: ggml searches
+                    // scales within a row, so the framing has to survive
+                    // to the encoder or the bytes are not what a
+                    // llama.cpp artifact of this tensor would hold.
+                    let row_len = *tensor.shape.last().ok_or_else(|| {
+                        VindexError::Parse(format!(
+                            "tensor `{}`: a scalar has no row to block along",
+                            tensor.name
+                        ))
+                    })?;
+                    let bytes = encode_kquant(k, &values, row_len, &tensor.name)?;
+                    if bytes.len() != planned_len {
+                        return Err(VindexError::Parse(format!(
+                            "tensor `{}`: encoded {} bytes, the plan reserved {planned_len} \
+                             — the segment table would not describe its payload",
+                            tensor.name,
+                            bytes.len()
+                        )));
+                    }
+                    w.write_all(&bytes)?;
+                    tap(&bytes);
+                    Ok(bytes.len() as u64)
+                }
+                Some(TensorEncoding::Nvfp4(layout)) => {
                     // The load path is `OperandSource::load` then
                     // `quantize_nvfp4`. Running exactly those two here is
                     // what makes persisted bytes bit-identical to
@@ -423,6 +653,8 @@ pub fn compile_representation(
             }
         })?;
 
+        candidate.written(src, out, entry, &segment_rel)?;
+
         report.compiled_objects.push(CompiledObject {
             object: entry.object.clone(),
             representation_id: target_id.clone(),
@@ -451,12 +683,18 @@ pub fn compile_representation(
                 compiled_from: Some(rep_id.clone()),
                 // The ABI these bytes were produced against, so a later
                 // build refuses them rather than decoding under new rules.
-                codec: Some(CodecIdentity::nvfp4_v1()),
+                codec: Some(match target {
+                    Target::Nvfp4 => CodecIdentity::nvfp4_v1(),
+                    Target::KQuant(k) => k.codec_identity(),
+                }),
                 // Ties the pack to the exact source bytes even after it is
                 // copied out of the container that holds them — which is
                 // precisely what a deployment artifact does.
                 source_representation_digest: Some(entry.payload_sha256.clone()),
-                encoder: Some(EncoderRecipe::current()),
+                encoder: Some(match target {
+                    Target::Nvfp4 => EncoderRecipe::current(),
+                    Target::KQuant(_) => kquant_encoder_recipe(),
+                }),
             },
         ));
     }
@@ -559,7 +797,18 @@ pub fn compile_representation(
         std::fs::write(&graph_path, serialised)?;
     }
 
-    for aux in ["moe_manifest.json", "tokenizer.json"] {
+    // The capability snapshot travels with the representation: a compiled
+    // container that kept only tokenizer.json could tokenise and not
+    // chat — no eos, no template — which reads as a broken model rather
+    // than a missing file.
+    for aux in [
+        "moe_manifest.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "generation_config.json",
+        "chat_template.jinja",
+    ] {
         let from = src.join(aux);
         if from.exists() {
             std::fs::copy(&from, out.join(aux))?;
@@ -571,9 +820,22 @@ pub fn compile_representation(
     let serialised = serde_json::to_string_pretty(&index)
         .map_err(|e| VindexError::Parse(format!("serialise {INDEX_JSON}: {e}")))?;
     std::fs::write(out.join(INDEX_JSON), serialised)?;
+    let completed_candidate = candidate.finish(out)?;
+    compiler::write_index_atomically(
+        &completed_candidate,
+        &out.join(candidate_authority::CANDIDATE_INDEX_FILE),
+    )?;
 
     Ok(report)
 }
+
+#[cfg(test)]
+#[path = "compile_real_tests.rs"]
+mod compile_real_tests;
+
+#[cfg(test)]
+#[path = "compat_tests.rs"]
+mod compat_tests;
 
 #[cfg(test)]
 #[path = "tests.rs"]

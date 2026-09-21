@@ -30,6 +30,37 @@ pub const CONSUMED_LEAF_KEYS: &[&str] = &[
     "head_dim",
     "num_key_value_heads",
     "sliding_window",
+    // Read by `ModelArchitecture::sliding_window_size`, which resolves the
+    // effective policy from all three declarations at once — the flag is
+    // credited because something reads it and acts on what it read.
+    "use_sliding_window",
+    // Read by `ModelArchitecture::is_sliding_window_layer` as the bound on
+    // how far up the stack an enabled window applies.
+    "max_window_layers",
+    // Read by `ModelArchitecture::position_policy_for_layer`, where the
+    // family that owns the spelling interprets it: on `granitemoehybrid`
+    // it is the opt-in that turns rotation on at all, and the same leaf
+    // means `absolute` / `relative_key` in the BERT lineage.
+    "position_embedding_type",
+    // The per-layer rotary SCHEDULE (SmolLM3, Llama 4), resolved by
+    // `position_policy_for_layer` before the rotary shape. The mask's
+    // polarity is inverted relative to its name and is honoured once, in
+    // `PositionPolicy::rope_enabled_by_flag`; the interval is the
+    // fallback both references consult only when the mask is absent.
+    "no_rope_layers",
+    "no_rope_layer_interval",
+    // Two declarations no reference implementation reads. Consumed here
+    // so agreement is CHECKED: this build pairs split-half and resolves
+    // a text policy, and a checkpoint claiming otherwise must mismatch
+    // rather than be quietly overridden.
+    "rope_interleaved",
+    "use_mrope",
+    // Two more of the same kind (wave 9 of the conformance sweep):
+    // Falcon's one-word FFN shape and SmolLM2's family flag. Stored by
+    // the parser, judged against the FFN and the family that actually
+    // resolve.
+    "activation",
+    "is_llama_config",
     "sliding_window_pattern",
     "layer_types",
     "global_head_dim",
@@ -41,6 +72,8 @@ pub const CONSUMED_LEAF_KEYS: &[&str] = &[
     "rope_local_base_freq",
     "partial_rotary_factor",
     "layer_rope_theta",
+    // E30 static shards: a derived checkpoint's per-layer dense-FFN width
+    "larql_ffn_intermediate_size_by_layer",
     // rope_scaling / rope_parameters leaves
     "type",
     "rope_type",
@@ -66,10 +99,37 @@ pub const CONSUMED_LEAF_KEYS: &[&str] = &[
     "num_experts_per_tok",
     "num_experts_per_token",
     "n_shared_experts",
+    // The shared branch's own width, in both spellings: Qwen MoE writes
+    // `shared_expert_intermediate_size`, Nemotron-H prefixes it.
+    "shared_expert_intermediate_size",
+    "moe_shared_expert_intermediate_size",
+    // Hyper-connections (DeepSeek-V4): the residual is a bundle of
+    // `hc_mult` streams, reduced and expanded per token through a
+    // Sinkhorn-split mixing matrix. All three are read together — a
+    // partial declaration refuses rather than being completed.
+    "hc_mult",
+    "hc_sinkhorn_iters",
+    "hc_eps",
+    // Attention residuals (Kimi-K3): the residual is one vector plus a
+    // history of block-boundary snapshots of it, taken every
+    // `attn_res_block_size` layers and read by every sublayer.
+    "attn_res_block_size",
     "enable_moe_block",
     "top_k_experts",
     "moe_intermediate_size",
     "swiglu_limit",
+    // SiTU-GLU's two softcaps (K3-ACT-1). Parameters of the combine
+    // `hidden_act: "situ"` names, read into `ModelConfig` beside it.
+    "activation_situ_beta",
+    "activation_situ_linear_beta",
+    // The latent routed branch (K3-LATENTMOE-1): where the ROUTED experts
+    // run, and whether their weighted aggregate is normalised before it
+    // returns to the residual width. Both read into `ModelConfig` by
+    // `parse_model_config`, and both kept as `Option` there — the width's
+    // PRESENCE selects the form, so `null` and absent must stay
+    // distinguishable from `0`.
+    "routed_expert_hidden_size",
+    "latent_moe_use_norm",
     "norm_topk_prob",
     // MLA
     "kv_lora_rank",
@@ -82,6 +142,10 @@ pub const CONSUMED_LEAF_KEYS: &[&str] = &[
     "layer_norm_eps",
     "layer_norm_epsilon",
     "norm_epsilon",
+    // LFM2's spelling. Its separate `block_norm_eps` is a DIFFERENT
+    // fact (the FFN blocks' epsilon) and is deliberately not credited
+    // here — nothing reads it yet, and it must keep saying so.
+    "norm_eps",
     // softcapping + scaling multipliers
     "attn_logit_softcapping",
     "final_logit_softcapping",
@@ -120,14 +184,96 @@ pub const CONSUMED_LEAF_KEYS: &[&str] = &[
     "mask_token_id",
     // hybrid linear-attention + multi-token-prediction (declared,
     // R2/Kimi-Linear-rung prep — see `docs/k3-funnel.md`)
+    // The declared interleave and its window, in the flat spellings.
+    // `local_layer_ids` is Inkling-Small's; `sliding_window_size` is the
+    // same fact `sliding_window` states for every family before it.
+    "local_layer_ids",
+    "sliding_window_size",
+    // MoE facts in the spellings Kimi Linear uses, each read into the same
+    // canonical field its DeepSeek-lineage twin fills.
+    "num_shared_experts",
+    "moe_renormalize",
+    "routed_scaling_factor",
+    "n_group",
+    "num_expert_group",
+    "topk_group",
+    "use_grouped_topk",
+    "moe_layer_freq",
+    "first_k_dense_replace",
+    "mla_use_nope",
+    "model_max_length",
+    "moe_router_activation_func",
+    "scoring_func",
+    // The relative-position scheme's two parameters, declared together.
+    "d_rel",
+    "rel_extent",
+    "num_nextn_predict_layers",
     "linear_conv_kernel_dim",
     "linear_key_head_dim",
     "linear_value_head_dim",
     "linear_num_key_heads",
     "linear_num_value_heads",
     "mamba_ssm_dtype",
+    // The Mamba2 mixer geometry (`config::Mamba2Geometry::read`, all
+    // fields or none) plus the residual-precision fact. `num_heads` and
+    // `head_dim` are genuinely read at the top level by that same
+    // geometry read; `head_dim` was already consumed as an attention key,
+    // and on a Mamba2 declaration the one value is the mixer's.
+    "state_size",
+    "num_heads",
+    "expand",
+    "conv_kernel",
+    "n_groups",
+    "chunk_size",
+    "time_step_limit",
+    "rms_norm",
+    "use_bias",
+    "use_conv_bias",
+    // The mamba_ssm key dialect of the same mixer geometry
+    // (`Mamba2Geometry::read_mamba_ssm` — OuteAI Mamba2Attn), and the
+    // hybrid's conv-QKV attention block
+    // (`config::ConvQkvAttnGeometry::read`, all fields or none).
+    // `rope_theta` and the attention head counts were already consumed
+    // as attention keys; on a hybrid declaration the one value is the
+    // conv-QKV block's.
+    "mamba2_num_heads",
+    "mamba2_head_dim",
+    "mamba2_conv_kernel",
+    "use_mamba2_bias",
+    "attention_head_dim",
+    "attention_conv_kernel",
+    "rope_emb_dim",
+    "use_attention_qkv_bias",
+    "use_attention_out_bias",
+    // The hybrid interleave's index-set spellings
+    // (`interleave::spellings::read_attention_layer_idx`).
+    "attention_layers_idx",
+    "attn_layer_idx",
+    // The mamba_ssm lineage spelling of `tie_word_embeddings`, read by
+    // the same parser fallback chain.
+    "tie_embedding_weights",
+    // The mamba_ssm lineage's MLP declaration: width (0 = no MLP blocks,
+    // a declaration), padding multiple, bias flag. `d_intermediate` is
+    // the package's own spelling of the same width.
+    "mlp_intermediate_size",
+    "d_intermediate",
+    "mlp_padding_size",
+    "use_mlp_bias",
+    // The mamba_ssm-native (state-spaces) top-level keys: the package's
+    // own spellings of facts judged under other names — `d_model`
+    // (hidden_size alias), `tie_embeddings` (the third tie spelling) —
+    // plus the embedding-row padding and the fused add+norm schedule.
+    "d_model",
+    "tie_embeddings",
+    "pad_vocab_size_multiple",
+    "fused_add_norm",
+    "residual_in_fp32",
     "attn_output_gate",
     "output_gate_type",
+    // MLA's output gate (Kimi-K3): declared at the text level, beside the
+    // softmax family's `attn_output_gate`, and read into the MLA execution
+    // record as the same generic gate spec.
+    "mla_use_output_gate",
     "mtp_num_hidden_layers",
     "mtp_use_dedicated_embeddings",
     "mrope_interleaved",
@@ -147,6 +293,93 @@ pub const CONSUMED_CONTAINER_KEYS: &[&str] = &[
     "full_attention",
     "sliding_attention",
 ];
+
+/// Leaf names the parser reads out of a [`PATH_READ_CONTAINER_KEYS`]
+/// container, credited by **full path** rather than by name.
+pub const PATH_READ_LEAF_KEYS: &[&str] = &[
+    // The interleave, in each spelling that lives inside a container.
+    "kda_layers",
+    "full_attn_layers",
+    // Inkling-Small's MTP sub-stack states its own interleave and its own
+    // layer count inside `mtp_config`.
+    "local_layer_ids",
+    "num_nextn_predict_layers",
+    // The KDA block's geometry and gate clamp. `head_dim` and `num_heads`
+    // are the reason this list is by-path: both are consumed leaf NAMES
+    // elsewhere, so crediting them here by name would also credit them on
+    // every container that happens to spell them.
+    "num_heads",
+    "head_dim",
+    "short_conv_kernel_size",
+    "gate_lower_bound",
+    // Read alongside `gate_lower_bound` because the two together — not
+    // either alone — select GLM-5.3-Flash's decay-gate form.
+    "safe_gate",
+    // The output gate's FORM (Kimi-K3's `use_full_rank_gate`): full-rank
+    // `g_proj` or the low-rank pair. A leaf of `linear_attn_config`, so
+    // by-path like the three above.
+    "use_full_rank_gate",
+    // The mamba_ssm-native nested blocks: `ssm_cfg.layer` is the
+    // package's identity declaration; the rest are the geometry keys
+    // its dialect reads (`Mamba2Geometry::read_mamba_ssm_native`,
+    // `ConvQkvAttnGeometry::read_attn_cfg`) — every absent one a
+    // RECORDED family default, never a silent fill.
+    "layer",
+    "expand",
+    "headdim",
+    "d_state",
+    "d_conv",
+    "ngroups",
+    "chunk_size",
+    "rmsnorm",
+    "bias",
+    "conv_bias",
+    "causal",
+    "num_heads_kv",
+    "rotary_emb_base",
+    "rotary_emb_dim",
+    "qkv_proj_bias",
+    "out_proj_bias",
+];
+
+/// Containers the parser reads specific leaves of, by path, without
+/// recursing with name credit.
+///
+/// Deliberately *not* in [`CONSUMED_CONTAINER_KEYS`]. `linear_attn_config`
+/// holds a `head_dim` and a `num_heads`, and `head_dim` is a consumed leaf
+/// name — so crediting this container by name would mark
+/// `linear_attn_config.head_dim` consumed when the parser reads
+/// `linear_key_head_dim` instead and has never looked at it. That is the
+/// `vision_config.hidden_size` failure described above, and it under-reports
+/// in the direction this instrument exists to prevent.
+pub const PATH_READ_CONTAINER_KEYS: &[&str] =
+    &["linear_attn_config", "mtp_config", "ssm_cfg", "attn_cfg"];
+
+/// Full paths of the [`PATH_READ_LEAF_KEYS`] this config actually declares,
+/// for the recorded-read credit in `build_inventory`.
+///
+/// Both nestings are checked because the two observed checkpoints differ:
+/// GLM-5.3-Flash nests the section under `text_config`, Kimi Linear writes
+/// it flat.
+pub fn path_read_leaves(config: &serde_json::Value) -> Vec<String> {
+    const NESTINGS: &[&str] = &["", "text_config."];
+    let mut paths = Vec::new();
+    for nesting in NESTINGS {
+        for container in PATH_READ_CONTAINER_KEYS {
+            for leaf in PATH_READ_LEAF_KEYS {
+                let path = format!("{nesting}{container}.{leaf}");
+                if path
+                    .split('.')
+                    .try_fold(config, |node, seg| node.get(seg))
+                    .is_some()
+                {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
+}
 
 /// Containers whose *presence* is the only thing the parser reads.
 /// `vision_config` sets `has_vision_config`; everything inside it is

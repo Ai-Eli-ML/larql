@@ -18,6 +18,7 @@ use crate::format::vindex3::opplan::exec::backend::{
 };
 use crate::format::vindex3::opplan::exec::decode::DecodeSession;
 use crate::format::vindex3::opplan::exec::execute_plan;
+use crate::format::vindex3::opplan::exec::lowering::LoweringIdentity;
 use crate::format::vindex3::opplan::exec::operands::OperandStore;
 use crate::format::vindex3::opplan::exec::production::ProductionBackend;
 use crate::format::vindex3::opplan::exec::reference::ReferenceBackend;
@@ -105,6 +106,13 @@ fn as_f32_returns_f32_and_refuses_every_other_representation() {
                 packed: &FOREIGN_BYTES,
                 scales: &FOREIGN_BYTES,
                 tensor_scale: NVFP4_TENSOR_SCALE,
+            },
+        ),
+        (
+            "Q8_0",
+            WeightSlice::KQuant {
+                blocks: &FOREIGN_BYTES,
+                codec: crate::format::vindex3::represent::kquant::Q8_0,
             },
         ),
     ];
@@ -222,7 +230,7 @@ fn a_session_fails_closed_on_an_unresolvable_operand_at_every_site() {
         .q
         .tensor = UNRESOLVABLE_TENSOR.to_string();
     let mut ffn_broken = plan.clone();
-    let LayerFfn::Dense(op) = &mut ffn_broken.layers[0].ffn else {
+    let Some(LayerFfn::Dense(op)) = &mut ffn_broken.layers[0].ffn else {
         panic!("dense fixture");
     };
     op.up.tensor = UNRESOLVABLE_TENSOR.to_string();
@@ -304,6 +312,10 @@ impl RefusingBackend {
 impl PlanBackend for RefusingBackend {
     fn name(&self) -> &str {
         "refusing"
+    }
+
+    fn identity(&self) -> LoweringIdentity {
+        LoweringIdentity::new("test-refusing", 1)
     }
 
     fn embed(&self, table: &[f32], hidden: usize, token: u32, scale: Option<f32>) -> Vec<f32> {

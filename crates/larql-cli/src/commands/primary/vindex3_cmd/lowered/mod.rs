@@ -216,21 +216,17 @@ impl<'a> LoweredSession<'a> {
         // amplitude rides slot 6 of the rope kernel, the sinks slot 10/11
         // of the attention kernel, the biases the `bias_add` kernel after
         // each projection, and a routed FFN through the served descriptor
-        // MoE path (build_routed). A dense clamped-GLU FFN: the
-        // lowering encodes plain gated FFNs only, and running the clamped
-        // policy as plain gating would be a different model (A-9.4).
-        if let Some(l) = plan.layers.iter().find(|l| {
-            l.ffn
-                .dense()
-                .is_some_and(|f| !matches!(f.gate_policy, larql_models::ExpertGatePolicy::Gated))
-        }) {
-            return Err(VindexError::Parse(format!(
-                "layer {} carries {:?}, which the Metal lowering does not execute yet (A-9.4); \
-                 refusing rather than lowering it as plain gating",
-                l.layer,
-                l.ffn.dense().map(|f| f.gate_policy)
-            )));
-        }
+        // MoE path (build_routed).
+        //
+        // The dense gate policy is checked by `ffn_activation`, layer by
+        // layer, in the loop below — not by a blanket "is it plain
+        // gating" scan here. That scan predated any dense policy having a
+        // kernel; since K3-ACT-1 one does (`SituGlu` → the `situ_glu`
+        // kernel) and one still does not (`ClampedGlu`, A-9.4), so the
+        // question is no longer whether the policy is plain but whether
+        // its combine has a kernel — which `ffn_activation` answers, in
+        // one place, for both this pre-check and the encode. A policy
+        // with no kernel still refuses BY NAME, naming its parameters.
         // Gemma 4's semantics are lowered (G4.3): K≡V binds the K matrix
         // as V, the V norm and the weighted Q/K norms ride the served
         // norm kernels, the proportional partial rotary rides a per-layer
@@ -273,7 +269,7 @@ impl<'a> LoweredSession<'a> {
         if let Some(l) = plan
             .layers
             .iter()
-            .find(|l| l.layer_scale.is_some() && l.ffn.hybrid().is_none())
+            .find(|l| l.layer_scale.is_some() && l.ffn.as_ref().and_then(|f| f.hybrid()).is_none())
         {
             return Err(VindexError::Parse(format!(
                 "layer {} carries a layer scalar on a non-hybrid FFN, which the stack encoder \
@@ -283,14 +279,16 @@ impl<'a> LoweredSession<'a> {
         }
         for l in &plan.layers {
             let activation = match &l.ffn {
-                larql_vindex::format::vindex3::opplan::LayerFfn::Dense(op) => Some(op.activation),
-                larql_vindex::format::vindex3::opplan::LayerFfn::Hybrid(op) => {
-                    Some(op.dense.activation)
+                Some(larql_vindex::format::vindex3::opplan::LayerFfn::Dense(op)) => {
+                    Some((op.activation, op.gate_policy))
                 }
-                larql_vindex::format::vindex3::opplan::LayerFfn::Routed(_) => None,
+                Some(larql_vindex::format::vindex3::opplan::LayerFfn::Hybrid(op)) => {
+                    Some((op.dense.activation, op.dense.gate_policy))
+                }
+                Some(larql_vindex::format::vindex3::opplan::LayerFfn::Routed(_)) | None => None,
             };
-            if let Some(activation) = activation {
-                ffn_activation(activation)
+            if let Some((activation, gate_policy)) = activation {
+                ffn_activation(activation, gate_policy)
                     .map_err(|e| VindexError::Parse(format!("layer {}: {e}", l.layer)))?;
             }
         }
@@ -361,12 +359,37 @@ impl<'a> LoweredSession<'a> {
                     None => None,
                 },
                 ffn: build_ffn(gpu, store, layer, formats, keep)?,
-                pre_attn_norm: resident_norm(gpu, store, &layer.pre_attention_norm)?.0,
+                // The Metal trunk applies a norm before attention. A
+                // post-norm stack has none, and this path refuses rather
+                // than lowering an identity norm that would read as one.
+                pre_attn_norm: resident_norm(
+                    gpu,
+                    store,
+                    layer.pre_attention_norm.as_ref().ok_or_else(|| {
+                        VindexError::Parse(format!(
+                            "layer {} carries no pre-attention norm (post-norm placement); the \
+                             Metal trunk has no lowering for it",
+                            layer.layer
+                        ))
+                    })?,
+                )?
+                .0,
                 post_attn_norm: match &layer.post_attention_norm {
                     Some(op) => Some(resident_norm(gpu, store, op)?),
                     None => None,
                 },
-                pre_ffn_norm: resident_norm(gpu, store, &layer.pre_ffn_norm)?.0,
+                pre_ffn_norm: resident_norm(
+                    gpu,
+                    store,
+                    layer.pre_ffn_norm.as_ref().ok_or_else(|| {
+                        VindexError::Parse(format!(
+                            "layer {} carries no pre-FFN norm (mixer-only); the Metal \
+                             lowering has no arm for it",
+                            layer.layer
+                        ))
+                    })?,
+                )?
+                .0,
                 post_ffn_norm: match &layer.post_ffn_norm {
                     Some(op) => Some(resident_norm(gpu, store, op)?),
                     None => None,
@@ -410,10 +433,10 @@ impl<'a> LoweredSession<'a> {
             .layers
             .iter()
             .filter_map(|l| {
-                l.ffn
-                    .dense()
+                let ffn = l.ffn.as_ref()?;
+                ffn.dense()
                     .map(|f| f.intermediate_size)
-                    .or_else(|| l.ffn.hybrid().map(|h| h.dense.intermediate_size))
+                    .or_else(|| ffn.hybrid().map(|h| h.dense.intermediate_size))
             })
             .max()
             .unwrap_or(hidden);
@@ -447,7 +470,10 @@ impl<'a> LoweredSession<'a> {
             sizes.iter().map(|n| gpu.lowering_scratch(*n)).collect();
         // A hybrid layer's own intermediates (slots 18..24), and a zero
         // buffer for the expert combine's residual input.
-        let has_hybrid = plan.layers.iter().any(|l| l.ffn.hybrid().is_some());
+        let has_hybrid = plan
+            .layers
+            .iter()
+            .any(|l| l.ffn.as_ref().and_then(|f| f.hybrid()).is_some());
         if has_hybrid {
             for _ in 0..larql_compute_metal::lowering::stack::StackScratch::HYBRID_BUFFERS {
                 scratch.push(gpu.lowering_scratch(hidden));
@@ -622,11 +648,18 @@ impl<'a> LoweredSession<'a> {
                 num_q_heads: a.num_q_heads,
                 num_kv_heads: a.num_kv_heads,
                 head_dim: a.head_dim,
-                norm_eps: plan_layer.pre_attention_norm.eps as f32,
-                norm_weight_offset: plan_layer.pre_attention_norm.weight_offset,
-                // The interpreter passes the pre-attention norm's epsilon
-                // as the QK-norm epsilon; it is not a separate fact.
-                qk_norm_eps: plan_layer.pre_attention_norm.eps as f32,
+                norm_eps: plan_layer.declared_norm_eps as f32,
+                // The weight offset of the norm that conditions the
+                // attention input. Under post-norm placement no norm does,
+                // so the offset that would scale nothing is the identity.
+                norm_weight_offset: plan_layer
+                    .pre_attention_norm
+                    .as_ref()
+                    .map_or(0.0, |n| n.weight_offset),
+                // The component's declared epsilon, which QK norm runs at.
+                // Read from the layer's own field rather than off a norm
+                // site that a post-norm stack does not carry.
+                qk_norm_eps: plan_layer.declared_norm_eps as f32,
                 parameter_free_q: a.parameter_free_qk_norm.q && !self.ablate.no_qk_norm,
                 parameter_free_k: a.parameter_free_qk_norm.k && !self.ablate.no_qk_norm,
                 parameter_free_v: a.parameter_free_qk_norm.v && !self.ablate.no_qk_norm,
@@ -653,6 +686,29 @@ impl<'a> LoweredSession<'a> {
                             .1;
                         LoweredPosition::Scaled { theta, amplitude }
                     }
+                    // Llama-3 rides the same shared table as YaRN — the
+                    // per-layer `inv_freq` built in `new` — but at unit
+                    // amplitude: the family adjusts frequencies only.
+                    // Written as an explicit 1.0 rather than reusing
+                    // YaRN's arm, so an amplitude can never be inherited
+                    // by a family that does not define one.
+                    PositionPolicy::Llama3 { theta, .. } => LoweredPosition::Scaled {
+                        theta,
+                        amplitude: 1.0,
+                    },
+                    // Linear rides the shared table too — its `inv_freq`
+                    // is the plain series divided by the factor, built in
+                    // `new` — at unit amplitude, written explicitly for
+                    // the reason Llama-3's is.
+                    PositionPolicy::Linear { theta, .. } => LoweredPosition::Scaled {
+                        theta,
+                        amplitude: 1.0,
+                    },
+                    // No lowering exists for a relative scheme. It
+                    // lowers to `None` — no rotation — and the executor
+                    // refuses rather than running it unpositioned, so the
+                    // absence is never mistaken for NoPE downstream.
+                    PositionPolicy::Relative { .. } => LoweredPosition::None,
                     PositionPolicy::None => LoweredPosition::None,
                     // The proportional table (zeros above the fraction)
                     // rides this layer's own inv_freq at unit amplitude;
@@ -686,13 +742,26 @@ impl<'a> LoweredSession<'a> {
                         hidden: self.hidden,
                         intermediate: plan_layer
                             .ffn
-                            .dense()
+                            .as_ref()
+                            .and_then(|f| f.dense())
                             .map_or(self.hidden, |f| f.intermediate_size),
-                        norm_eps: plan_layer.pre_ffn_norm.eps as f32,
-                        norm_weight_offset: plan_layer.pre_ffn_norm.weight_offset,
-                        activation: plan_layer.ffn.dense().map_or(FfnActivation::Silu, |f| {
-                            ffn_activation(f.activation).expect("checked in `new`")
-                        }),
+                        norm_eps: plan_layer
+                            .pre_ffn_norm
+                            .as_ref()
+                            .expect("dense resident implies a pre-FFN norm")
+                            .eps as f32,
+                        norm_weight_offset: plan_layer
+                            .pre_ffn_norm
+                            .as_ref()
+                            .expect("dense resident implies a pre-FFN norm")
+                            .weight_offset,
+                        activation: plan_layer.ffn.as_ref().and_then(|f| f.dense()).map_or(
+                            FfnActivation::Silu,
+                            |f| {
+                                ffn_activation(f.activation, f.gate_policy)
+                                    .expect("checked in `new`")
+                            },
+                        ),
                     },
                 },
                 FfnResident::Routed(routed) => {
@@ -704,7 +773,11 @@ impl<'a> LoweredSession<'a> {
                     }))
                 }
                 FfnResident::Hybrid(h) => {
-                    let op = plan_layer.ffn.hybrid().expect("resident matches the plan");
+                    let op = plan_layer
+                        .ffn
+                        .as_ref()
+                        .and_then(|f| f.hybrid())
+                        .expect("resident matches the plan");
                     LayerFfnLowering::Hybrid(Box::new(HybridFfnLowering {
                         dense: FfnWeights {
                             gate: h.gate.as_lowered(),
@@ -718,9 +791,17 @@ impl<'a> LoweredSession<'a> {
                         dense_shape: FfnShape {
                             hidden: self.hidden,
                             intermediate: op.dense.intermediate_size,
-                            norm_eps: plan_layer.pre_ffn_norm.eps as f32,
-                            norm_weight_offset: plan_layer.pre_ffn_norm.weight_offset,
-                            activation: ffn_activation(op.dense.activation)
+                            norm_eps: plan_layer
+                                .pre_ffn_norm
+                                .as_ref()
+                                .expect("hybrid resident implies a pre-FFN norm")
+                                .eps as f32,
+                            norm_weight_offset: plan_layer
+                                .pre_ffn_norm
+                                .as_ref()
+                                .expect("hybrid resident implies a pre-FFN norm")
+                                .weight_offset,
+                            activation: ffn_activation(op.dense.activation, op.dense.gate_policy)
                                 .expect("checked in `new`"),
                         },
                         routed: RoutedFfnLowering {
@@ -824,11 +905,36 @@ impl<'a> LoweredSession<'a> {
 /// are the head's vocabulary-sized pair).
 const HYBRID_SCRATCH_BASE: usize = 18;
 
-/// The lowering's gate activation for the plan's, or why there is none.
+/// The lowering's gate/up combine for the plan's, or why there is none.
+///
+/// Reads the POLICY first: a policy that is not plain gating owns the
+/// whole combine and the nonlinearity beside it is inert, so asking the
+/// activation first would answer for a field the layer never reads.
 fn ffn_activation(
     activation: larql_models::config::Activation,
+    gate_policy: larql_models::ExpertGatePolicy,
 ) -> Result<FfnActivation, VindexError> {
     use larql_models::config::Activation;
+    match gate_policy {
+        larql_models::ExpertGatePolicy::SituGlu { beta, linear_beta } => {
+            return Ok(FfnActivation::SituGlu { beta, linear_beta })
+        }
+        larql_models::ExpertGatePolicy::ClampedGlu { limit, alpha } => {
+            return Err(VindexError::Parse(format!(
+                "the lowering has no gate/up kernel for ExpertGatePolicy::ClampedGlu \
+                 {{ limit: {limit}, alpha: {alpha} }} (A-9.4); refusing rather than lowering \
+                 it as plain gating"
+            )))
+        }
+        larql_models::ExpertGatePolicy::ClampedGated { limit } => {
+            return Err(VindexError::Parse(format!(
+                "the lowering has no gate/up kernel for ExpertGatePolicy::ClampedGated \
+                 {{ limit: {limit} }}; refusing rather than lowering it as plain gating, \
+                 whose clamp is one-sided on the gate and symmetric on the up branch"
+            )))
+        }
+        larql_models::ExpertGatePolicy::Gated => {}
+    }
     match activation {
         Activation::Silu => Ok(FfnActivation::Silu),
         Activation::GeluTanh => Ok(FfnActivation::GeluTanh),

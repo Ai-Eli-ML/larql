@@ -4,9 +4,15 @@
 //! `ComputeBackend` impl (`name`, `device_info`, `supports`) lives
 //! here; sub-trait impls are in their own files.
 
+mod bf16_gemv;
+pub mod bf16_grouped;
+pub mod bf16_moe_block;
 mod decode;
 pub mod grouped_experts;
+pub mod kda;
+pub mod kimi_layer;
 mod matmul;
+pub mod mla;
 pub mod mxfp4;
 mod quant_matvec;
 
@@ -291,9 +297,7 @@ mod tests {
         let enc = cmd.new_compute_command_encoder();
         enc.end_encoding();
         cmd.commit();
-        let _ = crate::cb_status::wait_checked(
-            cmd,
-            "crates/larql-compute-metal/src/trait_impl/mod.rs:294",
-        );
+        crate::cb_status::wait_checked(cmd, "crates/larql-compute-metal/src/trait_impl/mod.rs:294")
+            .expect("command buffer completed");
     }
 }

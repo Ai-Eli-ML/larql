@@ -28,9 +28,9 @@ mod pattern;
 mod table;
 
 pub use attention::AttentionKind;
-pub use entry::ArchitectureEntry;
+pub use entry::{ArchitectureEntry, ComponentRole};
 pub use pattern::ModelTypeMatch;
-pub use table::ARCHITECTURE_REGISTRY;
+pub use table::{ARCHITECTURE_REGISTRY, LLAMA_FAMILY};
 
 /// Look up the registry entry for a `model_type` string, using the same
 /// first-match-wins order `detect_from_json` uses. `None` means

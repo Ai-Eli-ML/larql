@@ -24,7 +24,11 @@ use crate::format::vindex3::opplan::exec::reference::ReferenceBackend;
 use crate::format::vindex3::opplan::{plan_component_ops, ComponentOpPlan, LayerAttention};
 
 /// The encoded hybrid fixture, planned and ready to execute.
-fn hybrid() -> (tempfile::TempDir, ComponentOpPlan, OperandStore) {
+pub(super) fn hybrid_plan_for_tests() -> (tempfile::TempDir, ComponentOpPlan, OperandStore) {
+    hybrid()
+}
+
+pub(super) fn hybrid() -> (tempfile::TempDir, ComponentOpPlan, OperandStore) {
     let src = tempfile::tempdir().unwrap();
     hybrid_lllf_f32_model(src.path());
     let inventory = larql_models::inventory::build_inventory(src.path()).unwrap();
@@ -65,7 +69,12 @@ fn an_lllf_stack_dispatches_three_recurrences_then_one_softmax() {
         .iter()
         .map(|l| match &l.attention {
             LayerAttention::GatedDelta(_) => "L",
+            LayerAttention::Kda(_) => "K",
             LayerAttention::Softmax(_) => "F",
+            // Never reached — this fixture builds no MLA/Mamba2 layer.
+            LayerAttention::Mla(_) => "M",
+            LayerAttention::Mamba2(_) => "S",
+            LayerAttention::ConvQkv(_) => "C",
         })
         .collect();
     assert_eq!(
@@ -115,6 +124,18 @@ fn a_kv_only_provider_refuses_a_recurrence_before_committing_output() {
             ContinuationError,
         > {
             Err(ContinuationError::RecurrentUnsupported {
+                provider: "KvOnly",
+                layer,
+            })
+        }
+        fn latent_state(
+            &mut self,
+            layer: usize,
+        ) -> Result<
+            &mut crate::format::vindex3::opplan::exec::continuation::LatentKvRows,
+            ContinuationError,
+        > {
+            Err(ContinuationError::LatentUnsupported {
                 provider: "KvOnly",
                 layer,
             })
@@ -173,6 +194,17 @@ fn each_layer_updates_its_own_kind_of_state_and_no_other() {
 
     for (index, layer) in plan.layers.iter().enumerate() {
         match &layer.attention {
+            // This fixture is a Gated DeltaNet stack; a KDA layer reaching
+            // here would mean the fixture changed operator, which the
+            // assertion should say rather than silently skip.
+            LayerAttention::Kda(_) => panic!("layer {index}: fixture is Gated DeltaNet, not KDA"),
+            LayerAttention::Mla(_) => panic!("layer {index}: fixture is Gated DeltaNet, not MLA"),
+            LayerAttention::Mamba2(_) => {
+                panic!("layer {index}: fixture is Gated DeltaNet, not Mamba2")
+            }
+            LayerAttention::ConvQkv(_) => {
+                panic!("layer {index}: fixture is Gated DeltaNet, not conv-QKV attention")
+            }
             LayerAttention::GatedDelta(_) => {
                 let state = provider.recurrent_state(index).expect("a recurrent layer");
                 let matrix = state.buffer(0).cells().to_vec();

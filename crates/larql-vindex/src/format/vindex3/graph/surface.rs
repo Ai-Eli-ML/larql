@@ -107,7 +107,28 @@ pub struct AttentionSurface {
 /// What the FFN op reads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FfnSurface {
-    pub intermediate_size: usize,
+    /// The DENSE FFN's intermediate width.
+    ///
+    /// `None` on a wholly-routed stack, which has no dense FFN to size —
+    /// `Qwen3_5MoeTextConfig` is `@strict` and declares no
+    /// `intermediate_size` at all, because every one of its layers is a
+    /// routed block. Absence is the fact; a zero here would be a width,
+    /// and every consumer that needs a dense width would take it.
+    ///
+    /// Added additively within GRAPH_SCHEMA 6: a container written before
+    /// this carries the number and still reads as `Some`, and only a
+    /// wholly-routed component — which could not be represented at all
+    /// before this — omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intermediate_size: Option<usize>,
+    /// Per-layer dense width, when the checkpoint declares one — a
+    /// derived static-shard container stores physically narrower
+    /// gate/up/down tensors for some layers and says so here. One entry
+    /// per layer; the planner checks every layer's tensors against it and
+    /// states the width on that layer's `FfnOp`. `None` = every layer at
+    /// `intermediate_size`. Additive within GRAPH_SCHEMA 6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intermediate_size_by_layer: Option<Vec<usize>>,
     pub activation: Activation,
     pub ffn_type: FfnType,
     /// How the gate combines with the up branch: plain `activation(gate) *
@@ -157,8 +178,103 @@ pub struct MoeSurface {
     pub gate_up_layout: Option<GateUpLayout>,
     /// Always-active experts alongside the routed ones.
     pub shared_experts: usize,
+    /// That branch's own intermediate width, resolved once by the
+    /// architecture. `None` iff [`Self::shared_experts`] is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_expert_intermediate_size: Option<usize>,
+    /// The gate on that branch's output, where the family runs one.
+    /// `None` = summed unscaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_expert_gate: Option<larql_models::config::SharedExpertGateSpec>,
+    /// Multiplier on the routed-expert branch (`routed_scaling_factor`).
+    /// `None` when undeclared — not 1.0, which is a different claim, and
+    /// a wrong one would rescale the whole branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_scale: Option<f64>,
+    /// Leading layers running a dense MLP instead of the routed block
+    /// (`first_k_dense_replace`): 1 on Kimi Linear, 3 on GLM-5.3-Flash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_prefix_layers: Option<usize>,
     /// A dense MLP summed with the expert block every layer.
     pub hybrid: bool,
+    /// The bottleneck the ROUTED experts run behind, when the family
+    /// declares one. `None` = the experts consume the block input at
+    /// `hidden` and their weighted sum is already in the residual
+    /// stream's space.
+    ///
+    /// Absent from the serialised surface when `None`, so every
+    /// non-latent container reads back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latent: Option<MoeLatent>,
+}
+
+/// The routed branch's bottleneck: down to [`Self::width`], experts,
+/// weighted aggregate, optional norm, back up to `hidden`.
+///
+/// Nested rather than two flat fields on [`MoeSurface`] because the
+/// reference nests them — `if self.use_latent_moe:` encloses `if
+/// self.latent_moe_use_norm:` — so a norm without a width builds nothing
+/// at all. Nesting makes that state unrepresentable instead of merely
+/// wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MoeLatent {
+    /// The width the routed experts' projections are sized from. A third
+    /// independently declared number — not `hidden / 2`, not the expert
+    /// intermediate width.
+    pub width: usize,
+    /// The norm on the weighted aggregate, between summation and the
+    /// up-projection. `None` = the family declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm: Option<LatentNorm>,
+}
+
+/// The routed-expert norm's own epsilon.
+///
+/// Carried rather than defaulted, and deliberately not shared with the
+/// MLA low-rank norms: in this same family `q_a_layernorm` and
+/// `kv_a_layernorm` run at `KimiRMSNorm`'s class default `1e-6` while
+/// this one is constructed with `eps=config.rms_norm_eps` and runs at the
+/// layer's `1e-5`. Same shape of fact, different authority, ten times
+/// apart.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LatentNorm {
+    /// The epsilon, from the layer's `rms_norm_eps`.
+    pub eps: f64,
+}
+
+impl MoeSurface {
+    /// The width the routed experts' own projections are sized from —
+    /// the bottleneck when one is declared, `hidden` otherwise.
+    ///
+    /// THE single authority for routed-bank geometry. Every expert-bank
+    /// shape contract asks this rather than reaching for `hidden`, so the
+    /// packed and per-expert call sites cannot disagree about where the
+    /// bank lives, and a future storage format inherits the answer rather
+    /// than restating it.
+    ///
+    /// The router and the shared experts do NOT ask this: both read the
+    /// un-projected block input, and the shared branch is summed after
+    /// the up-projection.
+    pub fn routed_expert_input_width(&self, hidden: usize) -> usize {
+        self.latent.map_or(hidden, |l| l.width)
+    }
+
+    /// The declared latent width that cannot be executed, if there is
+    /// one.
+    ///
+    /// `routed_expert_hidden_size: 0` SELECTS the latent form — the
+    /// reference tests `is not None`, not truthiness — and then describes
+    /// a bottleneck of no width. Naming it here lets the op plan refuse
+    /// the DECLARATION, rather than letting every bank contract refuse a
+    /// zero-column operand and send a reader to a tensor whose stored
+    /// width is not the thing that is wrong.
+    ///
+    /// Falling back to the uniform form is the one answer that must not
+    /// be given: it would execute a different model than the checkpoint
+    /// declares, silently.
+    pub fn degenerate_latent_width(&self) -> Option<usize> {
+        self.latent.map(|l| l.width).filter(|w| *w == 0)
+    }
 }
 
 /// What the norm op reads.
@@ -219,10 +335,46 @@ pub struct HeadSurface {
 }
 
 /// The complete per-component execution surface.
+///
+/// Since GRAPH_SCHEMA 6, `attention` and `ffn` are present **iff the
+/// component's program runs those operations** — presence means semantic
+/// presence, never "the file was written". A pure-SSM stack (mamba2)
+/// carries neither: fabricating an attention surface for it is the
+/// ontology drill's F1 finding, and its FFN twin is the same defect one
+/// op over (the mixer is the whole block; no `intermediate_size` exists).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionSurface {
-    pub attention: AttentionSurface,
-    pub ffn: FfnSurface,
+    /// How far the component's program is declared to run — the
+    /// checkpoint's `max_position_embeddings`, or another family's
+    /// spelling of the same fact.
+    ///
+    /// **On the component, not on `attention`.** Context extent is a
+    /// property of the execution programme, not of softmax: a Gated
+    /// DeltaNet, KDA or Mamba stack has one without attending at all,
+    /// and Qwen3.8 runs forty-eight recurrent layers to sixteen
+    /// attending ones. Hanging it off the attention surface would make
+    /// it unreachable for exactly the architectures that most need it.
+    ///
+    /// Added additively within GRAPH_SCHEMA 6 — new information, not a
+    /// reinterpretation of existing bytes, so a v6 graph written before
+    /// this field still reads and a reader without it still parses one
+    /// that has it.
+    ///
+    /// `tokenizer_config.json`'s `model_max_length` is a serving bound
+    /// on the tokenizer and is **not** the authority for this. The two
+    /// usually agree; when they disagree the execution semantic wins,
+    /// because that is the one that changes what a forward pass does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    /// What the attention op reads — present iff any layer of the
+    /// component's program attends (softmax or MLA).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<AttentionSurface>,
+    /// What the FFN op reads — present iff the component's program runs
+    /// an FFN (every attention-class family today; a mixer-only stack
+    /// does not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffn: Option<FfnSurface>,
     pub norm: NormSurface,
     /// Present iff the component owns embedding/output-head objects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +393,78 @@ pub struct ExecutionSurface {
     /// the subset an operator reads, not a second copy of `ModelConfig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_attention: Option<LinearAttentionSurface>,
+    /// Geometry the KDA operator consumes, on a component whose layers
+    /// include Kimi Delta Attention. `None` otherwise.
+    ///
+    /// Beside [`Self::linear_attention`] rather than sharing it: the two
+    /// operators' geometries are not interchangeable, and a single field
+    /// would force every reader to ask which one it holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda: Option<larql_models::config::KdaGeometry>,
+    /// Lower bound clamped onto KDA's decay gate (`gate_lower_bound`).
+    /// Carried beside the geometry because it changes what the operator
+    /// computes, and `None` must mean "the checkpoint declared none",
+    /// never a silently-chosen default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_gate_lower_bound: Option<f32>,
+    /// Which decay gate the KDA operator computes — the family's judgment
+    /// of what its reference does with
+    /// [`Self::kda_gate_lower_bound`], which the value alone cannot
+    /// answer (two checkpoints declare `-5.0` and disagree). `None` is
+    /// unjudged and must reach a refusal, never a chosen form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_gate_form: Option<larql_models::config::KdaGateForm>,
+    /// The FORM of KDA's output gate (`linear_attn_config.use_full_rank_gate`):
+    /// `Some(true)` = one full-rank `g_proj` of `[Hv·Dv, hidden]` (Kimi-K3),
+    /// `Some(false)` = the low-rank `g_a_proj`/`g_b_proj` pair, `None` =
+    /// undeclared, which the reference reads as the pair. Carried beside the
+    /// geometry, not inside it: the geometry is all-three-or-none, and the
+    /// form is a separate declared fact the op plan holds the shipped
+    /// operands to. Only the gate's projection changes with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_use_full_rank_gate: Option<bool>,
+    /// Geometry the Multi-Latent Attention operator consumes, on a
+    /// component whose full-attention layers run it. `None` otherwise —
+    /// including a family that DECLARES `uses_mla` but whose geometry did
+    /// not fully resolve, which stays `None` here while the layer still
+    /// classifies as [`super::policy::LayerOperator::Mla`] (see
+    /// [`larql_models::inventory::report::MlaExecution`]'s docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mla: Option<MlaSurface>,
+    /// What the Mamba2/SSD mixer reads, on a component whose layers run
+    /// it. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mamba2: Option<Mamba2Surface>,
+    /// What the hybrid's conv-QKV attention block reads, on a component
+    /// whose full layers run it (`LayerOperator::ConvQkvAttention`).
+    /// `None` otherwise. Reused from the architectural record directly,
+    /// the way [`Self::kda`] reuses `KdaGeometry` — every field is
+    /// something the operator reads, and the struct already refuses
+    /// partial declarations at the parse boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_qkv: Option<larql_models::config::ConvQkvAttnGeometry>,
+    /// Whether the residual stream is kept at fp32 against a
+    /// lower-precision model (`residual_in_fp32`) — declared, never
+    /// chosen by an executor. `None` = the checkpoint declares nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_in_fp32: Option<bool>,
+    /// How this component's residual stream is shaped and recombined.
+    ///
+    /// A COMPONENT fact rather than a per-layer one: once the residual
+    /// means `[..., streams, d]`, the embedding, every branch operator
+    /// and the head must all agree about it, and a per-layer flag would
+    /// let a stack claim a bundle while its embedding assumed one vector.
+    ///
+    /// Defaults to `SingleStream` when absent, which is what every
+    /// container written before this field carried.
+    #[serde(default = "single_stream")]
+    pub residual_topology: larql_models::config::ResidualTopology,
+}
+
+/// The topology every family judged before hyper-connections uses, and
+/// what a container written before this field meant.
+fn single_stream() -> larql_models::config::ResidualTopology {
+    larql_models::config::ResidualTopology::SingleStream
 }
 
 /// What the Gated DeltaNet operator reads.
@@ -283,6 +507,98 @@ impl LinearAttentionSurface {
     }
 }
 
+/// What the Multi-Latent Attention operator reads.
+///
+/// Mirrors [`MlaExecution`](larql_models::inventory::report::MlaExecution)
+/// rather than reusing it, for the same reason [`LinearAttentionSurface`]
+/// does not reuse `LinearAttentionTopology`: the surface is the executor's
+/// contract, and may diverge from the architectural record. It does not,
+/// today.
+// No `Eq`: `kv_a_norm_eps` is a float, and the operator's own epsilon
+// is exactly the kind of fact whose equality is approximate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MlaSurface {
+    /// Query/output head count — the decompressed K/V side always
+    /// produces this many heads' worth of output.
+    pub num_heads: usize,
+    /// Compressed KV latent width.
+    pub kv_lora_rank: usize,
+    /// Non-RoPE portion of the query/key head width.
+    pub qk_nope_head_dim: usize,
+    /// RoPE portion of the query/key head width, one SHARED projection
+    /// (MQA-style) across every head.
+    pub qk_rope_head_dim: usize,
+    /// Value head width — independent of the query/key head width.
+    pub v_head_dim: usize,
+    /// Epsilon of `kv_a_layernorm`, the latent norm applied between the
+    /// compressed cache and its decompression — the FAMILY'S OWN value,
+    /// which on Kimi Linear is `KimiRMSNorm`'s class default `1e-6` and
+    /// not the layer's `rms_norm_eps` (`1e-5`).
+    ///
+    /// Carried on the surface because it is a per-operator norm site the
+    /// component-level norm surface cannot speak for: the drill's F6, the
+    /// one judged semantic the container could not carry, which lived as
+    /// a constant inside a family-shaped executor and so could not
+    /// survive deleting the checkpoint.
+    ///
+    /// `None` = unjudged for this family; the operator refuses rather
+    /// than borrowing the layer eps. Absent on containers written before
+    /// it was recorded, which is the same state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_a_norm_eps: Option<f64>,
+    /// Which query these layers build: one dense `q_proj`, or Kimi-K3's
+    /// `q_a_proj` -> `q_a_layernorm` -> `q_b_proj` under a declared
+    /// `q_lora_rank`.
+    ///
+    /// A DECLARED fact, resolved from `q_lora_rank`'s presence and never
+    /// from the operand estate — `q_proj` and `q_b_proj` have the same
+    /// row count on K3 (`Hq*q_head_dim`, 18432) and differ only in their
+    /// columns, so an estate-derived form would be decided by the very
+    /// thing the form decides. Closure holds the shipped operands to
+    /// this from both sides.
+    ///
+    /// Defaults to `Direct` on containers written before it was
+    /// recorded, which is what those checkpoints declared.
+    #[serde(default = "direct_query_form")]
+    pub query: larql_models::config::MlaQueryForm,
+    /// The output gate the checkpoint declares on its MLA layers
+    /// (`mla_use_output_gate: true`): `sigmoid(g_proj(x)) ⊙ attn_value`
+    /// before `o_proj`, the same generic operation
+    /// [`AttentionSurface::output_gate`] carries for the softmax family, at
+    /// width `Hq·v_head_dim`. `None` = no gate (undeclared, or declared
+    /// `false`; the reference's default is none). Absent on containers
+    /// written before it was recorded, which is the same state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_gate: Option<AttentionGateSpec>,
+}
+
+impl MlaSurface {
+    /// `qk_nope_head_dim + qk_rope_head_dim` — one query/key head's full
+    /// width, and the row width `self_attn.q_proj.weight` is fused at
+    /// (`num_heads · q_head_dim`).
+    pub fn q_head_dim(self) -> usize {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+}
+
+/// What the Mamba2/SSD mixer reads.
+///
+/// The geometry is reused from the architectural record directly (the
+/// same way [`ExecutionSurface::kda`] reuses
+/// [`KdaGeometry`](larql_models::config::KdaGeometry)) — every field is
+/// something the operator reads, and the struct already refuses partial
+/// declarations at the parse boundary. The activation sits beside it
+/// because a mixer-only component has no FFN surface to carry
+/// `hidden_act`, and the mixer genuinely consumes it (the conv branch and
+/// the output gate both apply it).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Mamba2Surface {
+    pub geometry: larql_models::config::Mamba2Geometry,
+    /// The mixer's nonlinearity (`hidden_act`, SiLU on every judged
+    /// checkpoint — read, never assumed).
+    pub activation: Activation,
+}
+
 /// Build the surface for a text-path component (target/drafter) from its
 /// inventory's resolution. Returns the missing source facts when the
 /// surface cannot be completed — the caller turns those into blocking
@@ -296,11 +612,42 @@ pub fn surface_from_resolved(
             "resolved.execution (pre-v3 inventory — re-run inspect-hf)".to_string(),
         ]);
     };
+    // Presence follows the program (schema 6). A layer that declares no
+    // per-layer kind is an attention-class layer — that is what absence
+    // means on every judged transformer config — so the surface is
+    // present unless EVERY layer declares a recurrence. The FFN follows
+    // the declared width, and a wholly-routed family declares its width
+    // in the ROUTED spelling: `Qwen3_5MoeTextConfig` has no
+    // `intermediate_size` field at all (it is `@strict`, and every layer
+    // is a `Qwen3_5MoeSparseMoeBlock`), so reading only the dense
+    // spelling graded a 397B MoE as having no FFN op and sent both
+    // `hidden_act` and `num_experts_per_tok` to "no built component
+    // answered the probe". A mixer-only stack declares NEITHER width and
+    // still has no FFN — writing one there is the F1 fabrication one op
+    // over.
+    let attends = resolved.layers.is_empty()
+        || resolved.layers.iter().any(|l| {
+            !matches!(
+                l.declared_kind,
+                Some(larql_models::config::LayerKind::Recurrent(_))
+            )
+        });
+    let dense_ffn_width = (resolved.intermediate_size > 0).then_some(resolved.intermediate_size);
+    let routed_ffn_width = execution
+        .moe
+        .filter(|m| m.expert_intermediate_size > 0)
+        .map(|m| m.expert_intermediate_size);
+    let has_ffn = dense_ffn_width.is_some() || routed_ffn_width.is_some();
     // The surface carries the component's declared head geometry; a
     // family that varies it by layer (Gemma 4's global layers) records
     // each layer's geometry on its `AttentionLayerPolicy`, and the op
     // plan reads the layer's, so nothing here is averaged away.
     Ok(ExecutionSurface {
+        // The declared extent of the programme, transcribed from the
+        // judged execution semantic. Not read from the tokenizer's
+        // `model_max_length`, which is a serving bound on a different
+        // component and would be a second authority for one fact.
+        context_length: resolved.context_length.map(|v| v as u64),
         // Carried from the architectural record, not re-derived. `None`
         // when the model declares no recurrence — every layer attends by
         // softmax and the operator is never reached.
@@ -312,7 +659,59 @@ pub fn surface_from_resolved(
             conv_kernel: t.conv_kernel,
             state_dtype: t.state_dtype,
         }),
-        attention: AttentionSurface {
+        kda: resolved.kda,
+        kda_gate_lower_bound: resolved.kda_gate_lower_bound,
+        kda_gate_form: resolved.kda_gate_form,
+        kda_use_full_rank_gate: resolved.kda_use_full_rank_gate,
+        mamba2: resolved.mamba2.map(|geometry| Mamba2Surface {
+            geometry,
+            activation: execution.activation,
+        }),
+        conv_qkv: resolved.conv_qkv_attn,
+        residual_in_fp32: execution.residual_in_fp32,
+        // Absent means this build has not judged what the checkpoint
+        // declares. Refusing is still the point — the alternative is a
+        // four-stream model quietly served as a one-stream one — but the
+        // reason must NOT say the declaration is incomplete.
+        //
+        // A header census of Hy4-preview read its surface directly:
+        // `hc_pre.hc_fn` is `[2 * hc, hc * d]` with a two-entry scale and
+        // no combination block, the config carries `hc_magnitude` and no
+        // `hc_sinkhorn_iters`. That is a COMPLETE declaration of a
+        // Sinkhorn-free hyper-connection, not a half-written Sinkhorn
+        // one. Calling it partial sends the next reader to finish a
+        // declaration nothing is missing from.
+        //
+        // The reason is READ, not written here. Since K3-ATTNRES-1 there
+        // are two ways to resolve to nothing — a partial Sinkhorn
+        // declaration, and a checkpoint declaring two whole topologies at
+        // once — and they send a reader to opposite places. A single
+        // hardcoded sentence told the second case to go and find a
+        // missing iteration count. The architecture decided it and its
+        // words travel with the absence.
+        residual_topology: match execution.residual_topology {
+            Some(topology) => topology,
+            None => {
+                return Err(vec![format!(
+                    "residual topology ({})",
+                    execution.residual_topology_refusal.as_deref().unwrap_or(
+                        "the declaration resolved to no judged topology, and this inventory \
+                         predates the field that carries why — re-run inspect-hf"
+                    )
+                )])
+            }
+        },
+        mla: execution.mla.map(|m| MlaSurface {
+            num_heads: m.num_heads,
+            kv_lora_rank: m.kv_lora_rank,
+            qk_nope_head_dim: m.qk_nope_head_dim,
+            qk_rope_head_dim: m.qk_rope_head_dim,
+            v_head_dim: m.v_head_dim,
+            kv_a_norm_eps: m.kv_a_norm_eps,
+            query: m.query,
+            output_gate: m.output_gate,
+        }),
+        attention: attends.then_some(AttentionSurface {
             num_q_heads: resolved.num_q_heads,
             num_kv_heads: resolved.num_kv_heads,
             head_dim: resolved.head_dim,
@@ -326,13 +725,16 @@ pub fn surface_from_resolved(
             output_gate: execution.attention_output_gate,
             sinks: execution.attention_sinks,
             attention_bias: execution.attention_bias,
-        },
-        ffn: FfnSurface {
-            intermediate_size: resolved.intermediate_size,
+        }),
+        ffn: has_ffn.then(|| FfnSurface {
+            intermediate_size: dense_ffn_width,
+            intermediate_size_by_layer: resolved.ffn_intermediate_size_by_layer.clone(),
             activation: execution.activation,
             ffn_type: execution.ffn_type,
             gate_policy: execution.gate_policy,
             moe: execution.moe.map(|m| MoeSurface {
+                branch_scale: m.branch_scale,
+                dense_prefix_layers: m.dense_prefix_layers,
                 experts: m.experts,
                 top_k: m.top_k,
                 expert_intermediate_size: m.expert_intermediate_size,
@@ -342,9 +744,20 @@ pub fn surface_from_resolved(
                 expert_format: m.expert_format,
                 gate_up_layout: m.gate_up_layout,
                 shared_experts: m.shared_experts,
+                shared_expert_intermediate_size: m.shared_expert_intermediate_size,
+                shared_expert_gate: m.shared_expert_gate,
                 hybrid: m.hybrid,
+                latent: match m.routed_expert_form {
+                    larql_models::config::RoutedExpertForm::Uniform => None,
+                    larql_models::config::RoutedExpertForm::Latent { width, norm } => {
+                        Some(MoeLatent {
+                            width,
+                            norm: norm.map(|n| LatentNorm { eps: n.eps }),
+                        })
+                    }
+                },
             }),
-        },
+        }),
         norm: NormSurface {
             pre: execution.norm_pre,
             post: execution.norm_post,
@@ -380,9 +793,55 @@ pub fn attach_stack_evidence(
                 .map(|rest| rest.trim_start_matches('.').to_string())
         })
         .collect();
-    match super::roles::norm_placement_evidence(relative.iter().map(String::as_str)) {
+    // A mixer-only program (every layer declared a Mamba2 recurrence)
+    // reads its own placement evidence: one pre-mixer norm per layer, no
+    // attention/FFN wrap norms. The choice is made from the DECLARED
+    // program, so a transformer stack that lost its norms still fails the
+    // transformer evidence rather than sliding into the mixer's.
+    // A hybrid's attention layers carry the same single pre-mixer norm
+    // (the mamba_ssm lineage wraps EVERY block, mixer or attention, in
+    // one `norm.weight`), so a Full layer counts as mixer-normed exactly
+    // when the conv-QKV block is declared — a transformer's Full layer
+    // still reads the transformer evidence.
+    let mixer_only = !inventory.resolved.layers.is_empty()
+        && inventory
+            .resolved
+            .layers
+            .iter()
+            .all(|l| match l.declared_kind {
+                Some(larql_models::config::LayerKind::Recurrent(
+                    larql_models::config::RecurrenceFamily::Mamba2,
+                )) => true,
+                Some(larql_models::config::LayerKind::Full) => {
+                    inventory.resolved.conv_qkv_attn.is_some()
+                }
+                _ => false,
+            });
+    let evidence = if mixer_only {
+        super::roles::mixer_norm_placement_evidence(relative.iter().map(String::as_str))
+    } else {
+        super::roles::norm_placement_evidence(relative.iter().map(String::as_str))
+    };
+    match evidence {
         Ok(placement) => {
             surface.norm.placement = Some(placement);
+            // A post-norm stack's ONLY norm sites are the post ones, and
+            // the component declares exactly one epsilon. So the declared
+            // epsilon is theirs.
+            //
+            // This is not the four-norm case wearing a different hat, and
+            // the difference is why it is safe here and refused there. A
+            // four-norm stack HAS both sites and they can genuinely
+            // differ — Muse-Glimmer's are 1e-5 pre and 1e-8 post — so
+            // filling `post` from `pre` there would be inheriting one
+            // site's judged value into another's, which is the
+            // executable-but-unfounded failure. Here there is no second
+            // site to disagree with: reading the declaration as belonging
+            // to the pre sites would give an epsilon to norms this stack
+            // does not have and none to the norms it does.
+            if placement == super::roles::NormPlacement::PostOnly && surface.norm.post.is_none() {
+                surface.norm.post = Some(surface.norm.pre);
+            }
             Ok(())
         }
         Err(reason) => Err(vec![format!("norm placement ({reason})")]),
@@ -402,6 +861,15 @@ pub fn head_from_resolved(inventory: &ArchitectureInventory) -> Result<HeadSurfa
     let Some(vocab_size) = resolved.vocab_size else {
         missing.push("vocab_size".to_string());
         return Err(missing);
+    };
+    // The mamba_ssm lineage pads the embedding rows up to a declared
+    // multiple, and the tied head genuinely EMITS the padded width — the
+    // reference's own logits are that wide. The surface carries what the
+    // head does; the declared vocab remains on the resolution as the
+    // meaningful prefix.
+    let vocab_size = match resolved.pad_vocab_size_multiple {
+        Some(multiple) if multiple > 0 => vocab_size.div_ceil(multiple) * multiple,
+        _ => vocab_size,
     };
     Ok(HeadSurface {
         vocab_size,
@@ -476,10 +944,24 @@ pub fn surface_from_nested(
     };
     // The epsilon spelling the config declares names the norm kind; a
     // component declaring neither has no norm surface to persist.
+    //
+    // The message says both halves on purpose. A bare `norm_eps` reads
+    // as one absent number a reader might reasonably supply, when what
+    // is actually absent is the *kind* as well: the spelling is the
+    // only evidence of whether this tower runs LayerNorm or RMSNorm,
+    // so a config carrying neither has said nothing about its norm at
+    // all. Qwen3.8's `vision_config` is exactly this — depth, heads,
+    // widths and activation all declared, no epsilon key of either
+    // spelling — and the honest answer is to refuse the surface rather
+    // than pick an epsilon and a kind on the checkpoint's behalf.
     let (kind, eps) = match (nested.norm_kind, nested.norm_eps) {
         (Some(kind), Some(eps)) => (kind, eps),
         _ => {
-            missing.push("norm_eps".to_string());
+            missing.push(
+                "norm_eps (declares neither `layer_norm_eps` nor `rms_norm_eps`, so the \
+                 norm kind is undeclared too — this build will not choose one)"
+                    .to_string(),
+            );
             (NormType::LayerNorm, 0.0)
         }
     };
@@ -487,9 +969,21 @@ pub fn surface_from_nested(
         return Err(missing);
     }
     Ok(ExecutionSurface {
-        // No judged perception tower declares a linear-attention recurrence.
+        // A perception tower declares no sequence extent of its own; the
+        // absence is the fact, not a zero.
+        context_length: None,
+        // No judged perception tower declares a linear-attention
+        // recurrence, Multi-Latent Attention, or an SSM mixer.
         linear_attention: None,
-        attention: AttentionSurface {
+        kda: None,
+        kda_gate_lower_bound: None,
+        kda_gate_form: None,
+        kda_use_full_rank_gate: None,
+        mla: None,
+        mamba2: None,
+        conv_qkv: None,
+        residual_in_fp32: None,
+        attention: Some(AttentionSurface {
             num_q_heads: heads,
             num_kv_heads: nested.num_key_value_heads.unwrap_or(heads),
             head_dim,
@@ -508,9 +1002,13 @@ pub fn surface_from_nested(
             // it declares anything (Gemma 4 vision: `false`); the loader's
             // tensor-presence check answers otherwise, as for text.
             attention_bias: nested.tower.attention_bias,
-        },
-        ffn: FfnSurface {
-            intermediate_size,
+        }),
+        ffn: Some(FfnSurface {
+            // A perception tower's width is required above (its absence
+            // is already a refusal), so it is always present here.
+            intermediate_size: Some(intermediate_size),
+            // A nested component declares its own per-layer widths, or none.
+            intermediate_size_by_layer: nested.ffn_intermediate_size_by_layer.clone(),
             activation,
             ffn_type: if has_gate_tensors {
                 FfnType::Gated
@@ -521,7 +1019,7 @@ pub fn surface_from_nested(
             // fact, not a fallback.
             gate_policy: larql_models::ExpertGatePolicy::Gated,
             moe: None,
-        },
+        }),
         norm: NormSurface {
             pre: NormSpec {
                 kind,
@@ -546,5 +1044,14 @@ pub fn surface_from_nested(
         head: None,
         // No perception tower has declared a residual-scale operation.
         residual_scale: None,
+        // Nor a multi-stream residual: every judged tower adds its
+        // sublayer outputs into one vector.
+        residual_topology: larql_models::config::ResidualTopology::SingleStream,
     })
+}
+
+/// `serde` default for [`MlaSurface::query`]: the form every container
+/// written before it was recorded declared.
+fn direct_query_form() -> larql_models::config::MlaQueryForm {
+    larql_models::config::MlaQueryForm::Direct
 }

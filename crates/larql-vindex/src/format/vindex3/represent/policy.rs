@@ -28,13 +28,71 @@
 //! because it happened to be 2-D is how a policy acquires behaviour its
 //! author never chose.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// What a tensor does, as far as representation eligibility is concerned.
+///
+/// The serialised form is exactly what [`Role::name`] returns, because
+/// `Serialize`/`Deserialize` are written in terms of `name`/`parse`
+/// rather than derived.
+///
+/// Deriving `rename_all = "kebab-case"` would work today and is wrong in
+/// principle: it makes the VARIANT NAME a second, independent definition
+/// of the wire form. The two agree now, so a rename of either would keep
+/// compiling and silently split the vocabulary — a precision map on disk
+/// still deserialising while `--include-role` no longer accepted the
+/// same word. One definition, pinned by `compat_tests`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     /// Attention and dense-FFN projections — the bulk of a dense model.
     DecoderLinear,
+    /// The bulk matmuls of a recurrent token mixer: Gated DeltaNet's
+    /// fused `in_proj_qkv`, its `in_proj_z` and `out_proj`; KDA's split
+    /// q/k/v and out; Mamba2's fused `in_proj` and `out_proj`.
+    ///
+    /// The same shape of operation as [`Self::DecoderLinear`] at the same
+    /// scale, and compiled by the same default — its own role because a
+    /// profile must be able to say something different about a
+    /// recurrence than about softmax attention without editing a
+    /// substring list, and because a report that cannot name them cannot
+    /// distinguish "protected" from "unrecognised".
+    RecurrenceProjection,
+    /// A recurrent mixer's *control* path: the narrow projections that
+    /// emit per-head decay and write strength (Gated DeltaNet
+    /// `in_proj_a`/`in_proj_b`, KDA's gate factorisations and `b_proj`).
+    ///
+    /// **Not protected by the default representation policy**, and the
+    /// reason is a cost/benefit judgement rather than a null result.
+    ///
+    /// Q-BANK-1 compared an otherwise identical Qwen3.8 NVFP4 programme
+    /// with these projections preserved at BF16 against one compiling
+    /// them, matched on commit, reference bank and backend, differing by
+    /// this role alone. Protection reduced top-1 flips from 106 to 98
+    /// across 1,740 measured positions — a real effect, McNemar exact
+    /// two-sided p = 0.0215 — while changing mean KL by 0.000389
+    /// bits/token (1.6% of the mean) and costing 33,914,496 bytes,
+    /// 0.0112 bits/weight. The metrics disagreed on direction: KL p95
+    /// and mean ΔNLL were better *without* protection.
+    ///
+    /// The benefit concentrated in low-margin positions, where the BF16
+    /// reference was already least decisive; the high-margin tertile had
+    /// zero flips under either programme. So the measured effect did not
+    /// justify a default precision exception.
+    ///
+    /// The architecture treating recurrent *state* specially —
+    /// Qwen3.8 declares `linear_attention.state_dtype: float32` against
+    /// otherwise-bf16 weights — does not imply that the projections
+    /// controlling that state inherit special representation policy.
+    /// Precision exceptions require behavioural evidence sufficient to
+    /// justify their cost.
+    ///
+    /// Still its own role, because naming the operand is what made the
+    /// question askable: `--protect` is `--include-role`'s inverse, and
+    /// a profile with different evidence — a longer context, a different
+    /// recurrence — can hold these back deliberately rather than by an
+    /// accident of spelling.
+    RecurrenceControl,
     /// Routed-expert weights — the bulk of an MoE model.
     ExpertWeight,
     /// Token embedding table.
@@ -64,6 +122,8 @@ impl Role {
     /// Every role, for CLI parsing and exhaustive reporting.
     pub const ALL: &'static [Role] = &[
         Role::DecoderLinear,
+        Role::RecurrenceProjection,
+        Role::RecurrenceControl,
         Role::ExpertWeight,
         Role::Embedding,
         Role::OutputHead,
@@ -78,6 +138,8 @@ impl Role {
     pub fn name(self) -> &'static str {
         match self {
             Role::DecoderLinear => "decoder-linear",
+            Role::RecurrenceProjection => "recurrence-projection",
+            Role::RecurrenceControl => "recurrence-control",
             Role::ExpertWeight => "expert-weight",
             Role::Embedding => "embedding",
             Role::OutputHead => "output-head",
@@ -95,7 +157,41 @@ impl Role {
 
     /// Whether the conservative default compiles this role.
     pub fn in_default_policy(self) -> bool {
-        matches!(self, Role::DecoderLinear | Role::ExpertWeight)
+        matches!(
+            self,
+            Role::DecoderLinear
+                | Role::RecurrenceProjection
+                | Role::RecurrenceControl
+                | Role::ExpertWeight
+        )
+    }
+}
+
+impl Serialize for Role {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Role {
+    /// Read through `Cow`, not `&str`.
+    ///
+    /// `&str` demands a BORROWED string and so only works for a
+    /// deserializer reading from a buffer it can borrow out of —
+    /// `from_str`, `from_slice`. It fails on every owning one:
+    /// `serde_json::from_value`, `from_reader`, and any binary format.
+    /// A role that could only survive one transport would put an
+    /// arbitrary limit on where a precision map may travel, and the
+    /// symptom is an unhelpful `invalid type: string, expected a
+    /// borrowed string` far from the cause. `Cow` still borrows where
+    /// borrowing is possible.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = <std::borrow::Cow<'de, str> as Deserialize>::deserialize(d)?;
+        Role::parse(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "`{s}` is not a role; a precision map naming it cannot be resolved"
+            ))
+        })
     }
 }
 

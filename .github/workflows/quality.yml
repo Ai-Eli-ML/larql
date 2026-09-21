@@ -10,7 +10,8 @@
 #   deny        — licences, advisories, sources, bans            (blocking)
 #   msrv        — the declared rust-version really compiles      (blocking)
 #   proto-lint  — buf lint over the four gRPC schemas            (blocking)
-#   doc-links   — every relative Markdown link resolves          (blocking)
+#   docs-integrity — Markdown links resolve, code references resolve,
+#                   and contract indexes name real tests       (blocking)
 #
 # Mutation testing lives in `mutants.yml`, not here: it is informational,
 # and a job cancelled by `timeout-minutes` concludes the whole run as
@@ -34,6 +35,21 @@ on:
     # Mondays 06:00 UTC — a fresh advisory-db scan against unchanged code.
     - cron: '0 6 * * 1'
   workflow_dispatch: {}
+
+# Supersede in-flight pull-request runs: pushing a new commit to a PR
+# cancels the runs still compiling the previous one.
+#
+# Non-PR runs (main pushes, schedules, manual dispatch) are keyed by
+# `run_id`, which is unique per run, so they are each alone in their
+# group. That is deliberate and not the same as `cancel-in-progress:
+# false`: a concurrency group holds at most one running and one pending
+# run, and a newer pending run EVICTS the older pending one. Grouping
+# every main push under `refs/heads/main` would therefore still destroy
+# the CI record for an intermediate main commit when merges land close
+# together, with cancellation disabled or not.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -82,28 +98,24 @@ jobs:
   msrv:
     # Named without the version: a job-level `name` cannot reference `steps`,
     # and hardcoding a number here would be a second place to forget to bump.
-    name: MSRV · ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: MSRV · workspace
+    runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      # Split by platform because no single runner can build the whole
-      # workspace. `larql-compute-metal` takes `blas-src` only under
-      # `cfg(target_os = "macos")` while its examples `extern crate blas_src`
-      # unconditionally, so on Linux they fail to resolve at *any* toolchain —
-      # nothing to do with the MSRV. Its own workflow is macOS-only for the
-      # same reason.
-      #
-      # So: Linux checks the workspace minus that crate (covering the
-      # cfg(linux) OpenBLAS paths in larql-compute and larql-inference), and
-      # macOS checks the crate Linux cannot. Between them every member crate
-      # is MSRV-gated with no silent hole.
-      matrix:
-        include:
-          - os: ubuntu-latest
-            args: --workspace --all-targets --exclude larql-compute-metal
-          - os: macos-14
-            args: -p larql-compute-metal --all-targets
+    # Split by platform because no single runner can build the whole
+    # workspace. `larql-compute-metal` takes `blas-src` only under
+    # `cfg(target_os = "macos")` while its examples `extern crate blas_src`
+    # unconditionally, so on Linux they fail to resolve at *any* toolchain —
+    # nothing to do with the MSRV.
+    #
+    # So: this job checks the workspace minus that crate (covering the
+    # cfg(linux) OpenBLAS paths in larql-compute and larql-inference), and
+    # `msrv-metal.yml` checks the crate Linux cannot. Between them every
+    # member crate is still MSRV-gated with no silent hole.
+    #
+    # That second leg used to be a macos-14 entry in a matrix here. It was
+    # moved out because this workflow carries no `paths:` filter — the
+    # weekly `schedule:` needs to scan an unchanged lockfile — so a macOS
+    # runner was requested on every pull request, whatever it touched.
     steps:
       - uses: actions/checkout@v7
 
@@ -131,16 +143,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libopenblas-dev pkg-config
 
-      - name: Cache cargo registry + build artefacts
+      - name: Cache cargo registry (downloads only, never target/)
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-reg2-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-msrv-${{ steps.msrv.outputs.version }}-
+            ${{ runner.os }}-cargo-reg2-msrv-${{ steps.msrv.outputs.version }}-
+
+      - name: No compiled workspace artefacts may be restored
+        shell: bash
+        run: |
+          # The cache above carries downloads only. A target/ restored from
+          # another commit can satisfy a link against stale code, so a green
+          # matrix would be evidence about an artefact that is not in this
+          # commit. Fail loudly rather than build on one.
+          if [ -e target ]; then
+            echo "::error::target/ was restored from cache - the cache key or path is wrong"
+            exit 1
+          fi
 
       # This is `cargo check` at the pinned toolchain rather than
       # `cargo msrv verify`. cargo-msrv bisects across many toolchains to
@@ -150,11 +173,39 @@ jobs:
       #
       # `--locked` matters: without it cargo may resolve a newer dependency
       # than Cargo.lock pins and the job would test a graph nobody ships.
-      - name: Check at declared MSRV
-        run: cargo check ${{ matrix.args }} --locked
+      #
+      # `RUSTUP_TOOLCHAIN` matters more. `rust-toolchain.toml` pins the
+      # DEVELOPMENT toolchain and rustup honours that file over whatever
+      # `dtolnay/rust-toolchain` installed, so from the day the pin landed
+      # (2026-08-22) this step silently checked at the development version
+      # and the gate was hollow. The env var outranks the file, and the
+      # step before the check refuses to run it under any other compiler.
+      - name: Report the compiler running the gate
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: |
+          rustc --version
+          cargo --version
+          # `rust-version` may be two components ("1.98"); rustc reports
+          # three ("1.98.0"). The declared version must equal the running
+          # one or be its major.minor prefix.
+          declared="${{ steps.msrv.outputs.version }}"
+          actual=$(rustc --version | awk '{print $2}')
+          case "$actual" in
+            "$declared"|"$declared".*) echo "MSRV gate runs rustc $actual (declared $declared)" ;;
+            *)
+              echo "::error::MSRV gate would run rustc $actual, not the declared $declared"
+              exit 1
+              ;;
+          esac
 
-  doc-links:
-    name: doc links
+      - name: Check at declared MSRV
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: cargo check --workspace --all-targets --exclude larql-compute-metal --locked
+
+  docs-integrity:
+    name: documentation integrity
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -180,6 +231,89 @@ jobs:
       # cries wolf on legitimate content gets switched off.
       - name: Check documentation code references
         run: python3 scripts/check_doc_references.py --strict
+
+      # A contract index names the test that pins each frozen invariant, and
+      # that citation is exactly the kind that rots silently: renaming a test
+      # is a green refactor which leaves the freeze pointing at nothing, and
+      # nothing else in CI reads the index at all. The checker has existed
+      # since the v1 index landed and NOTHING RAN IT -- enforcement in
+      # principle only -- which is the state the optimizer index would have
+      # inherited. It checks existence and location; `cargo test` decides
+      # whether the contracts still hold.
+      - name: Contract indexes name tests that exist
+        run: python3 scripts/check_contract_index.py
+
+      # The reference checker above matched SKIP_DIRS against the ABSOLUTE
+      # directory path, and SKIP_DIRS contains `/.claude/`. Every worktree in
+      # this repository lives under `.claude/worktrees/`, so ROOT matched its
+      # own prefix, the walk was pruned at the first directory, and the gate
+      # printed "no broken references" over an empty corpus and exited 0.
+      # Sound here -- Actions checks out clean -- and vacuous in every local
+      # pre-push run, which is the worse failure: it fails OPEN in the one
+      # place a human reads it before pushing.
+      #
+      # `selftest` carries the DOC-GATE-1 controls, and each is REACHABLE:
+      # run against the pre-repair script they fail, reproducing the bug in
+      # miniature (ordinary checkout 1 reference / 1 document, `.claude`
+      # worktree 0 / 0). The strongest is equivalence rather than non-zero --
+      # equal counts from both paths, since a partial-tree bug would still
+      # report a confident number.
+      #
+      # No network, no repository walk: synthetic fixtures in a temp dir.
+      - name: Documentation instrument selftest
+        run: python3 scripts/check_doc_references.py selftest
+
+  ci-instrument:
+    name: ci throughput instrument
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/ci_throughput.py adjudicates the CI experiments that decide
+      # what this repository's CI looks like, and until 2026-09-07 its
+      # `selftest` -- the thing that proves each verdict is reachable and
+      # each metric definition is right -- ran only when someone remembered
+      # to type it. E1 shipped a forecast whose validity gate could not
+      # pass; the selftest now carries the control that catches that class
+      # (an extensive metric scored across samples of different size must
+      # be REFUSED, and must still be scoreable at equal n). A checker
+      # nobody runs is not a check.
+      #
+      # No network: `selftest` builds synthetic runs with known answers and
+      # never calls the API. Seconds on Linux.
+      - name: Instrument selftest
+        run: python3 scripts/ci_throughput.py selftest
+
+      # The Metal tier classifier ships before the trigger change that will
+      # use it (CI-E2-D is designed, not activated). Its completeness check
+      # runs from the moment the manifest exists, not from activation:
+      # `parity-obligations.json` declares which upstream surfaces can
+      # invalidate Metal's behaviour, and its one real weakness is OMISSION.
+      # A new parity dependency added without a declaration would classify
+      # as compile-only once tiering is live, so the gate that notices has
+      # to predate the gate that acts.
+      - name: Metal tier classifier selftest
+        run: python3 scripts/metal_tier.py selftest
+
+      - name: Parity-obligation manifest is complete
+        run: python3 scripts/metal_tier.py check
+
+      # The conformance sweep's cached plans are the evidence every
+      # architecture verdict in `docs/arch-conformance` is derived from,
+      # and a cache outlives the planner that wrote it. Until this guard
+      # existed nothing in `arch_sweep.py` read the recorded
+      # `PLANNER_SEMANTICS_VERSION`, so a semantics-16 cache beside a
+      # semantics-22 planner was indistinguishable from current evidence:
+      # every row parsed and every field the readers touch was present.
+      #
+      # No network and no planner: `selftest` builds caches with known
+      # answers and checks the guard against them, including the control
+      # that matters — a row complete in every respect and one version
+      # behind must refuse, and the same row at the current version must
+      # not.
+      - name: Conformance evidence guard selftest
+        run: python3 scripts/conformance_evidence.py selftest
 
   proto-lint:
     name: buf lint

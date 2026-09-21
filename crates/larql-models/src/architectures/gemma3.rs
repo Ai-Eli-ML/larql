@@ -163,20 +163,13 @@ impl ModelArchitecture for Gemma3Arch {
     /// `scaling_type = linear` as global-only because that matches what
     /// `Gemma3TextConfig` produces from the same input.
     fn rope_position_divisor_for_layer(&self, layer: usize) -> f64 {
-        let rs = match self.config.rope_scaling.as_ref() {
-            Some(rs) => rs,
-            None => return 1.0,
+        let Some(factor) = self.linear_rope_scaling() else {
+            return crate::config::UNSCALED_POSITION_DIVISOR;
         };
-        if !rs
-            .scaling_type
-            .eq_ignore_ascii_case(crate::ROPE_TYPE_LINEAR)
-        {
-            return 1.0;
-        }
         if self.is_sliding_window_layer(layer) {
-            1.0
+            crate::config::UNSCALED_POSITION_DIVISOR
         } else {
-            rs.factor
+            factor
         }
     }
 
@@ -204,6 +197,7 @@ mod tests {
             num_layers: 34,
             hidden_size: 2560,
             intermediate_size: 10240,
+            ffn_intermediate_size_by_layer: None,
             head_dim: 256,
             num_q_heads: 8,
             num_kv_heads: 4,
@@ -212,14 +206,30 @@ mod tests {
             layer_rope_theta: None,
             rope_local_base: Some(10_000.0),
             sliding_window: Some(1024),
+            use_sliding_window: None,
+            position_embedding_type: None,
+            no_rope_layers: None,
+            no_rope_layer_interval: None,
+            rope_interleaved: None,
+            use_mrope: None,
+            ffn_shape_name: None,
+            is_llama_config: None,
+            max_window_layers: None,
             num_experts: None,
             num_experts_per_token: None,
             num_shared_experts: None,
+            shared_expert_intermediate_size: None,
+            hc_streams: None,
+            hc_sinkhorn_iters: None,
+            hc_eps: None,
+            attn_res_block_size: None,
             enable_moe_block: false,
             top_k_experts: None,
             moe_intermediate_size: None,
             swiglu_limit: None,
             norm_topk_prob: None,
+            routed_expert_hidden_size: None,
+            latent_moe_use_norm: None,
             kv_lora_rank: None,
             q_lora_rank: None,
             qk_nope_head_dim: None,
@@ -249,6 +259,8 @@ mod tests {
             attention_bias: None,
             mlp_bias: None,
             hidden_act: None,
+            activation_situ_beta: None,
+            activation_situ_linear_beta: None,
             max_position_embeddings: None,
             image_token_id: None,
             video_token_id: None,
@@ -265,7 +277,36 @@ mod tests {
             linear_value_head_dim: None,
             linear_num_key_heads: None,
             linear_num_value_heads: None,
+            linear_attn_interleave: crate::config::DeclaredInterleave::Absent,
+            mtp_interleave: crate::config::DeclaredInterleave::Absent,
+            kda_geometry: None,
+            kda_gate_lower_bound: None,
+            kda_safe_gate: None,
+            kda_use_full_rank_gate: None,
+            mla_use_output_gate: None,
+            router_activation: None,
+            routed_scaling_factor: None,
+            expert_groups: None,
+            topk_group: None,
+            use_grouped_topk: None,
+            moe_layer_freq: None,
+            first_k_dense_replace: None,
+            mla_use_nope: None,
+            model_max_length: None,
+            d_rel: None,
+            rel_extent: None,
             mamba_ssm_dtype: None,
+            mamba2_geometry: None,
+            mamba2_provenance: None,
+            conv_qkv_attn: None,
+            conv_qkv_provenance: None,
+            attn_causal: None,
+            pad_vocab_size_multiple: None,
+            fused_add_norm: None,
+            mlp_intermediate_size: None,
+            mlp_padding_size: None,
+            use_mlp_bias: None,
+            residual_in_fp32: None,
             attn_output_gate: None,
             output_gate_type: None,
             mtp_num_hidden_layers: None,
@@ -328,6 +369,44 @@ mod tests {
         // Layers 5, 11, 17, ... are full attention; everyone else sliding.
         assert_eq!(arch.rope_position_divisor_for_layer(5), 8.0);
         assert_eq!(arch.rope_position_divisor_for_layer(4), 1.0);
+    }
+
+    /// The per-layer policy the container carries: the declared divisor
+    /// reaches a full-attention layer as `Linear` at the global base, and
+    /// a sliding layer rotates plain at the local base — HF's per-layer-
+    /// type expansion of the flat block, layer by layer.
+    #[test]
+    fn linear_rope_policy_reaches_full_attention_layers_only() {
+        use crate::config::PositionPolicy;
+        let arch = Gemma3Arch::from_config(synth_config(Some(RopeScaling {
+            scaling_type: "linear".into(),
+            factor: 8.0,
+            llama3_low_freq_factor: None,
+            llama3_high_freq_factor: None,
+            llama3_original_max_position_embeddings: None,
+            yarn_beta_fast: None,
+            yarn_beta_slow: None,
+            yarn_truncate: None,
+            yarn_mscale: None,
+            yarn_mscale_all_dim: None,
+            gemma3_global_only: true,
+        })));
+        assert_eq!(
+            arch.position_policy_for_layer(5),
+            PositionPolicy::Linear {
+                theta: arch.rope_base_for_layer(5),
+                factor: 8.0
+            }
+        );
+        assert_eq!(
+            arch.position_policy_for_layer(4),
+            PositionPolicy::Rope { theta: 10_000.0 }
+        );
+        assert_ne!(
+            arch.rope_base_for_layer(5),
+            10_000.0,
+            "the two spans rotate at different bases"
+        );
     }
 
     // ─── Phase 1a: MultiModalProtocol contract ────────────────────────────

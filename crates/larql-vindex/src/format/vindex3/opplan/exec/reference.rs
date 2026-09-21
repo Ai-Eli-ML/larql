@@ -18,14 +18,18 @@ use larql_models::config::{
 
 use super::super::super::graph::policy::AttentionSpan;
 use super::backend::{
-    AttentionCall, AttentionOut, AttentionStepCall, AttentionStepOut, FfnCall, GateCall, NormCall,
-    PlanBackend, ProjectCall, ProjectedQkv, QkNormCall, RoutedFfnCall,
+    AttentionCall, AttentionOut, AttentionStepCall, AttentionStepOut, ExpertSlices, FfnCall,
+    GateCall, NormCall, PlanBackend, ProjectCall, ProjectedQkv, QkNormCall, RoutedFfnCall,
+    WeightSlice,
 };
 use super::kernels::{
-    activate, gather_fused_half_mutated, matvec, mrope_rotate, norm, partial_rotary_frequencies,
-    partial_rotary_slice, rope_rotate, rope_rotate_scaled, sigmoid, softcap, softmax,
-    softmax_with_sink, yarn_frequencies, FusedHalf, GateMutation,
+    activate, gather_fused_half_mutated, linear_frequencies, llama3_frequencies, matvec,
+    mrope_rotate, norm, partial_rotary_frequencies, partial_rotary_slice, rope_rotate,
+    rope_rotate_scaled, sigmoid, softcap, softmax, softmax_with_sink, yarn_frequencies, FusedHalf,
+    GateMutation,
 };
+use super::lowering::LoweringIdentity;
+use super::observe::AttentionHeadRecord;
 use crate::error::VindexError;
 use larql_models::config::NormType;
 use larql_models::config::{PositionPolicy, RotaryFrequencyBasis};
@@ -33,6 +37,12 @@ use rayon::prelude::*;
 
 /// Name reported by [`PlanBackend::name`].
 const NAME: &str = "reference-f32";
+/// The provider's family ([`PlanBackend::identity`]): the literal f32
+/// transcription that defines correctness. Its revision moves only if the
+/// transcription itself is corrected — which is a change to what every
+/// other provider is judged against, and is recorded as one.
+pub const IDENTITY_FAMILY: &str = "reference";
+pub const IDENTITY_REVISION: u32 = 1;
 
 /// Naive f32 realisation of every plan operation.
 #[derive(Debug, Default, Clone, Copy)]
@@ -190,6 +200,43 @@ impl ReferenceBackend {
                     rope_rotate_scaled(head, position, &inv_freq, amplitude);
                 }
             }
+            // Linear, transcribed: every frequency divided by the
+            // factor, unit amplitude — Gemma 3's global layers. Written
+            // as its own arm rather than a divisor on the plain arm, so
+            // a plain layer can never inherit a divisor.
+            PositionPolicy::Linear { theta, factor } => {
+                const UNIT_AMPLITUDE: f32 = 1.0;
+                let inv_freq = linear_frequencies(head_dim, theta, factor);
+                for head in q.chunks_exact_mut(head_dim) {
+                    rope_rotate_scaled(head, position, &inv_freq, UNIT_AMPLITUDE);
+                }
+                for head in k.chunks_exact_mut(head_dim) {
+                    rope_rotate_scaled(head, position, &inv_freq, UNIT_AMPLITUDE);
+                }
+            }
+            // Llama-3, transcribed: wavelength-band frequencies at unit
+            // amplitude. `UNIT_AMPLITUDE` is passed explicitly rather
+            // than defaulted, so an amplitude arriving here later has to
+            // be written down rather than inherited.
+            PositionPolicy::Llama3 { theta, scaling } => {
+                const UNIT_AMPLITUDE: f32 = 1.0;
+                let inv_freq = llama3_frequencies(&scaling, head_dim, theta);
+                for head in q.chunks_exact_mut(head_dim) {
+                    rope_rotate_scaled(head, position, &inv_freq, UNIT_AMPLITUDE);
+                }
+                for head in k.chunks_exact_mut(head_dim) {
+                    rope_rotate_scaled(head, position, &inv_freq, UNIT_AMPLITUDE);
+                }
+            }
+            // See `production.rs`: no backend rotates for a relative
+            // scheme, and silently skipping position is a wrong answer
+            // that still produces fluent output.
+            PositionPolicy::Relative { d_rel, extent } => {
+                return Err(VindexError::Parse(format!(
+                    "relative position (d_rel {d_rel}, extent {extent}) is represented but not \
+                     executable: no backend implements it"
+                )))
+            }
             PositionPolicy::None => {}
             // Partial rotary, transcribed: head-width basis is the full
             // rotate-half table with the top frequencies zero; rotary-width
@@ -255,30 +302,6 @@ impl ReferenceBackend {
         Ok((q, k, v))
     }
 
-    /// One query position's scores, softmax, weighted-V aggregation,
-    /// gate, and output projection. `key_of`/`value_of` abstract where
-    /// K/V rows live (the batch path's local vectors, or the decode
-    /// step's interpreter-owned cache plus the fresh row).
-    #[allow(clippy::too_many_arguments)]
-    fn attend_position<'k>(
-        call: &AttentionCall<'_>,
-        position: usize,
-        query: &[f32],
-        key_of: impl Fn(usize) -> &'k [f32],
-        value_of: impl Fn(usize) -> &'k [f32],
-        gate_input: &[f32],
-    ) -> Result<Vec<f32>, VindexError> {
-        Self::attend_position_inner(
-            call,
-            position,
-            query,
-            key_of,
-            value_of,
-            gate_input,
-            GateMutation::None,
-        )
-    }
-
     /// [`Self::attend_position`] with a deliberate defect in the gate
     /// stage. See [`Self::project_position_inner`].
     #[allow(clippy::too_many_arguments)]
@@ -291,6 +314,39 @@ impl ReferenceBackend {
         gate_input: &[f32],
         gate_mutation: GateMutation,
     ) -> Result<Vec<f32>, VindexError> {
+        Self::attend_position_tapped(
+            call,
+            position,
+            query,
+            key_of,
+            value_of,
+            gate_input,
+            gate_mutation,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::attend_position_inner`] with the V3-HEAD-OBS-1 tap: the
+    /// oracle's own loop keeps each head's distribution when asked and
+    /// fires one record per query head after the gate values are known
+    /// and before they multiply the heads. The arithmetic is the same
+    /// either way; the tap is what the production kernel's tap is gated
+    /// against.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attend_position_tapped<'k>(
+        call: &AttentionCall<'_>,
+        position: usize,
+        query: &[f32],
+        key_of: impl Fn(usize) -> &'k [f32],
+        value_of: impl Fn(usize) -> &'k [f32],
+        gate_input: &[f32],
+        gate_mutation: GateMutation,
+        mut tap: Option<&mut dyn FnMut(AttentionHeadRecord<'_>)>,
+        mut head_intervene: Option<&mut super::backend::HeadIntervene<'_>>,
+    ) -> Result<Vec<f32>, VindexError> {
+        let mut kept: Vec<Vec<f32>> = Vec::new();
+        let mut fired = false;
         let head_dim = call.head_dim;
         let q_rows = call.num_q_heads * head_dim;
         let group = call.num_q_heads / call.num_kv_heads;
@@ -339,6 +395,9 @@ impl ReferenceBackend {
                 for (acc, v) in head_out.iter_mut().zip(v_slice) {
                     *acc += weight * v;
                 }
+            }
+            if tap.is_some() {
+                kept.push(scores);
             }
         }
 
@@ -403,6 +462,33 @@ impl ReferenceBackend {
                 GateMutation::SiluGate => g * sigmoid(g),
                 _ => sigmoid(g),
             };
+            // V3-HEAD-OBS-1: the records, with the activated gate the
+            // multiply below will apply, before it applies.
+            if let Some(tap) = tap.as_deref_mut() {
+                let activated: Vec<f32> = gate_values.iter().map(|g| activate_gate(*g)).collect();
+                super::observe::fire_head_records(
+                    tap,
+                    position,
+                    call.num_q_heads,
+                    call.num_kv_heads,
+                    head_dim,
+                    start,
+                    call.sinks.is_some(),
+                    &concat,
+                    &kept,
+                    Some(&activated),
+                    &value_of,
+                );
+                fired = true;
+            }
+            // V3-INTERVENE-2: each head's `ctx_h`, mutated in place if
+            // declared — after the uninintervened head record above (J3),
+            // before the gate multiply and `o_proj` below (J1).
+            if let Some(hi) = head_intervene.as_deref_mut() {
+                for (head, ctx_h) in concat.chunks_exact_mut(head_dim).enumerate() {
+                    hi(head, ctx_h);
+                }
+            }
             if gate_mutation != GateMutation::NoGate
                 && gate_mutation != GateMutation::GateAfterOProj
             {
@@ -422,11 +508,81 @@ impl ReferenceBackend {
             }
         }
 
+        // V3-HEAD-OBS-1: a plan without a gate fires its records here,
+        // with no gate slice; a gated plan fired them above.
+        if let (Some(tap), false) = (tap, fired) {
+            super::observe::fire_head_records(
+                tap,
+                position,
+                call.num_q_heads,
+                call.num_kv_heads,
+                head_dim,
+                start,
+                call.sinks.is_some(),
+                &concat,
+                &kept,
+                None,
+                &value_of,
+            );
+        }
+        // V3-INTERVENE-2: a plan without a gate applies its head
+        // intervention here; a gated plan applied it above regardless of
+        // whether observation was armed — gated on the plan's OWN gate,
+        // not on `fired`, which tracks the tap and stays false without one.
+        if call.gate.is_none() {
+            if let Some(hi) = head_intervene {
+                for (head, ctx_h) in concat.chunks_exact_mut(head_dim).enumerate() {
+                    hi(head, ctx_h);
+                }
+            }
+        }
+
         let mut out = matvec(call.w_o.as_f32()?, call.hidden, q_rows, &concat);
         if let Some(bias) = &call.bias {
             add_in_place(&mut out, bias.o);
         }
         Ok(out)
+    }
+
+    /// The decode step with an optional per-head tap and an optional
+    /// per-head intervention; `attention_step` is this with `None, None`,
+    /// so the observed step IS the step.
+    fn attention_step_tapped(
+        step: AttentionStepCall<'_>,
+        tap: Option<&mut dyn FnMut(AttentionHeadRecord<'_>)>,
+        head_intervene: Option<&mut super::backend::HeadIntervene<'_>>,
+    ) -> Result<AttentionStepOut, VindexError> {
+        let call = &step.op;
+        let pre = &call.inputs[0];
+        let (q, k, v) = Self::project_position(call, step.position, pre)?;
+        let output = Self::attend_position_tapped(
+            call,
+            step.position,
+            &q,
+            |p| {
+                if p == step.position {
+                    k.as_slice()
+                } else {
+                    step.keys[p].as_slice()
+                }
+            },
+            |p| {
+                if p == step.position {
+                    v.as_slice()
+                } else {
+                    step.values[p].as_slice()
+                }
+            },
+            pre,
+            GateMutation::None,
+            tap,
+            head_intervene,
+        )?;
+        Ok(AttentionStepOut {
+            key: k,
+            value: v,
+            output,
+        })
     }
 }
 
@@ -443,10 +599,54 @@ const FUSED_BRANCHES: usize = larql_models::quant::mxfp4::FUSED_HALVES;
 /// RMS-normalised without a weight, times `scale`, times `hidden^-0.5`;
 /// softmax over every expert; top-k; the selected weights renormalised to
 /// sum to one; then each multiplied by `per_expert_scale[expert]`.
-fn select_experts_reference(call: &RoutedFfnCall<'_>) -> Result<Vec<(usize, f32)>, VindexError> {
-    if call.router_kind == MoeRouterKind::Gemma4Hybrid {
-        return select_experts_gemma4_reference(call);
+pub(super) fn select_experts_reference(
+    call: &RoutedFfnCall<'_>,
+) -> Result<Vec<(usize, f32)>, VindexError> {
+    let mut selected = if call.router_kind == MoeRouterKind::Gemma4Hybrid {
+        select_experts_gemma4_reference(call)?
+    } else if call.router_kind == MoeRouterKind::Sigmoid {
+        select_experts_sigmoid_reference(call)
+    } else {
+        select_experts_softmax_reference(call)
+    };
+    // `routed_scaling_factor`: the reference multiplies the routed sum;
+    // multiplying each weight is the same sum.
+    for (_, w) in &mut selected {
+        *w *= call.branch_scale;
     }
+    Ok(selected)
+}
+
+/// `weights / (weights.sum() + 1e-20)` — the reference's literal.
+const RENORM_EPS: f32 = 1e-20;
+
+/// DeepSeek-V3's `MoEGate` with `scoring_func = "sigmoid"`, literal: scores
+/// are sigmoids of the logits; `topk` runs over `scores +
+/// e_score_correction_bias`; the gathered weights are the UNCORRECTED
+/// scores, renormalised when `norm_topk_prob`.
+fn select_experts_sigmoid_reference(call: &RoutedFfnCall<'_>) -> Vec<(usize, f32)> {
+    let logits = matvec(call.router, call.experts, call.hidden, call.x);
+    let scores: Vec<f32> = logits.iter().map(|l| 1.0 / (1.0 + (-l).exp())).collect();
+    let mut ranked: Vec<(usize, f32)> = scores
+        .iter()
+        .enumerate()
+        .map(|(e, &s)| (e, s + call.router_bias.map_or(0.0, |b| b[e])))
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let k = call.top_k.min(ranked.len());
+    let mut selected: Vec<(usize, f32)> =
+        ranked[..k].iter().map(|&(e, _)| (e, scores[e])).collect();
+    if call.routing_policy == ExpertRoutingPolicy::NormalisedOverSelected && k > 1 {
+        let denominator = selected.iter().map(|(_, w)| w).sum::<f32>() + RENORM_EPS;
+        for (_, w) in &mut selected {
+            *w /= denominator;
+        }
+    }
+    selected
+}
+
+/// The softmax routers, literal (see [`select_experts_reference`]).
+fn select_experts_softmax_reference(call: &RoutedFfnCall<'_>) -> Vec<(usize, f32)> {
     let mut logits = matvec(call.router, call.experts, call.hidden, call.x);
     if let Some(bias) = call.router_bias {
         for (l, b) in logits.iter_mut().zip(bias) {
@@ -464,11 +664,11 @@ fn select_experts_reference(call: &RoutedFfnCall<'_>) -> Result<Vec<(usize, f32)
             ranked.iter().take(k).map(|r| (r.1 - max).exp()).sum()
         }
     };
-    Ok(ranked
+    ranked
         .into_iter()
         .take(k)
         .map(|(e, l)| (e, (l - max).exp() / denominator))
-        .collect())
+        .collect()
 }
 
 /// Gemma 4's router, literal (see [`select_experts_reference`]). Every
@@ -521,6 +721,41 @@ fn select_experts_gemma4_reference(
 /// the family definitions: plain gating is `activation(gate) · up`;
 /// GPT-OSS's clamped GLU clamps gate above and up both ways at `limit`,
 /// scales the sigmoid argument by `alpha` and adds one to up.
+/// The exact f32 image of a slice the reference can transcribe: f32 as
+/// it is, bf16 widened bit-exactly. Any other form needs a decode the
+/// reference does not perform, and is refused by name.
+fn widen_reference<'a>(
+    slice: &WeightSlice<'a>,
+) -> Result<std::borrow::Cow<'a, [f32]>, VindexError> {
+    match slice {
+        WeightSlice::F32(w) => Ok(std::borrow::Cow::Borrowed(w)),
+        WeightSlice::Bf16(w) => Ok(std::borrow::Cow::Owned(
+            w.iter()
+                .map(|b| f32::from_bits(u32::from(*b) << 16))
+                .collect(),
+        )),
+        other => Err(VindexError::Parse(format!(
+            "the reference transcribes f32 and bf16 experts; a {} expert was handed to it",
+            slice_form(other)
+        ))),
+    }
+}
+
+/// The stored form a slice is in, named for a refusal — never its bytes.
+fn slice_form(slice: &WeightSlice<'_>) -> &'static str {
+    match slice {
+        WeightSlice::F32(_) => "f32",
+        WeightSlice::Bf16(_) => "bf16",
+        WeightSlice::F16(_) => "f16",
+        WeightSlice::Q8 { .. } => "q8",
+        WeightSlice::Q4 { .. } => "q4",
+        WeightSlice::Mxfp4 { .. } => "mxfp4",
+        WeightSlice::Nvfp4 { .. } => "nvfp4",
+        WeightSlice::KQuant { .. } => "k-quant",
+        WeightSlice::Fp8Block { .. } => "fine-grained fp8",
+    }
+}
+
 fn combine_gate_up_reference(
     policy: larql_models::ExpertGatePolicy,
     activation: larql_models::config::Activation,
@@ -533,6 +768,21 @@ fn combine_gate_up_reference(
             let g = g.min(limit);
             let u = u.clamp(-limit, limit);
             (u + 1.0) * (g * sigmoid(alpha * g))
+        }
+        // Delegated, not transcribed a third time. SiTU has exactly one
+        // formula and `MoeGateRule::combine` is where it lives — unlike
+        // the `Gated` arm above, which deliberately differs from the
+        // production tier (exact erf-GELU here, the tanh approximation
+        // there) and therefore has to be spelled out.
+        larql_models::ExpertGatePolicy::SituGlu { beta, linear_beta } => {
+            larql_compute::MoeGateRule::SituGlu { beta, linear_beta }.combine(g, u)
+        }
+        // GLM-5.3-Flash: the SAME clamp, then the ordinary gated
+        // product. No `alpha`, no `(u + 1)`.
+        larql_models::ExpertGatePolicy::ClampedGated { limit } => {
+            let g = g.min(limit);
+            let u = u.clamp(-limit, limit);
+            activate(activation, g) * u
         }
     }
 }
@@ -553,6 +803,10 @@ fn add_in_place(x: &mut [f32], b: &[f32]) {
 impl PlanBackend for ReferenceBackend {
     fn name(&self) -> &str {
         NAME
+    }
+
+    fn identity(&self) -> LoweringIdentity {
+        LoweringIdentity::new(IDENTITY_FAMILY, IDENTITY_REVISION)
     }
 
     fn embed(&self, table: &[f32], hidden: usize, token: u32, scale: Option<f32>) -> Vec<f32> {
@@ -581,38 +835,36 @@ impl PlanBackend for ReferenceBackend {
     }
 
     fn attention_step(&self, step: AttentionStepCall<'_>) -> Result<AttentionStepOut, VindexError> {
-        let call = &step.op;
-        let pre = &call.inputs[0];
-        let (q, k, v) = Self::project_position(call, step.position, pre)?;
-        let output = Self::attend_position(
-            call,
-            step.position,
-            &q,
-            |p| {
-                if p == step.position {
-                    k.as_slice()
-                } else {
-                    step.keys[p].as_slice()
-                }
-            },
-            |p| {
-                if p == step.position {
-                    v.as_slice()
-                } else {
-                    step.values[p].as_slice()
-                }
-            },
-            pre,
-        )?;
-        Ok(AttentionStepOut {
-            key: k,
-            value: v,
-            output,
-        })
+        Self::attention_step_tapped(step, None, None)
+    }
+
+    fn serves_attention_heads(&self) -> bool {
+        true
+    }
+
+    fn attention_step_observed(
+        &self,
+        step: AttentionStepCall<'_>,
+        tap: &mut dyn FnMut(AttentionHeadRecord<'_>),
+    ) -> Result<AttentionStepOut, VindexError> {
+        Self::attention_step_tapped(step, Some(tap), None)
+    }
+
+    fn serves_head_intervention(&self) -> bool {
+        true
+    }
+
+    fn attention_step_intervened(
+        &self,
+        step: AttentionStepCall<'_>,
+        tap: Option<&mut dyn FnMut(AttentionHeadRecord<'_>)>,
+        head_intervene: &mut super::backend::HeadIntervene<'_>,
+    ) -> Result<AttentionStepOut, VindexError> {
+        Self::attention_step_tapped(step, tap, Some(head_intervene))
     }
 
     fn ffn(&self, call: FfnCall<'_>) -> Result<Vec<f32>, VindexError> {
-        super::production::require_plain_gate("reference", call.gate_policy)?;
+        super::production::require_executable_gate("reference", call.gate_policy)?;
         let up = matvec(call.up.as_f32()?, call.intermediate, call.hidden, call.x);
         let inner: Vec<f32> = match call.gate {
             Some(gate_weight) => {
@@ -622,9 +874,14 @@ impl PlanBackend for ReferenceBackend {
                     call.hidden,
                     call.x,
                 );
+                // Through the same combine the routed path uses, so this
+                // backend has ONE answer for what a gate policy means
+                // rather than a dense answer and a routed one.
                 gate.iter()
                     .zip(&up)
-                    .map(|(g, u)| activate(call.activation, *g) * u)
+                    .map(|(g, u)| {
+                        combine_gate_up_reference(call.gate_policy, call.activation, *g, *u)
+                    })
                     .collect()
             }
             None => up.iter().map(|u| activate(call.activation, *u)).collect(),
@@ -644,51 +901,91 @@ impl PlanBackend for ReferenceBackend {
     /// MoE path — plain loops over widened f32 operands.
     fn routed_ffn(&self, call: RoutedFfnCall<'_>) -> Result<Vec<f32>, VindexError> {
         let selected = select_experts_reference(&call)?;
-        let two_inter = FUSED_BRANCHES * call.intermediate;
         let mut out = vec![0.0f32; call.hidden];
-        for (expert, weight) in selected {
-            let mut fused = matvec(
-                call.gate_up[expert].as_f32()?,
-                two_inter,
-                call.hidden,
-                call.x,
-            );
-            if let Some(bias) = call.gate_up_bias {
-                for (f, b) in fused
-                    .iter_mut()
-                    .zip(&bias[expert * two_inter..(expert + 1) * two_inter])
-                {
-                    *f += b;
+        match call.weights {
+            ExpertSlices::Fused {
+                gate_up,
+                down,
+                layout,
+            } => {
+                let two_inter = FUSED_BRANCHES * call.intermediate;
+                for (expert, weight) in selected {
+                    let mut fused =
+                        matvec(gate_up[expert].as_f32()?, two_inter, call.hidden, call.x);
+                    if let Some(bias) = call.gate_up_bias {
+                        for (f, b) in fused
+                            .iter_mut()
+                            .zip(&bias[expert * two_inter..(expert + 1) * two_inter])
+                        {
+                            *f += b;
+                        }
+                    }
+                    let inner: Vec<f32> = (0..call.intermediate)
+                        .map(|i| {
+                            let g = fused[layout.row(GateUpBranch::Gate, i, call.intermediate)];
+                            let u = fused[layout.row(GateUpBranch::Up, i, call.intermediate)];
+                            combine_gate_up_reference(call.gate_policy, call.activation, g, u)
+                        })
+                        .collect();
+                    let mut expert_out = matvec(
+                        down[expert].as_f32()?,
+                        call.hidden,
+                        call.intermediate,
+                        &inner,
+                    );
+                    if let Some(bias) = call.down_bias {
+                        for (o, b) in expert_out
+                            .iter_mut()
+                            .zip(&bias[expert * call.hidden..(expert + 1) * call.hidden])
+                        {
+                            *o += b;
+                        }
+                    }
+                    for (acc, v) in out.iter_mut().zip(&expert_out) {
+                        *acc += weight * v;
+                    }
                 }
             }
-            let inner: Vec<f32> = (0..call.intermediate)
-                .map(|i| {
-                    let g =
-                        fused[call
-                            .gate_up_layout
-                            .row(GateUpBranch::Gate, i, call.intermediate)];
-                    let u = fused[call
-                        .gate_up_layout
-                        .row(GateUpBranch::Up, i, call.intermediate)];
-                    combine_gate_up_reference(call.gate_policy, call.activation, g, u)
-                })
-                .collect();
-            let mut expert_out = matvec(
-                call.down[expert].as_f32()?,
-                call.hidden,
-                call.intermediate,
-                &inner,
-            );
-            if let Some(bias) = call.down_bias {
-                for (o, b) in expert_out
-                    .iter_mut()
-                    .zip(&bias[expert * call.hidden..(expert + 1) * call.hidden])
-                {
-                    *o += b;
+            // A per-expert bank, transcribed literally: each matrix
+            // widened to f32 exactly (bf16 is the top half of the f32 it
+            // denotes), three matvecs, the declared combine.
+            ExpertSlices::Separate { gate, up, down, .. } => {
+                if call.gate_up_bias.is_some() || call.down_bias.is_some() {
+                    return Err(VindexError::Parse(
+                        "a per-expert bank carries no expert bias; the call declares one"
+                            .to_string(),
+                    ));
                 }
-            }
-            for (acc, v) in out.iter_mut().zip(&expert_out) {
-                *acc += weight * v;
+                for (expert, weight) in selected {
+                    let g = matvec(
+                        &widen_reference(&gate[expert])?,
+                        call.intermediate,
+                        call.hidden,
+                        call.x,
+                    );
+                    let u = matvec(
+                        &widen_reference(&up[expert])?,
+                        call.intermediate,
+                        call.hidden,
+                        call.x,
+                    );
+                    let inner: Vec<f32> = g
+                        .iter()
+                        .zip(&u)
+                        .map(|(g, u)| {
+                            combine_gate_up_reference(call.gate_policy, call.activation, *g, *u)
+                        })
+                        .collect();
+                    let expert_out = matvec(
+                        &widen_reference(&down[expert])?,
+                        call.hidden,
+                        call.intermediate,
+                        &inner,
+                    );
+                    for (acc, v) in out.iter_mut().zip(&expert_out) {
+                        *acc += weight * v;
+                    }
+                }
             }
         }
         Ok(out)

@@ -12,6 +12,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
+mod update;
+
 #[derive(Parser)]
 #[command(
     name = "vindex",
@@ -28,6 +30,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Encode a checkpoint into a VINDEX3 container.
+    ///
+    /// An `hf://org/name[@revision]` argument is read from Hugging Face
+    /// over byte ranges — the canonical checkpoint never needs to exist
+    /// as a complete local download.
+    Encode {
+        /// Checkpoint directories, saved inventories, or `hf://` repos.
+        #[arg(required = true)]
+        artifacts: Vec<PathBuf>,
+        /// Container directory to write.
+        #[arg(long)]
+        output: PathBuf,
+        /// Admit on text generation's execution closure instead of
+        /// whole-model completeness. The container written is identical
+        /// either way; only the gate changes.
+        #[arg(long)]
+        text_only: bool,
+    },
+    /// What VINDEX understands about a model, before moving its weights.
+    ///
+    /// Reads configuration and safetensors headers only. A bring-up
+    /// instrument: it answers what VINDEX still needs to understand, not
+    /// whether you can use the model.
+    Plan {
+        /// Checkpoint directories, saved inventories, or `hf://` repos.
+        #[arg(required = true)]
+        artifacts: Vec<PathBuf>,
+    },
     /// The container, reconstructed from itself: identity, census, coherence.
     Inspect { container: PathBuf },
     /// One logical object, in full — identity, bindings, representations, tensor-table head.
@@ -38,9 +68,15 @@ enum Command {
         /// How many tensor-table rows to show per representation.
         #[arg(long, default_value_t = 8)]
         values: usize,
+        /// Decode and print the first values of this tensor (name or
+        /// suffix) — the numbers themselves, from the canonical bytes.
+        #[arg(long)]
+        peek: Option<String>,
     },
     /// The physical directory: what exists as bytes, with recorded fidelity.
     Representations { container: PathBuf },
+    /// Every layer's token-mixer programme, from the operation plan.
+    Layers { container: PathBuf },
     /// One object under two of the container's representations, decoded and
     /// compared value by value — the error derived, never asserted.
     Diff {
@@ -69,10 +105,66 @@ enum Command {
         #[arg(long, default_value = "NVFP4")]
         encoding: String,
     },
+    /// Compile the selected representation to a GGUF for an independent
+    /// runtime, verified against the plan before the command returns.
+    Export {
+        container: PathBuf,
+        /// The .gguf file to write.
+        out: PathBuf,
+    },
     /// Bits per weight — derived from stored bytes over tensor elements, never asserted.
-    Precision { container: PathBuf },
+    Precision {
+        container: PathBuf,
+        /// The precision map, seen: bits per layer × semantic role, from the
+        /// representation each object would execute.
+        #[arg(long)]
+        matrix: bool,
+    },
     /// The container against its own recorded hashes, re-derived from the artifact alone.
     Verify { container: PathBuf },
+    /// Install the latest release of this tool. Only ever runs when you ask:
+    /// no verb checks for updates on its own, and nothing phones home.
+    Update {
+        /// Report whether a newer release exists, without installing.
+        #[arg(long)]
+        check: bool,
+    },
+}
+
+fn render_export(v: &Value) {
+    kv("selected", v["selected"].as_str().unwrap_or("?"));
+    let w = &v["walk"];
+    kv(
+        "walk",
+        format!(
+            "{} tensors · geometry {}/{} · {} scale siblings",
+            w["source_tensors"], w["geometry_reconciled"], w["accounted"], w["scale_siblings"]
+        ),
+    );
+    let vc = &v["vocab"];
+    kv(
+        "vocab",
+        format!(
+            "{} tokens + {} pad · {} merges",
+            vc["tokens"], vc["padded"], vc["merges"]
+        ),
+    );
+    let ve = &v["verified"];
+    kv(
+        "verified",
+        format!(
+            "{} tensors ({} NVFP4 · {} scale siblings) · {} metadata keys",
+            ve["tensors"], ve["nvfp4_tensors"], ve["scale_siblings"], ve["metadata_keys"]
+        ),
+    );
+    kv(
+        "written",
+        format!(
+            "{} — {:.2} GB, independent reader agrees with the plan",
+            v["out"].as_str().unwrap_or("?"),
+            v["bytes"].as_f64().unwrap_or(0.0) / 1e9
+        ),
+    );
 }
 
 fn kv(label: &str, value: impl std::fmt::Display) {
@@ -138,7 +230,102 @@ fn render_representations(v: &Value) {
     }
 }
 
+fn render_peek(v: &Value) {
+    let Some(p) = v.get("peek").filter(|p| !p.is_null()) else {
+        return;
+    };
+    println!();
+    println!(
+        "{} {} {} — first values",
+        p["tensor"].as_str().unwrap_or("?"),
+        p["dtype"].as_str().unwrap_or("?"),
+        serde_json::to_string(&p["shape"]).unwrap_or_default()
+    );
+    for x in p["values"].as_array().into_iter().flatten() {
+        let x = x.as_f64().unwrap_or(0.0);
+        println!("  {}{:.6}", if x >= 0.0 { "+" } else { "" }, x);
+    }
+}
+
+fn render_layers(v: &Value) {
+    let rows: Vec<&Value> = v["layers"].as_array().into_iter().flatten().collect();
+    let line = |r: &Value| {
+        format!(
+            "{:<18} ffn {}",
+            r["mixer"].as_str().unwrap_or("?"),
+            r["ffn"].as_str().unwrap_or("?")
+        )
+    };
+    let mut i = 0;
+    while i < rows.len() {
+        let l = line(rows[i]);
+        let start = rows[i]["layer"].as_u64().unwrap_or(0);
+        let mut end = start;
+        while i + 1 < rows.len() && line(rows[i + 1]) == l {
+            i += 1;
+            end = rows[i]["layer"].as_u64().unwrap_or(end);
+        }
+        let label = if start == end {
+            format!("{start}")
+        } else {
+            format!("{start}–{end}")
+        };
+        println!("{label:<10}{l}");
+        i += 1;
+    }
+}
+
 fn render_describe(v: &Value) {
+    if let Some(mixer) = v["mixer"].as_str() {
+        kv("layer", v["layer"].as_u64().unwrap_or(0));
+        kv("token mixer", mixer);
+        // An operator the container names but this release cannot
+        // describe operand-by-operand says so, in place of the empty
+        // table that once stood in for the answer.
+        if let Some(why) = v["undescribed"].as_str() {
+            println!();
+            println!("operands      — {why}");
+            return;
+        }
+        println!();
+        println!("{:<32} {:<38} SHAPE", "SEMANTICS", "TENSOR");
+        for op in v["operands"].as_array().into_iter().flatten() {
+            println!(
+                "{:<32} {:<38} {}",
+                op["role"].as_str().unwrap_or("?"),
+                op["tensor"].as_str().unwrap_or("?"),
+                serde_json::to_string(&op["shape"]).unwrap_or_default()
+            );
+        }
+        return;
+    }
+    if let Some(role) = v["role"].as_str() {
+        kv("role", role);
+        kv("object", v["object"].as_str().unwrap_or("?"));
+        kv("tensor", v["tensor"].as_str().unwrap_or("?"));
+        kv(
+            "shape",
+            serde_json::to_string(&v["shape"]).unwrap_or_default(),
+        );
+        for r in v["representations"].as_array().into_iter().flatten() {
+            kv(
+                "representation",
+                format!(
+                    "{} · {} · {:.4} bits/weight",
+                    r["encoding"].as_str().unwrap_or("?"),
+                    r["dtype"].as_str().unwrap_or("?"),
+                    r["bits_per_weight"].as_f64().unwrap_or(0.0)
+                ),
+            );
+        }
+        println!();
+        println!("VALUES");
+        for x in v["values"].as_array().into_iter().flatten() {
+            let x = x.as_f64().unwrap_or(0.0);
+            println!("  {}{:.6}", if x >= 0.0 { "+" } else { "" }, x);
+        }
+        return;
+    }
     let o = &v["object"];
     kv("object", o["id"].as_str().unwrap_or("?"));
     kv("kind", o["kind"].as_str().unwrap_or("?"));
@@ -153,6 +340,7 @@ fn render_describe(v: &Value) {
             ),
         );
     }
+    render_peek(v);
     for d in v["directory"].as_array().into_iter().flatten() {
         println!();
         kv(
@@ -172,6 +360,66 @@ fn render_describe(v: &Value) {
                 serde_json::to_string(&t["shape"]).unwrap_or_default()
             );
         }
+    }
+}
+
+fn render_precision_matrix(v: &Value) {
+    for prog in v["programmes"].as_array().into_iter().flatten() {
+        let roles: Vec<&str> = prog["roles"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.as_str())
+            .collect();
+        println!(
+            "{} · {} layer(s)",
+            prog["label"].as_str().unwrap_or("?"),
+            prog["layers"].as_u64().unwrap_or(0)
+        );
+        let fmt_row = |bits: &Value| -> String {
+            roles
+                .iter()
+                .map(|r| match bits[r].as_f64() {
+                    Some(b) => format!("{b:>7.2}"),
+                    None => format!("{:>7}", "—"),
+                })
+                .collect::<String>()
+        };
+        println!(
+            "{:<10}{}",
+            "LAYER",
+            roles.iter().map(|r| format!("{r:>7}")).collect::<String>()
+        );
+        // Collapse runs of identical rows into ranges — a 64-layer
+        // model with a five-layer map should read as its regions.
+        let rows: Vec<&Value> = prog["rows"].as_array().into_iter().flatten().collect();
+        let mut i = 0;
+        while i < rows.len() {
+            let line = fmt_row(&rows[i]["bits"]);
+            let start = rows[i]["layer"].as_u64().unwrap_or(0);
+            let mut end = start;
+            while i + 1 < rows.len() && fmt_row(&rows[i + 1]["bits"]) == line {
+                i += 1;
+                end = rows[i]["layer"].as_u64().unwrap_or(end);
+            }
+            let label = if start == end {
+                format!("{start}")
+            } else {
+                format!("{start}–{end}")
+            };
+            println!("{label:<10}{line}");
+            i += 1;
+        }
+        println!();
+    }
+    println!("MODEL SURFACES");
+    for s in v["surfaces"].as_array().into_iter().flatten() {
+        println!(
+            "{:<34} {:<8} {:>8.4} bits/weight",
+            s["object"].as_str().unwrap_or("?"),
+            s["representation"].as_str().unwrap_or("?"),
+            s["bits_per_weight"].as_f64().unwrap_or(0.0)
+        );
     }
 }
 
@@ -312,6 +560,110 @@ fn render_represent(v: &Value) {
     );
 }
 
+/// Staging lines shared by both ingest verbs.
+///
+/// Headers and metadata are quoted separately and then totalled. The
+/// header figure alone understates the transfer — a tokenizer can outweigh
+/// every shard header put together — and the honest number is the one that
+/// makes "the checkpoint was never downloaded" checkable.
+fn render_staging(v: &Value) {
+    for s in v["staging"].as_array().into_iter().flatten() {
+        kv(
+            "staged",
+            format!(
+                "{} ({} of headers over {} shard(s), {} of metadata)",
+                s["staged"].as_str().unwrap_or("?"),
+                s["headers"].as_str().unwrap_or("?"),
+                s["shards"],
+                s["metadata"].as_str().unwrap_or("?"),
+            ),
+        );
+        if let Some(stands) = s["stands_in_for"].as_str() {
+            kv("standing in for", format!("{stands} of tensor payload"));
+        }
+        // Only when the index disagrees with its own headers: tied
+        // weights are counted once there and serialised twice in the file.
+        if let Some(declared) = s["index_declares"].as_str() {
+            kv(
+                "note",
+                format!("the shard index declares {declared} — the header sum is what transfers"),
+            );
+        }
+        if let Some(commit) = s["commit"].as_str() {
+            kv("pinned at", commit.to_string());
+        }
+    }
+}
+
+fn render_plan(v: &Value) {
+    render_staging(v);
+    println!();
+    let summary = &v["summary"];
+    kv("representable", summary["representable"].to_string());
+    kv("mismatched", summary["mismatched"].to_string());
+    kv("unrepresented", summary["unrepresented"].to_string());
+    kv("blocking", summary["blocking"].to_string());
+    kv(
+        "admissible",
+        if v["admissible"].as_bool().unwrap_or(false) {
+            "yes — every declaration has a home"
+        } else {
+            "no — see the blocking findings"
+        },
+    );
+}
+
+fn render_encode(v: &Value) {
+    render_staging(v);
+    for t in v["transfers"].as_array().into_iter().flatten() {
+        println!();
+        kv(
+            "fetched",
+            format!(
+                "{} of {} declared across {} tensor(s)",
+                t["fetched"].as_str().unwrap_or("?"),
+                t["declared"].as_str().unwrap_or("?"),
+                t["tensors"],
+            ),
+        );
+        kv("checkpoint", "never present on this disk".to_string());
+    }
+    for u in v["unpinned"].as_array().into_iter().flatten() {
+        kv(
+            "warning",
+            format!(
+                "the hub named no commit for `{}` — provenance records a revision name, which can move",
+                u["revision"].as_str().unwrap_or("?")
+            ),
+        );
+    }
+    println!();
+    let caps = v["capabilities"]
+        .as_array()
+        .map(|c| {
+            c.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    if !caps.is_empty() {
+        kv("capabilities", caps);
+    }
+    kv(
+        "encoded",
+        format!(
+            "{} representation(s), {} payload",
+            v["representations"],
+            v["payload"].as_str().unwrap_or("?")
+        ),
+    );
+    kv(
+        "container",
+        v["container"].as_str().unwrap_or("?").to_string(),
+    );
+}
+
 fn render_verify(v: &Value) {
     for e in v["entries"].as_array().into_iter().flatten() {
         let ok = e["segment_ok"].as_bool().unwrap_or(false)
@@ -336,14 +688,34 @@ fn render_verify(v: &Value) {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Update { check } = &cli.command {
+        return match update::run(*check) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("vindex: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let result = match &cli.command {
+        Command::Encode {
+            artifacts,
+            output,
+            text_only,
+        } => vindex_cli::encode_facts(artifacts, output, *text_only),
+        Command::Plan { artifacts } => vindex_cli::plan_facts(artifacts),
         Command::Inspect { container } => vindex_cli::inspect_facts(container),
         Command::Describe {
             container,
             address,
             values,
-        } => vindex_cli::describe_facts(container, address, *values),
+            peek,
+        } => vindex_cli::describe_facts(container, address, *values, peek.as_deref()),
         Command::Representations { container } => vindex_cli::representations_facts(container),
+        Command::Layers { container } => vindex_cli::layers_facts(container),
         Command::Diff {
             container,
             a,
@@ -357,8 +729,16 @@ fn main() -> ExitCode {
             out,
             encoding,
         } => vindex_cli::represent_facts(container, out, encoding),
-        Command::Precision { container } => vindex_cli::precision_facts(container),
+        Command::Precision { container, matrix } => {
+            if *matrix {
+                vindex_cli::precision_matrix_facts(container)
+            } else {
+                vindex_cli::precision_facts(container)
+            }
+        }
         Command::Verify { container } => vindex_cli::verify_facts(container),
+        Command::Export { container, out } => vindex_cli::export_facts(container, out),
+        Command::Update { .. } => unreachable!("handled above"),
     };
     match result {
         Ok(v) => {
@@ -366,13 +746,24 @@ fn main() -> ExitCode {
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
             } else {
                 match &cli.command {
+                    Command::Encode { .. } => render_encode(&v),
+                    Command::Plan { .. } => render_plan(&v),
                     Command::Inspect { .. } => render_inspect(&v),
+                    Command::Export { .. } => render_export(&v),
                     Command::Describe { .. } => render_describe(&v),
                     Command::Representations { .. } => render_representations(&v),
+                    Command::Layers { .. } => render_layers(&v),
                     Command::Diff { .. } => render_diff(&v),
                     Command::Represent { .. } => render_represent(&v),
-                    Command::Precision { .. } => render_precision(&v),
+                    Command::Precision { matrix, .. } => {
+                        if *matrix {
+                            render_precision_matrix(&v)
+                        } else {
+                            render_precision(&v)
+                        }
+                    }
                     Command::Verify { .. } => render_verify(&v),
+                    Command::Update { .. } => unreachable!("handled above"),
                 }
             }
             if let Some(false) = v["verified"].as_bool() {

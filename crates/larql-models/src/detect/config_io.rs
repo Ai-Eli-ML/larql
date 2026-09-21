@@ -30,7 +30,7 @@ pub(super) const CONFIG_KEY_LANGUAGE_CONFIG: &str = "language_config";
 // The parser reads from either via the alias lists.
 
 /// Aliases for `hidden_size`. GPT-2 family uses `n_embd`.
-pub(super) const CONFIG_KEY_HIDDEN_SIZE_ALIASES: &[&str] = &["hidden_size", "n_embd"];
+pub(super) const CONFIG_KEY_HIDDEN_SIZE_ALIASES: &[&str] = &["hidden_size", "n_embd", "d_model"];
 
 /// Aliases for `num_hidden_layers`. GPT-2 family uses `n_layer`.
 pub(super) const CONFIG_KEY_NUM_HIDDEN_LAYERS_ALIASES: &[&str] = &["num_hidden_layers", "n_layer"];
@@ -39,6 +39,13 @@ pub(super) const CONFIG_KEY_NUM_HIDDEN_LAYERS_ALIASES: &[&str] = &["num_hidden_l
 /// doesn't, the parser fills in `4 * hidden_size` for `gpt2` model_type
 /// (HF's model-side fallback in `GPT2Config.n_inner`).
 pub(super) const CONFIG_KEY_INTERMEDIATE_SIZE_ALIASES: &[&str] = &["intermediate_size", "n_inner"];
+/// A DERIVED checkpoint's per-layer dense-FFN width (E30 static shards):
+/// one entry per layer, each the row count of that layer's `gate_proj` /
+/// `up_proj` and the column count of its `down_proj`. LARQL's own key —
+/// no upstream config spells a per-layer dense width — read under
+/// `text_config` first, then at the top level, like every topology field.
+pub(super) const CONFIG_KEY_FFN_INTERMEDIATE_SIZE_BY_LAYER: &str =
+    "larql_ffn_intermediate_size_by_layer";
 
 /// Aliases for `num_attention_heads`. GPT-2 family uses `n_head`.
 pub(super) const CONFIG_KEY_NUM_ATTENTION_HEADS_ALIASES: &[&str] =
@@ -81,7 +88,9 @@ pub(super) fn read_config_json(config_path: &Path) -> Result<serde_json::Value, 
         return Err(ModelError::ConfigMissing(config_path.to_path_buf()));
     }
     let text = std::fs::read_to_string(config_path)?;
-    Ok(serde_json::from_str::<serde_json::Value>(&text)?)
+    // The judged non-finite boundary (config::nonfinite_json): bare
+    // Python `Infinity`/`NaN` literals parse as the strings they spell.
+    Ok(crate::config::nonfinite_json::parse_config_json(&text)?)
 }
 
 /// Fail loudly when a parsed config is missing any field whose silent
@@ -106,7 +115,13 @@ pub(super) fn require_config_fields(
     // `4 * n_embd` at the model boundary. Skip the intermediate_size check
     // for that model_type — the parser performs the same derivation when
     // `intermediate_size` and `n_inner` are both absent.
-    let skip_intermediate = model_type == "gpt2";
+    //
+    // Mamba2 has no FFN at all — the mixer is the whole block — so an
+    // `intermediate_size` genuinely does not exist to require; the
+    // family's own validation judges the SSM geometry instead
+    // (`validation::validate_mamba2`).
+    let skip_intermediate =
+        model_type == "gpt2" || model_type == crate::architectures::mamba2::MAMBA2_MODEL_TYPE;
     let missing: Vec<&'static str> = REQUIRED_CONFIG_FIELDS
         .iter()
         .filter_map(|aliases| {

@@ -1,12 +1,25 @@
 //! Opening a VINDEX3 container as an inference runtime.
+//!
+//! [`open_component`] is the **one** opening authority in the workspace:
+//! inspect the container, close the component's plan, bind its operands.
+//! `larql serve`, `larql run` and `larql vindex3 exec` all come through
+//! it, so the same container under the same [`OpenPolicy`] means the same
+//! program bound to the same bytes whichever front door was used. What
+//! *executes* that program — CPU, Metal, an interpreter or a lowering —
+//! is not decided here: that is a realisation, chosen by the caller and
+//! handed in as the backend.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use larql_vindex::format::vindex3::inspect::inspect_container;
+use larql_vindex::format::vindex3::inspect::{inspect_container, SystemInspection};
 use larql_vindex::format::vindex3::opplan::exec::backend::PlanBackend;
 use larql_vindex::format::vindex3::opplan::exec::kv::KvState;
+use larql_vindex::format::vindex3::opplan::exec::lowering::{
+    LoweringIdentity, LoweringRegistry, SharedProvider,
+};
 use larql_vindex::format::vindex3::opplan::exec::operands::{
-    OperandOverrides, OperandSource, OperandStore,
+    OperandOverrides, OperandSource, OperandStore, RepresentationSource,
 };
 use larql_vindex::format::vindex3::opplan::exec::prepared::{ExecutionSlice, PreparedOperands};
 use larql_vindex::format::vindex3::opplan::exec::{
@@ -18,20 +31,57 @@ use crate::error::InferenceError;
 
 use super::session::Vindex3Session;
 
-/// Inspect the container, plan `component`'s operations, and open the
-/// operand store — solely from the container's own contents. Kept
-/// outside the generic impl so the whole opening path (and its
-/// refusals) is one instantiation regardless of backend.
-/// What opening a component yields: the executable plan, its operand
-/// store, and the two identities the container declares about itself.
-struct OpenedComponent {
-    plan: ComponentOpPlan,
-    store: OperandStore,
-    model_name: String,
-    family: String,
+/// How a component's operands are bound when it is opened.
+///
+/// Two separate questions, deliberately: `want` is *what* encoding
+/// execution asks for — `None` executes the canonical bytes and never
+/// looks for a compiled pack, so adding packs to a container cannot
+/// change what such a caller runs — and `source` is *whether* the runtime
+/// may manufacture that encoding at load or must find it already
+/// compiled. The default is the canonical program, which is what a
+/// server binds.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OpenPolicy {
+    /// The stored encoding to serve from, if one is compiled.
+    pub want: Option<String>,
+    pub source: RepresentationSource,
 }
 
-fn open_component(container: &Path, component: &str) -> Result<OpenedComponent, InferenceError> {
+/// What opening a component yields: the executable plan, its operand
+/// store, the two identities the container declares about itself, and
+/// the encoding the store was asked for.
+pub struct OpenedComponent {
+    /// The inspection the plan and store were built from — the
+    /// container's own directory, graph and index facts — so a caller
+    /// that needs them (provenance checks, representation listings)
+    /// reads the same inspection the opener judged, not a second one.
+    pub inspection: SystemInspection,
+    pub plan: ComponentOpPlan,
+    pub store: OperandStore,
+    /// The container's self-declared model name (`index.model`) — the
+    /// identity authority. Callers must not fall back to a directory
+    /// name when this is non-empty.
+    pub model_name: String,
+    /// The model family the container declares.
+    pub family: String,
+    /// [`OpenPolicy::want`], carried so a caller can report what it
+    /// asked for beside what the store bound.
+    pub want: Option<String>,
+}
+
+/// Inspect the container, plan `component`'s operations, and open the
+/// operand store under `policy` — solely from the container's own
+/// contents. Kept outside the generic impl so the whole opening path
+/// (and its refusals) is one instantiation regardless of backend.
+///
+/// A component whose stack does not close refuses to open, with every
+/// defect in the error: an unclosed program is never "best-effort"
+/// executed by anyone.
+pub fn open_component(
+    container: &Path,
+    component: &str,
+    policy: OpenPolicy,
+) -> Result<OpenedComponent, InferenceError> {
     let inspection = inspect_container(container, false)?;
     let outcome = plan_component_ops(&inspection, container, component)?;
     if !outcome.closed() {
@@ -40,7 +90,12 @@ fn open_component(container: &Path, component: &str) -> Result<OpenedComponent, 
     let plan = outcome.plan.ok_or_else(|| {
         InferenceError::Parse(format!("component `{component}` produced no plan"))
     })?;
-    let store = OperandStore::open(container, &inspection)?;
+    let store = OperandStore::open_for(
+        container,
+        &inspection,
+        policy.want.as_deref(),
+        policy.source,
+    )?;
     // The container names itself (`index.model`) — identity travels
     // with the artifact, never a sidecar or a directory name — and
     // declares its own family, which is the only authority a V3
@@ -50,6 +105,8 @@ fn open_component(container: &Path, component: &str) -> Result<OpenedComponent, 
         store,
         model_name: inspection.index.model.clone(),
         family: inspection.index.family.clone(),
+        want: policy.want,
+        inspection,
     })
 }
 
@@ -82,24 +139,51 @@ pub struct Vindex3Runtime<B: PlanBackend> {
     plan: ComponentOpPlan,
     store: OperandStore,
     backend: B,
+    /// The lowering authority this runtime was opened through, when it
+    /// was opened through one (LOWERING-PLUGIN-1, L4).
+    ///
+    /// Shared, not owned by the prepared image: the image records which
+    /// provider decided its pins, and this says which providers exist
+    /// now. Keeping them apart is what makes invalidation possible — an
+    /// image that held its own provider would keep a removed one alive.
+    ///
+    /// `None` on the direct-backend path, which named no authority: a
+    /// caller that hands a provider in has declared nothing for the pins
+    /// to be checked against.
+    lowerings: Option<Arc<LoweringRegistry>>,
     model_name: String,
     family: String,
 }
 
 impl<B: PlanBackend> Vindex3Runtime<B> {
-    /// Open `component` from the container, refusing any closure
-    /// defect (see [`unclosed_component`]'s doc).
+    /// Open `component` from the container as its canonical program —
+    /// [`open_with`](Self::open_with) under the default [`OpenPolicy`].
     pub fn open(container: &Path, component: &str, backend: B) -> Result<Self, InferenceError> {
+        Self::open_with(container, component, backend, OpenPolicy::default())
+    }
+
+    /// Open `component` from the container with its operands bound under
+    /// `policy`, refusing any closure defect (see [`unclosed_component`]'s
+    /// doc). The backend is the realisation; the policy is what it runs.
+    pub fn open_with(
+        container: &Path,
+        component: &str,
+        backend: B,
+        policy: OpenPolicy,
+    ) -> Result<Self, InferenceError> {
         let OpenedComponent {
             plan,
             store,
             model_name,
             family,
-        } = open_component(container, component)?;
+            want: _,
+            inspection: _,
+        } = open_component(container, component, policy)?;
         Ok(Self {
             plan,
             store,
             backend,
+            lowerings: None,
             model_name,
             family,
         })
@@ -313,10 +397,57 @@ impl<B: PlanBackend> Vindex3Runtime<B> {
             plan: self.plan,
             store: self.store,
             backend: self.backend,
+            lowerings: self.lowerings,
             operands,
             model_name: self.model_name,
             family: self.family,
         })
+    }
+}
+
+impl Vindex3Runtime<SharedProvider> {
+    /// [`open`](Self::open) on the provider `provider` names in
+    /// `lowerings` — the registry-carried path every production caller
+    /// opens through (LOWERING-PLUGIN-1, L3).
+    pub fn open_via(
+        container: &Path,
+        component: &str,
+        lowerings: Arc<LoweringRegistry>,
+        provider: &LoweringIdentity,
+    ) -> Result<Self, InferenceError> {
+        Self::open_with_via(
+            container,
+            component,
+            lowerings,
+            provider,
+            OpenPolicy::default(),
+        )
+    }
+
+    /// [`open_with`](Self::open_with) through a registry.
+    ///
+    /// The provider is resolved FIRST and the container opened second: a
+    /// provider the registry does not hold is refused by identity, naming
+    /// every provider it does hold, before any file is touched — so the
+    /// refusal is the same on a container that does not exist. Nothing
+    /// here constructs a provider the caller did not register.
+    ///
+    /// The registry is kept, shared, as this runtime's current authority
+    /// (L4): the resolved provider answers calls, and the registry is
+    /// what a prepared image's pins are held against before every use.
+    pub fn open_with_via(
+        container: &Path,
+        component: &str,
+        lowerings: Arc<LoweringRegistry>,
+        provider: &LoweringIdentity,
+        policy: OpenPolicy,
+    ) -> Result<Self, InferenceError> {
+        let backend = lowerings
+            .provider_shared(provider)
+            .map_err(larql_vindex::error::VindexError::from)?;
+        let mut runtime = Self::open_with(container, component, backend, policy)?;
+        runtime.lowerings = Some(lowerings);
+        Ok(runtime)
     }
 }
 
@@ -336,18 +467,40 @@ pub struct PreparedVindex3<B: PlanBackend> {
     plan: ComponentOpPlan,
     store: OperandStore,
     backend: B,
+    /// The current lowering authority — see
+    /// [`Vindex3Runtime::lowerings`](Vindex3Runtime).
+    lowerings: Option<Arc<LoweringRegistry>>,
     operands: PreparedOperands,
     model_name: String,
     family: String,
 }
 
 impl<B: PlanBackend> PreparedVindex3<B> {
+    /// Hold this image's historical decision against the current
+    /// authority, before anything executes on it (LOWERING-PLUGIN-1, L4).
+    ///
+    /// The image records which lowering provider qualified its pins; the
+    /// runtime carries which providers exist now. A provider that has
+    /// gone, or that is present only at another revision, invalidates the
+    /// preparation by name — another provider being available is not a
+    /// fallback, and nothing re-selects.
+    ///
+    /// A model opened on a directly handed provider named no authority,
+    /// and there is nothing to check it against.
+    fn ensure_current_lowerings(&self) -> Result<(), InferenceError> {
+        match &self.lowerings {
+            Some(registry) => Ok(self.operands.ensure_lowerings_in(registry)?),
+            None => Ok(()),
+        }
+    }
+
     /// Open an incremental session over the resident operands, with the
     /// caller's continuation state. Cheap: no operand touches disk.
     pub fn session_with_kv<'a>(
         &'a self,
         kv: &'a mut dyn KvState,
     ) -> Result<Vindex3Session<'a, B>, InferenceError> {
+        self.ensure_current_lowerings()?;
         Vindex3Session::over_prepared(&self.plan, &self.operands, &self.backend, kv)
     }
 
@@ -358,6 +511,7 @@ impl<B: PlanBackend> PreparedVindex3<B> {
         tokens: &[u32],
         kv: &mut dyn KvState,
     ) -> Result<Vec<f32>, InferenceError> {
+        self.ensure_current_lowerings()?;
         let out = prefill_prepared(&self.plan, &self.operands, tokens, &self.backend, kv)?;
         out.logits.ok_or_else(headless_prefill_error)
     }
@@ -402,5 +556,25 @@ impl<B: PlanBackend> PreparedVindex3<B> {
     /// head is present.
     pub fn operands(&self) -> &PreparedOperands {
         &self.operands
+    }
+
+    /// The lowering authority this model is held against, if it was
+    /// opened through one.
+    pub fn lowerings(&self) -> Option<&Arc<LoweringRegistry>> {
+        self.lowerings.as_ref()
+    }
+
+    /// The same model, held against another lowering authority — the
+    /// operand store's [`with_registry`](OperandStore::with_registry) for
+    /// the other plane (LOWERING-PLUGIN-1, L4).
+    ///
+    /// Not checked here: re-pointing is not an execution, and the pins
+    /// are judged in the one place that matters — before anything runs on
+    /// them. A model re-pointed at an authority that no longer holds the
+    /// provider its pins were made by refuses at its next use rather than
+    /// executing a decision that authority never made.
+    pub fn with_lowerings(mut self, lowerings: Arc<LoweringRegistry>) -> Self {
+        self.lowerings = Some(lowerings);
+        self
     }
 }

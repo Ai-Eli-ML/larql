@@ -394,6 +394,88 @@ fn expert_banks_bind_to_the_source_spelling_or_to_nothing() {
     assert_eq!(topology.layers[1].expert_bank, None);
 }
 
+/// A Kimi-Linear-shaped config: `ExpertFormat::PerExpert` (no packed key at
+/// all), sigmoid router, one shared expert.
+fn kimi_shaped() -> serde_json::Value {
+    json!({
+        "architectures": ["KimiLinearForCausalLM"],
+        "model_type": "kimi_linear",
+        "hidden_size": 2304,
+        "intermediate_size": 9216,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "head_dim": 128,
+        "vocab_size": 163840,
+        "num_experts": 256,
+        "num_experts_per_token": 8,
+        "num_shared_experts": 1,
+        "moe_intermediate_size": 1024,
+        "moe_router_activation_func": "sigmoid",
+        "first_k_dense_replace": 1,
+    })
+}
+
+/// A `PerExpert`-format family (no single packed tensor exists) names each
+/// routed layer's bank at the common ancestor of its per-expert operands —
+/// derived from the architecture's own key methods, not a packed key.
+#[test]
+fn per_expert_family_names_its_bank_from_evidence_not_a_packed_key() {
+    let config = kimi_shaped();
+    let identity = read_identity(&config);
+    let (detection, topology) = resolve(&config, &identity);
+    assert!(!detection.generic_fallback);
+    assert_eq!(detection.family, "kimi_linear");
+    let moe = topology
+        .execution
+        .expect("judged execution")
+        .moe
+        .expect("kimi is routed");
+    assert_eq!(moe.expert_format, crate::config::ExpertFormat::PerExpert);
+    assert_eq!(
+        topology.layers[0].expert_bank.as_deref(),
+        Some("layers.0.block_sparse_moe.experts")
+    );
+    assert_eq!(
+        topology.layers[2].expert_bank.as_deref(),
+        Some("layers.2.block_sparse_moe.experts")
+    );
+}
+
+/// The per-expert derivation requires the format AND at least two experts
+/// — a single-expert declaration cannot prove the divergence is the
+/// expert-index segment, so it must not guess.
+#[test]
+fn a_single_declared_expert_names_no_bank() {
+    let mut config = kimi_shaped();
+    config["num_experts"] = json!(1);
+    let identity = read_identity(&config);
+    let (_, topology) = resolve(&config, &identity);
+    assert!(topology.layers.iter().all(|l| l.expert_bank.is_none()));
+}
+
+/// The Kimi-shaped bank binds to the checkpoint's own `model.`-prefixed
+/// per-expert tensors exactly as the packed case does — same mechanism,
+/// evidenced on real per-expert tensor names this time.
+#[test]
+fn a_per_expert_bank_binds_to_the_source_spelling() {
+    use crate::inventory::resolved::bind_expert_banks;
+    let config = kimi_shaped();
+    let identity = read_identity(&config);
+    let (_, mut topology) = resolve(&config, &identity);
+    let tensors = vec![
+        tensor("model.layers.1.block_sparse_moe.experts.0.w1.weight"),
+        tensor("model.layers.1.block_sparse_moe.experts.255.w3.weight"),
+        // Layer 2's bank is unspelled by any tensor — stays `None`.
+    ];
+    bind_expert_banks(&mut topology, &tensors);
+    assert_eq!(
+        topology.layers[1].expert_bank.as_deref(),
+        Some("model.layers.1.block_sparse_moe.experts")
+    );
+    assert_eq!(topology.layers[2].expert_bank, None);
+}
+
 /// A bank spelled with no source prefix at all binds at offset zero.
 #[test]
 fn expert_bank_at_the_start_of_the_name_binds_too() {
@@ -408,4 +490,285 @@ fn expert_bank_at_the_start_of_the_name_binds_too() {
         topology.layers[1].expert_bank.as_deref(),
         Some("layers.1.mlp.experts")
     );
+}
+
+// ── J5: settling a declared index-base ambiguity from the tensor
+//    estate (the OuteAI Mamba2Attn hybrid) ──
+
+/// The OuteAI-shaped hybrid config: mamba_ssm dialect geometry, the
+/// conv-QKV attention block, and an `attention_layers_idx` that fits
+/// both bases over 8 layers.
+fn hybrid_shaped() -> serde_json::Value {
+    json!({
+        "model_type": "mamba2",
+        "num_hidden_layers": 8,
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "vocab_size": 32768,
+        "state_size": 128,
+        "mamba2_num_heads": 32,
+        "mamba2_head_dim": 64,
+        "expand": 2,
+        "mamba2_conv_kernel": 4,
+        "chunk_size": 256,
+        "time_step_limit": [0.0, "Infinity"],
+        "use_mamba2_bias": false,
+        "use_conv_bias": true,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 16,
+        "attention_head_dim": 128,
+        "attention_conv_kernel": 4,
+        "rope_emb_dim": 64,
+        "rope_theta": 10000.0,
+        "use_attention_qkv_bias": false,
+        "use_attention_out_bias": false,
+        "attention_layers_idx": [2, 5],
+        "layer_norm_epsilon": 1e-5,
+        "residual_in_fp32": true,
+        "tie_embedding_weights": true
+    })
+}
+
+/// One `mixer.in_proj.weight` fact per layer: attention rows (6144) on
+/// the layers in `attention`, mamba rows (4384) elsewhere.
+fn hybrid_in_proj_facts(layers: usize, attention: &[usize]) -> Vec<crate::inventory::TensorFact> {
+    (0..layers)
+        .map(|layer| {
+            let rows = if attention.contains(&layer) {
+                6144
+            } else {
+                4384
+            };
+            crate::inventory::TensorFact {
+                name: format!("backbone.layers.{layer}.mixer.in_proj.weight"),
+                dtype: "BF16".to_string(),
+                shape: vec![rows, 1024],
+                bytes: (rows * 1024 * 2) as u64,
+                file: "model.safetensors".to_string(),
+            }
+        })
+        .collect()
+}
+
+/// **The tensor estate settles the base the config leaves ambiguous.**
+/// `[2,5]` over 8 layers fits both readings; the observed `in_proj` rows
+/// fit exactly one. The settlement is recorded — sources name the tensor
+/// evidence — and the complement identifies as Mamba2, because the same
+/// shape check verified every complement layer against the DECLARED
+/// mixer geometry.
+#[test]
+fn tensor_evidence_settles_an_ambiguous_attention_set() {
+    use crate::config::{LayerIndexBase, LayerKind, RecurrenceFamily};
+    use crate::inventory::resolved::resolve_with_tensor_evidence;
+
+    let config = hybrid_shaped();
+    let identity = read_identity(&config);
+    // Config alone: unresolved, and the uniform fallback must NOT answer.
+    let (_, blind) = resolve(&config, &identity);
+    assert!(
+        blind.layers.iter().all(|l| l.declared_kind.is_none()),
+        "a declared-but-unresolved interleave must not take the uniform answer"
+    );
+    assert!(blind.layers.iter().all(|l| {
+        l.declared_span.as_deref() == Some(crate::config::LAYER_TYPE_UNRESOLVED_INTERLEAVE)
+    }));
+
+    // Zero-based evidence: attention mixers at layers 2 and 5.
+    let facts = hybrid_in_proj_facts(8, &[2, 5]);
+    let (_, topology) = resolve_with_tensor_evidence(&config, &identity, &facts);
+    for (layer, policy) in topology.layers.iter().enumerate() {
+        let expected = if [2usize, 5].contains(&layer) {
+            LayerKind::Full
+        } else {
+            LayerKind::Recurrent(RecurrenceFamily::Mamba2)
+        };
+        assert_eq!(
+            policy.declared_kind.as_ref(),
+            Some(&expected),
+            "layer {layer}"
+        );
+    }
+    // The attention layers rotate as declared: partial rotary, 64 of 128.
+    let rotating = &topology.layers[2].position;
+    assert_eq!(
+        *rotating,
+        crate::config::PositionPolicy::PartialRope {
+            theta: 10000.0,
+            rotary_fraction: 0.5,
+            basis: crate::config::RotaryFrequencyBasis::RotaryWidth,
+        }
+    );
+    assert_eq!(
+        topology.layers[0].position,
+        crate::config::PositionPolicy::None
+    );
+
+    // One-based evidence (attention mixers at 1 and 4) settles the OTHER
+    // reading from the SAME declaration.
+    let facts = hybrid_in_proj_facts(8, &[1, 4]);
+    let (_, topology) = resolve_with_tensor_evidence(&config, &identity, &facts);
+    assert_eq!(topology.layers[1].declared_kind, Some(LayerKind::Full));
+    assert_eq!(
+        topology.layers[2].declared_kind,
+        Some(LayerKind::Recurrent(RecurrenceFamily::Mamba2))
+    );
+    let _ = LayerIndexBase::Zero;
+}
+
+/// Evidence that fits NEITHER base — or layers whose shapes are missing —
+/// leaves the declaration unresolved: the pass settles ambiguity, it
+/// never invents an answer.
+#[test]
+fn inconsistent_tensor_evidence_settles_nothing() {
+    use crate::inventory::resolved::resolve_with_tensor_evidence;
+
+    let config = hybrid_shaped();
+    let identity = read_identity(&config);
+    // Attention-shaped rows at layer 3 — a set neither base predicts.
+    let facts = hybrid_in_proj_facts(8, &[3, 6]);
+    let (_, topology) = resolve_with_tensor_evidence(&config, &identity, &facts);
+    assert!(topology.layers.iter().all(|l| l.declared_kind.is_none()));
+
+    // No tensors at all: same refusal.
+    let (_, topology) = resolve_with_tensor_evidence(&config, &identity, &[]);
+    assert!(topology.layers.iter().all(|l| l.declared_kind.is_none()));
+}
+
+#[test]
+fn a_nested_text_declaration_does_not_erase_the_container_one() {
+    // Kimi K3: the container says `kimi_k3`, the text component says
+    // `kimi_linear`. The reader prefers the text declaration, so before
+    // this the container's was simply gone by the time anything could
+    // judge it — and `kimi_linear` resolves, so detection would have
+    // dispatched a 93-layer model to the 48B implementation without a
+    // word. Both declarations must reach the gate.
+    let identity = read_identity(&serde_json::json!({
+        "model_type": "kimi_k3",
+        "text_config": { "model_type": "kimi_linear", "num_hidden_layers": 93 },
+    }));
+    assert_eq!(identity.model_type, "kimi_linear");
+    assert_eq!(identity.container_model_type.as_deref(), Some("kimi_k3"));
+}
+
+#[test]
+fn a_flat_config_declares_once_and_reports_no_second_fact() {
+    // The control: without it, every flat checkpoint would report its own
+    // `model_type` as a container declaration and the conflict gate would
+    // be comparing a fact with itself.
+    let identity = read_identity(&serde_json::json!({ "model_type": "llama" }));
+    assert_eq!(identity.model_type, "llama");
+    assert_eq!(identity.container_model_type, None);
+}
+
+#[test]
+fn a_text_config_that_declares_nothing_leaves_the_container_authoritative() {
+    // A nested block exists but states no identity: the container's
+    // declaration is the only one, so there is nothing to reconcile and
+    // reporting a second fact would invent a disagreement.
+    let identity = read_identity(&serde_json::json!({
+        "model_type": "gemma3",
+        "text_config": { "num_hidden_layers": 26 },
+    }));
+    assert_eq!(identity.model_type, "gemma3");
+    assert_eq!(identity.container_model_type, None);
+}
+
+// ── `vocab_size` from the embedding rows ─────────────────────────────
+
+/// `google/gemma-3-4b-it`'s `text_config`, which declares no `vocab_size`
+/// anywhere (HF leaves it at the class default), no head count and no
+/// head width.
+fn gemma3_shaped_without_vocab() -> serde_json::Value {
+    json!({
+        "architectures": ["Gemma3ForConditionalGeneration"],
+        "model_type": "gemma3",
+        "text_config": {
+            "model_type": "gemma3_text",
+            "hidden_size": 2560,
+            "intermediate_size": 10240,
+            "num_hidden_layers": 34,
+            "rope_scaling": { "factor": 8.0, "rope_type": "linear" },
+            "sliding_window": 1024
+        }
+    })
+}
+
+fn embedding(name: &str, rows: usize) -> crate::inventory::TensorFact {
+    crate::inventory::TensorFact {
+        name: name.to_string(),
+        dtype: "BF16".to_string(),
+        shape: vec![rows, 2560],
+        bytes: (rows * 2560 * 2) as u64,
+        file: "model.safetensors".to_string(),
+    }
+}
+
+/// The width the output head runs against, read off the table it is tied
+/// to, and the answer says which tensor spoke.
+#[test]
+fn an_undeclared_vocab_is_answered_by_the_embedding_rows_with_provenance() {
+    use crate::inventory::resolved::resolve_with_tensor_evidence;
+    let config = gemma3_shaped_without_vocab();
+    let identity = read_identity(&config);
+    let tensors = [embedding(
+        "language_model.model.embed_tokens.weight",
+        262_208,
+    )];
+    let (_, topology) = resolve_with_tensor_evidence(&config, &identity, &tensors);
+    assert_eq!(topology.vocab_size, Some(262_208));
+    assert_eq!(
+        topology.vocab_size_provenance,
+        Some(
+            crate::inventory::report::VocabSizeProvenance::EmbeddingRows {
+                tensor: "language_model.model.embed_tokens.weight".to_string(),
+            }
+        )
+    );
+}
+
+/// A declaration always wins: the estate is evidence for an absent fact,
+/// never an override of a present one, and the provenance says so.
+#[test]
+fn a_declared_vocab_is_the_declaration_whatever_the_estate_says() {
+    use crate::inventory::resolved::resolve_with_tensor_evidence;
+    let mut config = gemma3_shaped_without_vocab();
+    config["text_config"]["vocab_size"] = json!(262_208);
+    let identity = read_identity(&config);
+    let tensors = [embedding("language_model.model.embed_tokens.weight", 999)];
+    let (_, topology) = resolve_with_tensor_evidence(&config, &identity, &tensors);
+    assert_eq!(topology.vocab_size, Some(262_208));
+    assert_eq!(
+        topology.vocab_size_provenance,
+        Some(crate::inventory::report::VocabSizeProvenance::Declared)
+    );
+}
+
+/// No estate, no answer: the resolution without tensors leaves the width
+/// absent, and the surface refuses as it always did rather than filling
+/// in the class default.
+#[test]
+fn no_estate_leaves_an_undeclared_vocab_absent() {
+    let config = gemma3_shaped_without_vocab();
+    let identity = read_identity(&config);
+    let (_, topology) = resolve(&config, &identity);
+    assert_eq!(topology.vocab_size, None);
+    assert_eq!(topology.vocab_size_provenance, None);
+}
+
+/// Matched on the exact name under the architecture's own prefixes: a
+/// tower's or a projector's table whose name merely CONTAINS the key
+/// cannot answer for the text component's.
+#[test]
+fn only_the_text_components_own_embedding_answers() {
+    use crate::inventory::resolved::resolve_with_tensor_evidence;
+    let config = gemma3_shaped_without_vocab();
+    let identity = read_identity(&config);
+    let tensors = [
+        embedding("model.vision_tower.embed_tokens.weight", 5),
+        embedding("language_model.model.embed_tokens.weight.extra", 7),
+        embedding("xlanguage_model.model.embed_tokens.weight", 9),
+    ];
+    let (_, topology) = resolve_with_tensor_evidence(&config, &identity, &tensors);
+    assert_eq!(topology.vocab_size, None);
+    assert_eq!(topology.vocab_size_provenance, None);
 }

@@ -32,6 +32,20 @@ use super::encode::encode_system;
 
 /// Deterministic small weights: LCG over the flat index, scaled to
 /// ±0.05 so activations stay in a well-conditioned range.
+/// One RFC 1950 stream over the row-major little-endian bf16 image of
+/// `values` — the only `BF16_ZLIB` encoder in the tree, and it lives with
+/// the fixtures deliberately: the representation contract is decode-only,
+/// and a compile-path encoder is a later rung's claim, not this one's.
+pub fn encode_bf16_zlib(values: &[f32]) -> Vec<u8> {
+    use std::io::Write;
+    let image = larql_models::quant::half::encode_bf16(values);
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder
+        .write_all(&image)
+        .expect("a Vec never refuses a write");
+    encoder.finish().expect("a Vec never refuses a write")
+}
+
 pub fn lcg_values(n: usize, seed: u64) -> Vec<f32> {
     let mut state = seed
         .wrapping_mul(6364136223846793005)
@@ -104,8 +118,14 @@ impl ShardBuilder {
     }
 
     pub fn write(self, dir: &Path) {
+        self.write_as(dir, "model.safetensors");
+    }
+
+    /// Write under a chosen filename — for a fixture that ships more than
+    /// one shard.
+    pub fn write_as(self, dir: &Path, name: &str) {
         let header_bytes = serde_json::to_vec(&serde_json::Value::Object(self.header)).unwrap();
-        let mut file = std::fs::File::create(dir.join("model.safetensors")).unwrap();
+        let mut file = std::fs::File::create(dir.join(name)).unwrap();
         file.write_all(&(header_bytes.len() as u64).to_le_bytes())
             .unwrap();
         file.write_all(&header_bytes).unwrap();
@@ -125,12 +145,36 @@ pub const DENSE_LAYERS: usize = 2;
 /// A dense Llama-shaped checkpoint with real F32 weights — loadable by
 /// the production path and encodable into a VINDEX3 container.
 pub fn dense_f32_model(dir: &Path) {
+    dense_f32_model_with(dir, HeadStorage::Separate);
+}
+
+/// How a checkpoint stores its output head.
+///
+/// A logical role and a serialised object are different things, and this
+/// is the axis on which they come apart. Qwen3-4B is the real instance:
+/// it declares `tie_word_embeddings: true` and ships no `lm_head.weight`
+/// at all, while Qwen3-0.6B and Qwen3-1.7B declare the same flag and ship
+/// the tensor anyway. Same family, same declaration, different
+/// realisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadStorage {
+    /// A distinct `lm_head.weight` group — its own object in the
+    /// container.
+    Separate,
+    /// `tie_word_embeddings: true` and no head tensor. The logical role
+    /// still exists; nothing is serialised for it.
+    Tied,
+}
+
+/// The dense Llama-shaped checkpoint, with the head stored either way.
+pub fn dense_f32_model_with(dir: &Path, head: HeadStorage) {
     std::fs::write(
         dir.join("config.json"),
         serde_json::json!({
             "architectures": ["LlamaForCausalLM"],
             "torch_dtype": "float32",
             "model_type": "llama",
+            "tie_word_embeddings": head == HeadStorage::Tied,
             "hidden_size": DENSE_HIDDEN,
             "num_hidden_layers": DENSE_LAYERS,
             "intermediate_size": DENSE_INTERMEDIATE,
@@ -158,11 +202,13 @@ pub fn dense_f32_model(dir: &Path) {
         &[DENSE_HIDDEN],
         &norm_values(DENSE_HIDDEN, 2),
     );
-    shard.push(
-        "lm_head.weight",
-        &[DENSE_VOCAB, DENSE_HIDDEN],
-        &lcg_values(DENSE_VOCAB * DENSE_HIDDEN, 3),
-    );
+    if head == HeadStorage::Separate {
+        shard.push(
+            "lm_head.weight",
+            &[DENSE_VOCAB, DENSE_HIDDEN],
+            &lcg_values(DENSE_VOCAB * DENSE_HIDDEN, 3),
+        );
+    }
     for layer in 0..DENSE_LAYERS {
         let seed = 100 + layer as u64 * 10;
         let prefix = format!("model.layers.{layer}");
@@ -399,6 +445,118 @@ pub fn miniature_glimmer_with(dir: &Path, extras: MiniatureExtras) {
 ///
 /// `write_checkpoint` is one of the writers above (or a caller's own);
 /// the encoded system holds that single model under `name`.
+/// The dense fixture with **one projection stored as fine-grained FP8** —
+/// E4M3 codes plus a `weight_scale_inv` grid, the way GLM-5.3-Flash and
+/// the DeepSeek-V3 lineage ship 95.8 % of their bytes.
+///
+/// Only `layers.0.mlp.gate_proj` is converted. A fixture where everything
+/// were FP8 could not show that the pair is bound TOGETHER and separately
+/// from its neighbours — the failure that matters is a scale grid
+/// reaching the wrong matrix, and a uniform fixture hides it.
+///
+/// The grid is deliberately **non-square with unequal tiles** (a
+/// `[2, 4]` grid over `[out, in]`), because a square one cannot tell a
+/// row-major scale index from a transposed one.
+pub fn dense_fp8_model(dir: &Path) {
+    use larql_models::quant::fp8::f32_to_e4m3;
+
+    dense_f32_model(dir);
+    // Re-open the config to add the scheme's declaration. The tensors
+    // are appended to a second shard so the base fixture stays exactly
+    // what every other test sees.
+    let cfg_path = dir.join("config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    // STORAGE only. `activation_scheme` is deliberately absent: it names
+    // an FP8 *compute* path this build does not implement, and declaring
+    // it makes the plan block — which is the intended behaviour and is
+    // asserted in `fp8_carriage`. A checkpoint that stores FP8 and says
+    // nothing about activation quantisation is admissible; one that asks
+    // for an FP8 GEMM is not.
+    cfg["quantization_config"] = serde_json::json!({
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "weight_block_size": [FP8_TILE_ROWS, FP8_TILE_COLS],
+        "modules_to_not_convert": [],
+    });
+    std::fs::write(&cfg_path, cfg.to_string()).unwrap();
+
+    // Drop the f32 original and write the FP8 pair in its place.
+    let target = "model.layers.0.mlp.gate_proj.weight";
+    let (rows, cols) = (DENSE_INTERMEDIATE, DENSE_HIDDEN);
+    let scale_rows = rows / FP8_TILE_ROWS;
+    let scale_cols = cols / FP8_TILE_COLS;
+    assert!(
+        scale_rows > 1 && scale_cols > 1 && scale_rows != scale_cols,
+        "the fixture's grid must be non-square and larger than 1x1, or it \
+         cannot distinguish a transposed scale index"
+    );
+
+    let values = lcg_values(rows * cols, 4242);
+    let scales: Vec<f32> = (0..scale_rows * scale_cols)
+        .map(|i| 0.0625 * (1 + i % 5) as f32)
+        .collect();
+    // Quantise so the pair MEANS something: each value is divided by its
+    // tile's scale before encoding, so dequantising recovers it to E4M3
+    // resolution rather than to noise.
+    let mut codes = vec![0u8; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            let s = scales[(r / FP8_TILE_ROWS) * scale_cols + c / FP8_TILE_COLS];
+            codes[r * cols + c] = f32_to_e4m3(values[r * cols + c] / s);
+        }
+    }
+
+    let mut shard = ShardBuilder::new();
+    shard.push_bytes(target, "F8_E4M3", &[rows, cols], &codes);
+    let scale_bytes: Vec<u8> = scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+    shard.push_bytes(
+        "model.layers.0.mlp.gate_proj.weight_scale_inv",
+        "F32",
+        &[scale_rows, scale_cols],
+        &scale_bytes,
+    );
+    shard.write_as(dir, "model-fp8.safetensors");
+    strip_tensor(dir, "model.safetensors", target);
+}
+
+/// The tile this fixture's FP8 pair uses. Unequal on purpose.
+pub const FP8_TILE_ROWS: usize = DENSE_INTERMEDIATE / 2;
+pub const FP8_TILE_COLS: usize = DENSE_HIDDEN / 4;
+
+/// Remove one tensor from a written shard, rewriting the payload.
+///
+/// The FP8 pair REPLACES the f32 original; leaving both would let a
+/// loader bind either and the test would not say which.
+fn strip_tensor(dir: &Path, shard: &str, name: &str) {
+    let path = dir.join(shard);
+    let raw = std::fs::read(&path).unwrap();
+    let hlen = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+    let header: serde_json::Value = serde_json::from_slice(&raw[8..8 + hlen]).unwrap();
+    let body = &raw[8 + hlen..];
+
+    let mut out = ShardBuilder::new();
+    for (k, v) in header.as_object().unwrap() {
+        if k == name || k == "__metadata__" {
+            continue;
+        }
+        let off = v["data_offsets"].as_array().unwrap();
+        let (a, b) = (
+            off[0].as_u64().unwrap() as usize,
+            off[1].as_u64().unwrap() as usize,
+        );
+        let shape: Vec<usize> = v["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as usize)
+            .collect();
+        out.push_bytes(k, v["dtype"].as_str().unwrap(), &shape, &body[a..b]);
+    }
+    std::fs::remove_file(&path).unwrap();
+    out.write_as(dir, shard);
+}
+
 pub fn encode_fixture_container(
     write_checkpoint: impl FnOnce(&Path),
     checkpoint_dir: &Path,

@@ -98,6 +98,14 @@ fn routing_policy(kind: larql_models::MoeRouterKind) -> larql_compute::MoeRoutin
         larql_models::MoeRouterKind::TopKSoftmax => MoeRoutingPolicy::top_k_softmax(),
         larql_models::MoeRouterKind::TopKThenSoftmax => MoeRoutingPolicy::top_k_then_softmax(),
         larql_models::MoeRouterKind::Gemma4Hybrid => MoeRoutingPolicy::gemma4_hybrid(),
+        // Represented, not executable — see
+        // `larql_compute::pipeline_layer::moe_build::moe_routing_policy`.
+        // Every policy here normalises across experts in a way sigmoid
+        // does not, so substituting one produces plausible, wrong
+        // expert weights.
+        larql_models::MoeRouterKind::Sigmoid => {
+            unimplemented!("sigmoid expert routing is represented but not executable")
+        }
     }
 }
 
@@ -268,7 +276,7 @@ pub(super) fn build_ffn(
     formats: WeightFormats,
     keep: &mut Vec<LoadedWeight>,
 ) -> Result<FfnResident, VindexError> {
-    if let Some(op) = layer.ffn.routed() {
+    if let Some(op) = layer.ffn.as_ref().and_then(|f| f.routed()) {
         if op.router_kind == larql_models::MoeRouterKind::Gemma4Hybrid {
             return Err(VindexError::Parse(format!(
                 "layer {}: a pure routed FFN with the Gemma 4 router kind has no lowering arm \
@@ -280,7 +288,7 @@ pub(super) fn build_ffn(
             gpu, store, layer, op,
         )?)));
     }
-    if let Some(op) = layer.ffn.hybrid() {
+    if let Some(op) = layer.ffn.as_ref().and_then(|f| f.hybrid()) {
         return Ok(FfnResident::Hybrid(Box::new(build_hybrid(
             gpu, store, layer, op, formats, keep,
         )?)));
@@ -312,6 +320,21 @@ fn build_routed(
     layer: &LayerPlan,
     op: &larql_vindex::format::vindex3::opplan::RoutedFfnOp,
 ) -> Result<RoutedLayer, VindexError> {
+    // A bottleneck around the bank refuses FIRST, and by name. The
+    // descriptor path would otherwise bind every operand successfully —
+    // the bank IS stored at the latent width — and run the layer at the
+    // wrong width with nothing to catch it. Named before any tensor is
+    // registered, for the reason K3-REP-GATE-1's D-6 gives: a refusal
+    // raised later reads as a byte count, and sends a reader to a buffer
+    // instead of to the config line that governs it.
+    if let Some(why) =
+        larql_vindex::format::vindex3::opplan::exec::device_refusal::lowered_latent_branch_refusal(
+            layer.layer,
+            op.latent.as_ref(),
+        )
+    {
+        return Err(VindexError::Parse(why));
+    }
     // Every routing/layout/format fact comes from the plan's RoutedFfnOp,
     // never a model name. A storage format the descriptor path cannot
     // serve, or a fused operand with no declared row layout, refuses here
@@ -322,6 +345,21 @@ fn build_routed(
             layer.layer, op.expert_format
         ))
     })?;
+    // The `expert_qformat` refusal above already rejects
+    // `ExpertFormat::PerExpert`, so this is a packed bank whenever it is
+    // reached — stated again here rather than trusted, the same posture
+    // `packed_bank`'s own exhaustive match takes.
+    let larql_vindex::format::vindex3::opplan::ExpertBank::Packed {
+        gate_up: gate_up_projection,
+        down: down_projection,
+    } = &op.bank
+    else {
+        return Err(VindexError::Parse(format!(
+            "layer {}: routed FFN op carries a per-expert (unfused) bank; the descriptor MoE \
+             path has no lowering arm for it",
+            layer.layer
+        )));
+    };
     let fused_row_layout = fused_row_layout(op.gate_up_layout.ok_or_else(|| {
         VindexError::Parse(format!(
             "layer {}: routed FFN carries no gate_up layout",
@@ -352,7 +390,7 @@ fn build_routed(
     const FUSED: usize = larql_models::quant::mxfp4::FUSED_HALVES;
     let (gate_up_blocks, gate_up_scales) = packed_bank(
         store,
-        &op.gate_up,
+        gate_up_projection,
         op.expert_format,
         experts,
         FUSED * inter,
@@ -362,7 +400,7 @@ fn build_routed(
     )?;
     let (down_blocks, down_scales) = packed_bank(
         store,
-        &op.down,
+        down_projection,
         op.expert_format,
         experts,
         hidden,
@@ -397,9 +435,12 @@ fn build_routed(
         };
     let router_proj = store.load(&op.router)?;
     let router_bias = f32_or_empty(op.router_bias.as_ref())?;
-    let gate_up_bias = f32_or_empty(op.gate_up.bias.as_ref())?;
-    let down_bias = f32_or_empty(op.down.bias.as_ref())?;
-    let pre_ffn_norm = store.load(&layer.pre_ffn_norm.weight)?;
+    let gate_up_bias = f32_or_empty(gate_up_projection.bias.as_ref())?;
+    let down_bias = f32_or_empty(down_projection.bias.as_ref())?;
+    let pre_ffn_op = layer.pre_ffn_norm.as_ref().ok_or_else(|| {
+        VindexError::Parse("layer carries no pre-FFN norm (mixer-only)".to_string())
+    })?;
+    let pre_ffn_norm = store.load(&pre_ffn_op.weight)?;
     let gate_rule = larql_compute::MoeGateRule::from_arch(op.gate_policy, op.activation);
 
     let scratch = larql_compute_metal::MoeScratch::new_public_with_format(
@@ -481,7 +522,7 @@ fn build_routed(
         expert_qformat,
         table,
         scratch,
-        eps: layer.pre_ffn_norm.eps as f32,
+        eps: pre_ffn_op.eps as f32,
     })
 }
 
@@ -556,7 +597,7 @@ fn build_hybrid(
 /// layers are refused in `new`, so this only fails on a plan that changed
 /// under us).
 fn dense_ffn(layer: &LayerPlan) -> Result<&FfnOp, VindexError> {
-    layer.ffn.dense().ok_or_else(|| {
+    layer.ffn.as_ref().and_then(|f| f.dense()).ok_or_else(|| {
         VindexError::Parse(format!(
             "layer {} carries a routed FFN the lowering does not execute (A-9.4)",
             layer.layer

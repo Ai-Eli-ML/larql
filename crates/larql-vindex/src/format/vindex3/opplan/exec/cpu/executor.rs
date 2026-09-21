@@ -79,6 +79,100 @@ impl CpuExecutor {
         self.workers
     }
 
+    /// Run `items.len()` INDEPENDENT jobs across this executor's SAME
+    /// persistent pool — task-level fan-out, not the row-partitioning
+    /// `project` does within one projection.
+    ///
+    /// P4b-1: eight selected experts are eight coarse, unrelated jobs —
+    /// `w1 → w3 → silu → w2` for one id shares nothing with another's —
+    /// which is a much cleaner unit of scheduling than splitting any ONE
+    /// expert's own rows across workers (the mistake `FusedBf16`'s
+    /// serial call at P4a made: a kernel declared `ExternalPool`, called
+    /// with no external pool at all, loses to `BlasF32`'s
+    /// Accelerate-internal threading even though it moves half the
+    /// bytes — this method is what `ExternalPool` was actually asking
+    /// for).
+    ///
+    /// **Order-preserving**: `rayon`'s `par_iter().map().collect()` is
+    /// index-based, not completion-order, so `results[i]` is always
+    /// `f(&items[i])` regardless of which worker computed it or when —
+    /// the caller's own downstream reduction (a weighted sum in
+    /// `router.selected_ids` order) sees exactly the same order it would
+    /// from a serial `.map()`, so this changes WHERE the arithmetic
+    /// runs, never what it sums or in what order.
+    ///
+    /// Respects the same "at most one layer of parallelism owns the
+    /// machine" rule `project` does: if the caller is already inside a
+    /// rayon worker, this runs serially rather than nesting a second
+    /// fan-out inside it.
+    pub fn parallel_map<T: Sync, R: Send>(
+        &self,
+        items: &[T],
+        f: impl Fn(&T) -> R + Sync + Send,
+    ) -> Vec<R> {
+        if caller_owns_the_machine() || self.workers <= 1 {
+            return items.iter().map(&f).collect();
+        }
+        self.pool.install(|| {
+            use rayon::prelude::*;
+            items.par_iter().map(f).collect()
+        })
+    }
+
+    /// Run six INDEPENDENT, HETEROGENEOUS jobs across this executor's same
+    /// pool and return their results in argument order.
+    ///
+    /// Distinct from [`Self::parallel_map`]: that fans ONE closure out
+    /// over MANY homogeneous items (the eight selected experts); this
+    /// fans SIX DIFFERENT closures out over the same pool, for a fixed
+    /// set of branches that share no data dependency until the caller
+    /// joins their results. P4c-2a: KDA's q/k/v projection+conv+norm,
+    /// decay-gate, output-gate and b_proj branches each read only the
+    /// layer's own input `x` — independent of each other AND of the
+    /// recurrence that follows — which is exactly this shape, not a new
+    /// mechanism.
+    ///
+    /// Built from nested [`rayon::join`], not six `spawn`s into a
+    /// pre-allocated buffer: each `join` runs its first closure on the
+    /// CALLING thread and offers the second as a stealable task, so the
+    /// six leaves see AT MOST `self.workers` truly concurrent, the same
+    /// ceiling `parallel_map` and `project` already respect — no new
+    /// oversubscription surface.
+    ///
+    /// Respects the same "at most one layer of parallelism owns the
+    /// machine" rule every other primitive here does: serial, in
+    /// argument order, if the caller is already inside a rayon worker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn parallel6<A, B, C, D, E, F>(
+        &self,
+        a: impl FnOnce() -> A + Send,
+        b: impl FnOnce() -> B + Send,
+        c: impl FnOnce() -> C + Send,
+        d: impl FnOnce() -> D + Send,
+        e: impl FnOnce() -> E + Send,
+        f: impl FnOnce() -> F + Send,
+    ) -> (A, B, C, D, E, F)
+    where
+        A: Send,
+        B: Send,
+        C: Send,
+        D: Send,
+        E: Send,
+        F: Send,
+    {
+        if caller_owns_the_machine() || self.workers <= 1 {
+            return (a(), b(), c(), d(), e(), f());
+        }
+        self.pool.install(|| {
+            let (ra, (rb, (rc, (rd, (re, rf))))) = rayon::join(a, || {
+                rayon::join(b, || {
+                    rayon::join(c, || rayon::join(d, || rayon::join(e, f)))
+                })
+            });
+            (ra, rb, rc, rd, re, rf)
+        })
+    }
+
     /// How many workers to cut this projection across.
     ///
     /// A policy, deliberately shaped by measurement rather than fixed at
@@ -111,6 +205,44 @@ impl CpuExecutor {
         // The SAME site the byte ledger is written, so time and traffic
         // describe one call set rather than two.
         let _t = timed(OpClass::Projection);
+        self.project_inner(kernel, weight, x, out_dim)
+    }
+
+    /// [`Self::project`], timed under a CALLER-SUPPLIED class instead of
+    /// the generic [`OpClass::Projection`] — same row-parallel policy,
+    /// same byte-ledger accounting, only the leaf the wall time is
+    /// attributed to differs.
+    ///
+    /// For a caller with its own named boundary already — KDA's
+    /// `q_proj`/`k_proj`/`v_proj`/`o_proj` at P4c-4 — calling `project()`
+    /// there would nest `OpClass::Projection` inside the caller's own
+    /// timer, which `timing.rs`'s "nothing nests" contract forbids. This
+    /// avoids that by construction (one timer fires, not two) rather than
+    /// by adding a second documented exception next to
+    /// [`super::super::timing::OpClass::KdaBranchFanout`]'s.
+    pub fn project_as(
+        &self,
+        class: OpClass,
+        kernel: &dyn DenseProjector,
+        weight: WeightRows<'_>,
+        x: &[f32],
+        out_dim: usize,
+    ) -> Vec<f32> {
+        let _t = timed(class);
+        self.project_inner(kernel, weight, x, out_dim)
+    }
+
+    /// The execution [`Self::project`]/[`Self::project_as`] share — never
+    /// called directly, so the SAME two entry points are the only places
+    /// that decide which class the time belongs to.
+    fn project_inner(
+        &self,
+        kernel: &dyn DenseProjector,
+        weight: WeightRows<'_>,
+        x: &[f32],
+        out_dim: usize,
+    ) -> Vec<f32> {
+        let clock = std::time::Instant::now();
         super::replay::record(weight, x, out_dim);
         let in_dim = x.len();
         let mut out = vec![0.0f32; out_dim];
@@ -120,22 +252,18 @@ impl CpuExecutor {
             self.workers_for(kernel.parallelism(), weight.bytes())
         };
         if workers <= 1 || out_dim < workers {
+            kernel.project_rows(weight, x, &mut out);
             ledger().record(
-                PhysicalProjectionPlan::for_resident(weight),
+                PhysicalProjectionPlan::for_resident(weight, in_dim),
                 weight.bytes(),
                 1,
+                clock.elapsed().as_nanos() as u64,
             );
-            kernel.project_rows(weight, x, &mut out);
             return out;
         }
         // Row-contiguous partitions: each worker streams one unbroken
         // slab of weight, which is what the memory system wants.
         let rows = out_dim.div_ceil(workers);
-        ledger().record(
-            PhysicalProjectionPlan::for_resident(weight),
-            weight.bytes(),
-            out_dim.div_ceil(rows),
-        );
         self.pool.install(|| {
             use rayon::prelude::*;
             out.par_chunks_mut(rows).enumerate().for_each(|(i, slot)| {
@@ -143,7 +271,95 @@ impl CpuExecutor {
                 kernel.project_rows(slab, x, slot);
             });
         });
+        ledger().record(
+            PhysicalProjectionPlan::for_resident(weight, in_dim),
+            weight.bytes(),
+            out_dim.div_ceil(rows),
+            clock.elapsed().as_nanos() as u64,
+        );
         out
+    }
+
+    /// **CPU-7C.** Run `y_p = W x_p` for every position `p` under this
+    /// executor's threading policy, giving the kernel the chance to serve
+    /// them all from ONE weight traversal.
+    ///
+    /// The partition is by output ROWS, exactly as [`Self::project`] —
+    /// never by position. Cutting by position would hand each worker its
+    /// own copy of the whole matrix, which is the traffic this exists to
+    /// remove and is precisely what the position-parallel caller already
+    /// does.
+    pub fn project_many(
+        &self,
+        kernel: &dyn DenseProjector,
+        weight: WeightRows<'_>,
+        xs: &[&[f32]],
+        out_dim: usize,
+    ) -> Vec<Vec<f32>> {
+        let _t = timed(OpClass::Projection);
+        let clock = std::time::Instant::now();
+        let n = xs.len();
+        let in_dim = xs[0].len();
+        for x in xs {
+            super::replay::record(weight, x, out_dim);
+        }
+        // Position-minor, so one worker's row range is one contiguous run.
+        let mut flat = vec![0.0f32; out_dim * n];
+        let workers = if caller_owns_the_machine() {
+            1
+        } else {
+            self.workers_for(kernel.parallelism(), weight.bytes())
+        };
+        // The ledger must charge what was actually READ. A stationary
+        // kernel streams the matrix once for all `n`; the looping default
+        // streams it `n` times, and a ledger that charged one traversal
+        // for both would report the fallback at `n` times its true rate —
+        // the exact failure mode `is_weight_stationary` exists to expose.
+        let stationary = kernel.is_weight_stationary(weight, in_dim, n);
+        let traversals = if stationary { 1 } else { n };
+        let plan = PhysicalProjectionPlan::for_resident(weight, in_dim);
+        if workers <= 1 || out_dim < workers {
+            kernel.project_rows_many(weight, xs, &mut flat, n);
+            let ns = clock.elapsed().as_nanos() as u64;
+            ledger().record_many(
+                plan,
+                super::ledger::Call {
+                    bytes: weight.bytes() * traversals,
+                    slabs: 1,
+                    positions: n,
+                    grouped: stationary,
+                    nanos: ns,
+                    nanos_many: ns,
+                },
+            );
+        } else {
+            let rows = out_dim.div_ceil(workers);
+            self.pool.install(|| {
+                use rayon::prelude::*;
+                flat.par_chunks_mut(rows * n)
+                    .enumerate()
+                    .for_each(|(i, slot)| {
+                        let count = slot.len() / n;
+                        let slab = weight.slice_rows(in_dim, i * rows, count);
+                        kernel.project_rows_many(slab, xs, slot, n);
+                    });
+            });
+            let ns = clock.elapsed().as_nanos() as u64;
+            ledger().record_many(
+                plan,
+                super::ledger::Call {
+                    bytes: weight.bytes() * traversals,
+                    slabs: out_dim.div_ceil(rows),
+                    positions: n,
+                    grouped: stationary,
+                    nanos: ns,
+                    nanos_many: ns,
+                },
+            );
+        }
+        (0..n)
+            .map(|p| (0..out_dim).map(|r| flat[r * n + p]).collect())
+            .collect()
     }
 }
 

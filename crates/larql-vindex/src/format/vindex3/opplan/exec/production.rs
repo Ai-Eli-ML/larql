@@ -33,19 +33,32 @@ use larql_compute::residual::{
     layer_norm_eps, rms_norm_eps, rms_norm_heads_no_weight_eps, rms_norm_qk_eps,
 };
 use larql_compute::MoeGateRule;
+use larql_models::config::GateUpLayout;
 
 use super::super::super::graph::policy::AttentionSpan;
 use super::backend::{
-    AttentionCall, AttentionOut, AttentionStepCall, AttentionStepOut, FfnCall, GateCall,
-    MatrixClass, MatrixOperand, NormCall, PlanBackend, ProjectCall, ProjectedQkv, QkNormCall,
-    RoutedFfnCall, WeightFormat,
+    AttentionCall, AttentionOut, AttentionStepCall, AttentionStepOut, ExpertSlices, FfnCall,
+    FfnManyCall, GateCall, NormCall, PlanBackend, ProjectCall, ProjectedQkv, QkNormCall,
+    RoutedFfnCall, WeightFormat, WeightSlice,
 };
-use super::cpu::physical::{project_matrix, ExecutorProjections};
+use super::cpu::physical::{
+    kquant_execution, project_matrix, project_matrix_many, ExecutorProjections, KQuantExecution,
+};
 use super::cpu::PhysicalProjectionPlan;
 use super::kernels::{
-    gather_fused_half, mrope_rotate_scaled, rope_rotate, rope_rotate_scaled, FusedHalf,
+    gather_fused_half, mrope_rotate_scaled, rope_rotate, rope_rotate_scaled, sigmoid, FusedHalf,
 };
+use super::lowering::LoweringIdentity;
+use super::observe::AttentionHeadRecord;
+use super::prefetch;
+use super::realization::{
+    class_of, common_selection, cpu_projection_candidates, realization_residency, RealizationForm,
+    RealizationId, RefusalKind, RepresentationFacts, Selection, SelectionReason, SelectionRefusal,
+};
+use super::routing_trace;
+use super::stages::{stage, Stage};
 use super::timing::{timed, OpClass};
+use crate::format::vindex3::opplan::planned::PlannedOperand;
 use larql_compute::attention::rope::{
     rope_freq_plan, rope_freq_plan_proportional, RopeFreqScaling,
 };
@@ -60,6 +73,12 @@ use rayon::prelude::*;
 
 /// Name reported by [`PlanBackend::name`].
 const NAME: &str = "production-larql-compute";
+/// The provider's family ([`PlanBackend::identity`]): the CPU executor
+/// over `larql-compute`'s kernels. Revision 1 is the arithmetic this
+/// module binds today; it moves when the same pin would compute a
+/// different number, never for a faster kernel computing the same one.
+pub const IDENTITY_FAMILY: &str = "cpu-production";
+pub const IDENTITY_REVISION: u32 = 1;
 
 /// `larql-compute` realisation of every plan operation.
 #[derive(Debug, Default, Clone, Copy)]
@@ -68,6 +87,57 @@ pub struct ProductionBackend;
 impl ProductionBackend {
     pub fn new() -> Self {
         Self
+    }
+}
+
+/// The FFN's elementwise middle, shared by the one-position and
+/// many-position arms so the two cannot drift into different arithmetic.
+///
+/// The activation ONLY. The three projections around it are timed by the
+/// executor, and a timer that spanned them would make this class the
+/// whole FFN.
+fn ffn_activation(
+    gate: Option<&[f32]>,
+    up: &[f32],
+    activation: Activation,
+    policy: larql_models::ExpertGatePolicy,
+) -> Result<Vec<f32>, VindexError> {
+    let _t = timed(OpClass::FfnActivation);
+    // A gate POLICY that is not plain gating owns the whole combine, and
+    // the nonlinearity beside it is inert. Handled before the activation
+    // match so the two facts cannot be applied at once.
+    if let larql_models::ExpertGatePolicy::SituGlu { beta, linear_beta } = policy {
+        let Some(gate) = gate else {
+            return Err(VindexError::Parse(
+                "SiTU-GLU is a gated combine and this FFN has no gate projection; refusing \
+                 rather than computing it on the up branch alone"
+                    .to_string(),
+            ));
+        };
+        let rule = larql_compute::MoeGateRule::SituGlu { beta, linear_beta };
+        return Ok(gate
+            .iter()
+            .zip(up)
+            .map(|(g, u)| rule.combine(*g, *u))
+            .collect());
+    }
+    match gate {
+        Some(gate) => match activation {
+            Activation::Silu => Ok(geglu_silu_alloc(gate, up)),
+            // The served Gemma gate/up kernel (tanh-approximated GELU on
+            // the gate, times up).
+            Activation::GeluTanh => Ok(gate
+                .iter()
+                .zip(up)
+                .map(|(g, u)| gelu_tanh(*g) * u)
+                .collect()),
+            other => Err(unsupported_activation("gated", other)),
+        },
+        None => match activation {
+            Activation::Silu => Ok(up.iter().map(|u| silu(*u)).collect()),
+            Activation::GeluTanh => Ok(up.iter().map(|u| gelu_tanh(*u)).collect()),
+            other => Err(unsupported_activation("ungated", other)),
+        },
     }
 }
 
@@ -87,12 +157,17 @@ pub(super) fn unsupported_activation(shape: &str, activation: Activation) -> Vin
 /// (GPT-OSS's `swiglu_limit`) is carried by the container and refused
 /// until A-9.3 executes it — computing `activation(gate) * up` for it
 /// would run a different model without saying so.
-pub(super) fn require_plain_gate(
+pub(super) fn require_executable_gate(
     backend: &str,
     policy: larql_models::ExpertGatePolicy,
 ) -> Result<(), VindexError> {
     match policy {
         larql_models::ExpertGatePolicy::Gated => Ok(()),
+        // K3-ACT-1: both CPU-glue backends compute SiTU elementwise
+        // through `MoeGateRule::combine` — the same authority the routed
+        // path already uses — so admitting it here is a statement about
+        // what they execute, not a relaxation of what they check.
+        larql_models::ExpertGatePolicy::SituGlu { .. } => Ok(()),
         larql_models::ExpertGatePolicy::ClampedGlu { limit, alpha } => {
             Err(VindexError::Parse(format!(
                 "the {backend} backend does not execute ExpertGatePolicy::ClampedGlu {{ limit: \
@@ -100,6 +175,11 @@ pub(super) fn require_plain_gate(
              gating to a clamped-GLU FFN"
             )))
         }
+        larql_models::ExpertGatePolicy::ClampedGated { limit } => Err(VindexError::Parse(format!(
+            "the {backend} backend does not execute ExpertGatePolicy::ClampedGated {{ limit: \
+             {limit} }} yet; refusing rather than applying plain gating to a CLAMPED FFN, \
+             whose clamp is one-sided on the gate and symmetric on the up branch"
+        ))),
     }
 }
 
@@ -217,6 +297,51 @@ pub(super) fn condition_qk_in_place(
             for head in k.chunks_exact_mut(head_dim) {
                 rope_rotate_scaled(head, position, &plan.inv_freq, amplitude);
             }
+        }
+        // Linear through the served rope planner: the position divisor
+        // the planner has always taken, at full rotary width, unscaled
+        // frequencies, unit amplitude. The one arm that passes a divisor
+        // other than `NO_POSITION_DIVISOR` — Gemma 3's global layers.
+        PositionPolicy::Linear { theta, factor } => {
+            let plan = rope_freq_plan(head_dim, FULL_ROTARY, theta, factor, RopeFreqScaling::None);
+            let amplitude = plan.amplitude as f32;
+            for head in q.chunks_exact_mut(head_dim) {
+                rope_rotate_scaled(head, position, &plan.inv_freq, amplitude);
+            }
+            for head in k.chunks_exact_mut(head_dim) {
+                rope_rotate_scaled(head, position, &plan.inv_freq, amplitude);
+            }
+        }
+        // Llama-3 through the same served rope planner: wavelength-band
+        // frequencies at full rotary width, unit amplitude. The planner
+        // has implemented this since before the container could express
+        // it — the gap this arm closes was carriage, not mathematics.
+        PositionPolicy::Llama3 { theta, scaling } => {
+            let plan = rope_freq_plan(
+                head_dim,
+                FULL_ROTARY,
+                theta,
+                NO_POSITION_DIVISOR,
+                RopeFreqScaling::Llama3(scaling),
+            );
+            let amplitude = plan.amplitude as f32;
+            for head in q.chunks_exact_mut(head_dim) {
+                rope_rotate_scaled(head, position, &plan.inv_freq, amplitude);
+            }
+            for head in k.chunks_exact_mut(head_dim) {
+                rope_rotate_scaled(head, position, &plan.inv_freq, amplitude);
+            }
+        }
+        // Declared, and no backend rotates for it. Refusing is the only
+        // honest arm: doing nothing would run the model with no position
+        // information at all, which is a wrong answer that produces
+        // plausible text. The plan blocks such a stack, so this is
+        // unreachable through the supported path.
+        PositionPolicy::Relative { d_rel, extent } => {
+            return Err(VindexError::Parse(format!(
+                "relative position (d_rel {d_rel}, extent {extent}) is represented but not \
+                 executable: no backend implements it"
+            )))
         }
         PositionPolicy::None => {}
         // Partial rotary through the served planners: the proportional
@@ -358,7 +483,16 @@ pub(super) const FUSED_BRANCHES: usize = larql_models::quant::mxfp4::FUSED_HALVE
 /// input choice. Every conditioning operand must be present.
 pub(super) fn router_input(call: &RoutedFfnCall<'_>) -> Result<Vec<f32>, VindexError> {
     if call.router_kind != MoeRouterKind::Gemma4Hybrid {
-        return Ok(call.x.to_vec());
+        // `router_input`, not `x`. Until K3-LATENTMOE-1 these were the
+        // same vector for every non-Gemma-4 family, so reading `x` here
+        // was indistinguishable from honouring the field — the seam was
+        // declared and not carried, and nothing could tell. A latent
+        // routed branch hands the experts a projection of the block
+        // input and the router the block input itself, and taking `x`
+        // here would route on the bottleneck: a different model, and one
+        // no shape check can see, since the router matrix would simply
+        // be applied to a vector of the wrong width.
+        return Ok(call.router_input.unwrap_or(call.x).to_vec());
     }
     let missing = |what: &str| {
         VindexError::Parse(format!(
@@ -408,27 +542,76 @@ pub(super) fn select_experts(
         }
         return Ok(selected);
     }
-    if let Some(bias) = call.router_bias {
-        for (l, b) in logits.iter_mut().zip(bias) {
-            *l += b;
+    let mut selected = if call.router_kind == MoeRouterKind::Sigmoid {
+        sigmoid_select(logits, call.router_bias, call.top_k, call.routing_policy)
+    } else {
+        if let Some(bias) = call.router_bias {
+            for (l, b) in logits.iter_mut().zip(bias) {
+                *l += b;
+            }
+        }
+        router::select(logits, call.top_k, call.routing_policy)
+    };
+    if call.branch_scale != 1.0 {
+        for (_, w) in &mut selected {
+            *w *= call.branch_scale;
         }
     }
-    Ok(router::select(logits, call.top_k, call.routing_policy))
+    Ok(selected)
+}
+
+/// The reference's renormalisation guard: `weights / (sum + 1e-20)`, so a
+/// selection whose scores all underflow divides by something.
+const SIGMOID_RENORM_EPS: f32 = 1e-20;
+
+/// The sigmoid router (DeepSeek-V3, Kimi, GLM-5.3-Flash): every expert's
+/// score is `sigmoid(logit)`, independent of the others; the correction
+/// bias moves which experts are SELECTED and never what they WEIGH; the
+/// selected raw scores are the weights, renormalised to sum to one under
+/// [`ExpertRoutingPolicy::NormalisedOverSelected`] and kept raw otherwise.
+/// Ties rank by first index, as `torch.topk` does.
+pub(super) fn sigmoid_select(
+    logits: &[f32],
+    bias: Option<&[f32]>,
+    top_k: usize,
+    policy: ExpertRoutingPolicy,
+) -> Vec<(usize, f32)> {
+    let scores: Vec<f32> = logits.iter().map(|&l| sigmoid(l)).collect();
+    let keys: Vec<f32> = match bias {
+        Some(bias) => scores.iter().zip(bias).map(|(s, b)| s + b).collect(),
+        None => scores.clone(),
+    };
+    let mut ranked: Vec<usize> = (0..logits.len()).collect();
+    // A stable sort on the key keeps equal keys in index order.
+    ranked.sort_by(|&a, &b| {
+        keys[b]
+            .partial_cmp(&keys[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.truncate(top_k.min(logits.len()));
+    let mut selected: Vec<(usize, f32)> = ranked.iter().map(|&e| (e, scores[e])).collect();
+    if policy == ExpertRoutingPolicy::NormalisedOverSelected && selected.len() > 1 {
+        let sum = selected.iter().map(|(_, w)| w).sum::<f32>() + SIGMOID_RENORM_EPS;
+        for (_, w) in &mut selected {
+            *w /= sum;
+        }
+    }
+    selected
 }
 
 /// One selected expert's inner activation from its fused gate/up output
 /// (bias already added): rows read through the declared layout, combined
 /// by the served gate rule.
-pub(super) fn expert_inner(call: &RoutedFfnCall<'_>, fused: &[f32]) -> Vec<f32> {
+pub(super) fn expert_inner(
+    call: &RoutedFfnCall<'_>,
+    layout: GateUpLayout,
+    fused: &[f32],
+) -> Vec<f32> {
     let rule = MoeGateRule::from_arch(call.gate_policy, call.activation);
     (0..call.intermediate)
         .map(|i| {
-            let g = fused[call
-                .gate_up_layout
-                .row(GateUpBranch::Gate, i, call.intermediate)];
-            let u = fused[call
-                .gate_up_layout
-                .row(GateUpBranch::Up, i, call.intermediate)];
+            let g = fused[layout.row(GateUpBranch::Gate, i, call.intermediate)];
+            let u = fused[layout.row(GateUpBranch::Up, i, call.intermediate)];
             rule.combine(g, u)
         })
         .collect()
@@ -448,20 +631,13 @@ pub(super) fn add_expert_bias(x: &mut [f32], bias: Option<&[f32]>, expert: usize
 /// device backends (the device deliberately runs production glue so a
 /// divergence is attributable to device matmul arithmetic alone); the
 /// gate and output projections stay with each backend's own matmuls.
-pub(super) fn aggregate_heads<'k>(
-    call: &AttentionCall<'_>,
-    position: usize,
-    query: &[f32],
-    key_of: impl Fn(usize) -> &'k [f32],
-    value_of: impl Fn(usize) -> &'k [f32],
-) -> Vec<f32> {
-    let head_dim = call.head_dim;
-    let q_rows = call.num_q_heads * head_dim;
-    let group = call.num_q_heads / call.num_kv_heads;
-    // Exhaustive over the span vocabulary on purpose: a `_` arm would let
-    // the next span kind mean "whole prefix" without anyone deciding that,
-    // which is the defect `layer_types` already suffered once.
-    let start = match (call.span, call.window) {
+/// The first source position a query at `position` may attend to under
+/// the call's span — ONE place, shared by the kernel and the head tap.
+/// Exhaustive over the span vocabulary on purpose: a `_` arm would let
+/// the next span kind mean "whole prefix" without anyone deciding that,
+/// which is the defect `layer_types` already suffered once.
+pub(super) fn source_start(call: &AttentionCall<'_>, position: usize) -> usize {
+    match (call.span, call.window) {
         (AttentionSpan::Sliding, Some(window)) => (position + 1).saturating_sub(window),
         // A sliding layer with no declared window has no bound to apply.
         (AttentionSpan::Sliding, None) | (AttentionSpan::Full, _) => 0,
@@ -470,7 +646,35 @@ pub(super) fn aggregate_heads<'k>(
         // perception component today; when one does, it needs the
         // component's own geometry here rather than this fallthrough.
         (AttentionSpan::Windowed, _) => 0,
-    };
+    }
+}
+
+pub(super) fn aggregate_heads<'k>(
+    call: &AttentionCall<'_>,
+    position: usize,
+    query: &[f32],
+    key_of: impl Fn(usize) -> &'k [f32],
+    value_of: impl Fn(usize) -> &'k [f32],
+) -> Vec<f32> {
+    aggregate_heads_keeping(call, position, query, key_of, value_of, None)
+}
+
+/// [`aggregate_heads`] that, when asked, keeps each head's softmax
+/// distribution after it has been consumed (V3-HEAD-OBS-1). The
+/// arithmetic is identical with or without `keep`: the distribution is
+/// moved out after the weighted sum, never recomputed or reordered.
+pub(super) fn aggregate_heads_keeping<'k>(
+    call: &AttentionCall<'_>,
+    position: usize,
+    query: &[f32],
+    key_of: impl Fn(usize) -> &'k [f32],
+    value_of: impl Fn(usize) -> &'k [f32],
+    mut keep: Option<&mut Vec<Vec<f32>>>,
+) -> Vec<f32> {
+    let head_dim = call.head_dim;
+    let q_rows = call.num_q_heads * head_dim;
+    let group = call.num_q_heads / call.num_kv_heads;
+    let start = source_start(call, position);
     let _t = timed(OpClass::AttentionCore);
     let mut concat = vec![0.0f32; q_rows];
     for q_head in 0..call.num_q_heads {
@@ -504,6 +708,9 @@ pub(super) fn aggregate_heads<'k>(
             for (acc, v) in head_out.iter_mut().zip(v_slice) {
                 *acc += weight * v;
             }
+        }
+        if let Some(kept) = keep.as_deref_mut() {
+            kept.push(scores);
         }
     }
     concat
@@ -591,17 +798,60 @@ impl ProductionBackend {
         gate_input: &[f32],
         projected_gate: Option<&[f32]>,
     ) -> Result<Vec<f32>, VindexError> {
-        let q_rows = call.num_q_heads * call.head_dim;
-        let mut concat = aggregate_heads(call, position, query, key_of, value_of);
+        Self::attend_position_tapped(
+            call,
+            position,
+            query,
+            key_of,
+            value_of,
+            gate_input,
+            projected_gate,
+            None,
+            None,
+        )
+    }
 
-        if let Some(GateCall { spec, weight }) = &call.gate {
+    /// [`Self::attend_position`] with the V3-HEAD-OBS-1 tap: when armed,
+    /// each head's distribution is kept by the kernel and, once the gate
+    /// values are known but BEFORE they multiply the heads, one record
+    /// per query head is handed to `tap` — the head's mixed value
+    /// pre-gate, its activated gate slice, its distribution and the sink
+    /// mass. The arithmetic the executor performs is the same either way.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attend_position_tapped<'k>(
+        call: &AttentionCall<'_>,
+        position: usize,
+        query: &[f32],
+        key_of: impl Fn(usize) -> &'k [f32],
+        value_of: impl Fn(usize) -> &'k [f32],
+        gate_input: &[f32],
+        projected_gate: Option<&[f32]>,
+        tap: Option<&mut dyn FnMut(AttentionHeadRecord<'_>)>,
+        head_intervene: Option<&mut super::backend::HeadIntervene<'_>>,
+    ) -> Result<Vec<f32>, VindexError> {
+        let head_dim = call.head_dim;
+        let q_rows = call.num_q_heads * head_dim;
+        let mut kept: Vec<Vec<f32>> = Vec::new();
+        let mut concat = aggregate_heads_keeping(
+            call,
+            position,
+            query,
+            &key_of,
+            &value_of,
+            tap.as_ref().map(|_| &mut kept),
+        );
+
+        // The gate values, computed before anything multiplies the heads,
+        // so a tap can carry each head's activated slice; the multiply
+        // itself is unchanged below.
+        let gate_values: Option<Vec<f32>> = if let Some(GateCall { spec, weight }) = &call.gate {
             // Exhaustive on the judged semantics, same as the
             // reference: a new variant must be implemented before it
             // can execute on this backend either.
             let GateActivation::Sigmoid = spec.activation;
             let GateCombine::ElementwiseMultiply = spec.combine;
             let GatePlacement::AfterAggregationBeforeOutputProjection = spec.placement;
-            let gate_values = match (spec.source, projected_gate) {
+            let values = match (spec.source, projected_gate) {
                 // Already computed: the projection that produced the
                 // queries produced these in the same pass.
                 (GateSource::FusedQueryProjection, Some(values)) => values.to_vec(),
@@ -620,8 +870,45 @@ impl ProductionBackend {
                     project_matrix(weight, gate_input, q_rows, call.hidden)?
                 }
             };
+            Some(values)
+        } else {
+            None
+        };
+
+        // V3-HEAD-OBS-1: the records, between aggregation and the gate,
+        // built in the one place every backend shares.
+        if let Some(tap) = tap {
+            let activated: Option<Vec<f32>> = gate_values
+                .as_ref()
+                .map(|g| g.iter().map(|g| 1.0 / (1.0 + (-g).exp())).collect());
+            super::observe::fire_head_records(
+                tap,
+                position,
+                call.num_q_heads,
+                call.num_kv_heads,
+                head_dim,
+                source_start(call, position),
+                call.sinks.is_some(),
+                &concat,
+                &kept,
+                activated.as_deref(),
+                &value_of,
+            );
+        }
+
+        // V3-INTERVENE-2: each head's `ctx_h`, mutated in place if the
+        // caller declared an intervention there — AFTER the head record
+        // above fired on the uninintervened value (J3), BEFORE the gate
+        // multiply, `o_proj` and the post-attention norm below (J1).
+        if let Some(head_intervene) = head_intervene {
+            for (head, ctx_h) in concat.chunks_exact_mut(head_dim).enumerate() {
+                head_intervene(head, ctx_h);
+            }
+        }
+
+        if let Some(gate_values) = &gate_values {
             let _t = timed(OpClass::OutputGate);
-            for (c, g) in concat.iter_mut().zip(&gate_values) {
+            for (c, g) in concat.iter_mut().zip(gate_values) {
                 *c *= 1.0 / (1.0 + (-g).exp());
             }
         }
@@ -630,6 +917,175 @@ impl ProductionBackend {
         add_output_bias(call, &mut out);
         Ok(out)
     }
+
+    /// The decode step with an optional per-head tap and an optional
+    /// per-head intervention: one projection, one attention over the
+    /// cached rows plus the fresh one, both threaded into the
+    /// aggregation. `attention_step` is this with `None, None`, so the
+    /// observed step IS the step.
+    fn attention_step_tapped(
+        step: AttentionStepCall<'_>,
+        tap: Option<&mut dyn FnMut(AttentionHeadRecord<'_>)>,
+        head_intervene: Option<&mut super::backend::HeadIntervene<'_>>,
+    ) -> Result<AttentionStepOut, VindexError> {
+        let call = &step.op;
+        let pre = &call.inputs[0];
+        let ProjectedAttention {
+            qkv: (q, k, v),
+            gate,
+        } = Self::project_position(call, step.position, pre)?;
+        let output = Self::attend_position_tapped(
+            call,
+            step.position,
+            &q,
+            |p| {
+                if p == step.position {
+                    k.as_slice()
+                } else {
+                    step.keys[p].as_slice()
+                }
+            },
+            |p| {
+                if p == step.position {
+                    v.as_slice()
+                } else {
+                    step.values[p].as_slice()
+                }
+            },
+            pre,
+            gate.as_deref(),
+            tap,
+            head_intervene,
+        )?;
+        Ok(AttentionStepOut {
+            key: k,
+            value: v,
+            output,
+        })
+    }
+}
+
+/// The CPU executor's own re-quantised resident forms, offered as
+/// candidates for a float source it knows how to narrow — which a codec
+/// declares by naming the direct bf16 kernel.
+const REQUANTISE: [PhysicalProjectionPlan; 4] = [
+    PhysicalProjectionPlan::FusedQ8,
+    PhysicalProjectionPlan::Q8xQ8,
+    PhysicalProjectionPlan::Q4xQ8,
+    PhysicalProjectionPlan::FusedQ4,
+];
+
+/// [`ProductionBackend::select`]'s decision, with the K-quant execution
+/// arm passed in rather than read from the environment — so both arms are
+/// testable in one process without touching it.
+///
+/// **The policy, over a derived candidate set.** The candidates come from
+/// the codec's declarations and the executor's own compact forms; the
+/// ladder below only ORDERS them, and can answer nothing that is not a
+/// candidate. A compiled NVFP4 pack outranks everything; a stored K-quant
+/// runs in place or widens by the arm; a float source goes to the size
+/// policy, which keeps a large bf16 image compact and widens a small one;
+/// a codec with no direct realization decodes, and says so.
+pub(crate) fn select_cpu(
+    operand: &PlannedOperand,
+    facts: &RepresentationFacts,
+    kquant: KQuantExecution,
+) -> Result<Selection, Box<SelectionRefusal>> {
+    use RealizationForm::{Decode, Direct, Requantise};
+    if let Some(common) = common_selection(operand, facts, WeightFormat::F32) {
+        return common;
+    }
+    let refuse = |kind, considered| {
+        Box::new(SelectionRefusal {
+            operand: operand.operand.clone(),
+            operation: operand.operation,
+            representation: facts.label.clone(),
+            requested: operand.access,
+            kind,
+            considered,
+        })
+    };
+    let Some(class) = class_of(operand.operation) else {
+        return Err(refuse(RefusalKind::MissingRealization, vec![]));
+    };
+    if facts.registered.is_none() {
+        return Err(refuse(RefusalKind::UnregisteredRepresentation, vec![]));
+    }
+    let candidates = cpu_projection_candidates(facts, PhysicalProjectionPlan::BlasF32, &REQUANTISE);
+    let has = |form: RealizationForm| candidates.iter().any(|c| c.form == form);
+    let decode = RealizationId::cpu(Decode(PhysicalProjectionPlan::BlasF32));
+    let pick = |id: RealizationId, reason: SelectionReason| {
+        Ok(Selection {
+            realization: id,
+            residency: realization_residency(facts, id),
+            reason,
+            candidates: candidates.clone(),
+        })
+    };
+    if has(Direct(PhysicalProjectionPlan::FusedNvfp4)) {
+        return pick(
+            RealizationId::cpu(Direct(PhysicalProjectionPlan::FusedNvfp4)),
+            SelectionReason::DirectDeclared,
+        );
+    }
+    if has(Direct(PhysicalProjectionPlan::FusedKQuant)) {
+        return match kquant {
+            KQuantExecution::Direct => pick(
+                RealizationId::cpu(Direct(PhysicalProjectionPlan::FusedKQuant)),
+                SelectionReason::DirectDeclared,
+            ),
+            KQuantExecution::Widen => pick(decode, SelectionReason::ArmPrefersDecode),
+        };
+    }
+    // The checkpoint's own fine-grained FP8 bytes, executed in place with
+    // their scale grid retained. Ranked with the compiled packs above and
+    // for the same reason: the stored bytes are the compact form, and the
+    // only alternative is a widened image — 612 GB of a 306 GB checkpoint
+    // on GLM-5.3-Flash — which stays a candidate for the oracle and is
+    // never the policy's choice.
+    if has(Direct(PhysicalProjectionPlan::FusedFp8Block)) {
+        return pick(
+            RealizationId::cpu(Direct(PhysicalProjectionPlan::FusedFp8Block)),
+            SelectionReason::DirectDeclared,
+        );
+    }
+    // The size policy is asked whether a bf16 image is worth keeping
+    // compact — and the fact it is asked about is the codec DECLARING the
+    // direct bf16 kernel, not a dtype the loader compared.
+    let bf16_kernel_declared = has(Direct(PhysicalProjectionPlan::FusedBf16));
+    let plan = PhysicalProjectionPlan::choose_for(
+        Some(class),
+        operand.logical_elements,
+        bf16_kernel_declared,
+    );
+    let form = if has(Direct(plan)) {
+        Direct(plan)
+    } else if plan.format() == WeightFormat::F32 {
+        Decode(plan)
+    } else {
+        Requantise(plan)
+    };
+    if !has(form) {
+        return Err(refuse(
+            RefusalKind::MissingRealization,
+            candidates
+                .iter()
+                .map(|c| {
+                    (
+                        *c,
+                        "not the resident form the size policy chose".to_string(),
+                    )
+                })
+                .collect(),
+        ));
+    }
+    let reason = match form {
+        _ if facts.overlaid => SelectionReason::OverlaidEdit,
+        Direct(_) if !bf16_kernel_declared => SelectionReason::DirectDeclared,
+        Decode(_) if !bf16_kernel_declared => SelectionReason::NoDirectRealization,
+        _ => SelectionReason::SizePolicy,
+    };
+    pick(RealizationId::cpu(form), reason)
 }
 
 impl PlanBackend for ProductionBackend {
@@ -637,25 +1093,23 @@ impl PlanBackend for ProductionBackend {
         &ExecutorProjections
     }
 
-    /// **The policy.** One decision per matrix, producing the format here
-    /// and the kernel at [`project_rows`] — see
-    /// [`PhysicalProjectionPlan`].
-    fn weight_format(&self, operand: MatrixOperand) -> WeightFormat {
-        match operand.class {
-            // The packed bank is widened to f32 on the way in and sliced
-            // into per-expert matrices; there are no stored bytes left to
-            // keep by the time a format could apply.
-            MatrixClass::RoutedExpertBank => WeightFormat::F32,
-            MatrixClass::AttentionProjection
-            | MatrixClass::FfnProjection
-            | MatrixClass::OutputHead => {
-                PhysicalProjectionPlan::choose(operand.elements, operand.stored_bf16).format()
-            }
-        }
+    /// **The policy.** One decision per matrix, producing the resident
+    /// form here and the kernel at [`project_rows`] — see
+    /// [`PhysicalProjectionPlan`] and [`select_cpu`].
+    fn select(
+        &self,
+        operand: &PlannedOperand,
+        facts: &RepresentationFacts,
+    ) -> Result<Selection, Box<SelectionRefusal>> {
+        select_cpu(operand, facts, kquant_execution())
     }
 
     fn name(&self) -> &str {
         NAME
+    }
+
+    fn identity(&self) -> LoweringIdentity {
+        LoweringIdentity::new(IDENTITY_FAMILY, IDENTITY_REVISION)
     }
 
     fn embed(&self, table: &[f32], hidden: usize, token: u32, scale: Option<f32>) -> Vec<f32> {
@@ -741,99 +1195,175 @@ impl PlanBackend for ProductionBackend {
     }
 
     fn attention_step(&self, step: AttentionStepCall<'_>) -> Result<AttentionStepOut, VindexError> {
-        let call = &step.op;
-        let pre = &call.inputs[0];
-        let ProjectedAttention {
-            qkv: (q, k, v),
-            gate,
-        } = Self::project_position(call, step.position, pre)?;
-        let output = Self::attend_position(
-            call,
-            step.position,
-            &q,
-            |p| {
-                if p == step.position {
-                    k.as_slice()
-                } else {
-                    step.keys[p].as_slice()
-                }
-            },
-            |p| {
-                if p == step.position {
-                    v.as_slice()
-                } else {
-                    step.values[p].as_slice()
-                }
-            },
-            pre,
-            gate.as_deref(),
-        )?;
-        Ok(AttentionStepOut {
-            key: k,
-            value: v,
-            output,
-        })
+        Self::attention_step_tapped(step, None, None)
+    }
+
+    fn serves_attention_heads(&self) -> bool {
+        true
+    }
+
+    fn attention_step_observed(
+        &self,
+        step: AttentionStepCall<'_>,
+        tap: &mut dyn FnMut(AttentionHeadRecord<'_>),
+    ) -> Result<AttentionStepOut, VindexError> {
+        Self::attention_step_tapped(step, Some(tap), None)
+    }
+
+    fn serves_head_intervention(&self) -> bool {
+        true
+    }
+
+    fn attention_step_intervened(
+        &self,
+        step: AttentionStepCall<'_>,
+        tap: Option<&mut dyn FnMut(AttentionHeadRecord<'_>)>,
+        head_intervene: &mut super::backend::HeadIntervene<'_>,
+    ) -> Result<AttentionStepOut, VindexError> {
+        Self::attention_step_tapped(step, tap, Some(head_intervene))
     }
 
     fn ffn(&self, call: FfnCall<'_>) -> Result<Vec<f32>, VindexError> {
-        require_plain_gate("production", call.gate_policy)?;
+        require_executable_gate("production", call.gate_policy)?;
         let up = project_matrix(&call.up, call.x, call.intermediate, call.hidden)?;
         let gate = match call.gate {
             Some(w) => Some(project_matrix(&w, call.x, call.intermediate, call.hidden)?),
             None => None,
         };
-        // The activation ONLY. The three projections around it are timed
-        // by the executor, and a timer that spanned them would make this
-        // class the whole FFN.
-        let activation = timed(OpClass::FfnActivation);
-        let inner: Vec<f32> = match &gate {
-            Some(gate) => {
-                match call.activation {
-                    Activation::Silu => geglu_silu_alloc(gate, &up),
-                    // The served Gemma gate/up kernel (tanh-approximated
-                    // GELU on the gate, times up).
-                    Activation::GeluTanh => gate
-                        .iter()
-                        .zip(&up)
-                        .map(|(g, u)| gelu_tanh(*g) * u)
-                        .collect(),
-                    other => return Err(unsupported_activation("gated", other)),
-                }
-            }
-            None => match call.activation {
-                Activation::Silu => up.iter().map(|u| silu(*u)).collect(),
-                Activation::GeluTanh => up.iter().map(|u| gelu_tanh(*u)).collect(),
-                other => return Err(unsupported_activation("ungated", other)),
-            },
-        };
-        drop(activation);
+        let inner = ffn_activation(gate.as_deref(), &up, call.activation, call.gate_policy)?;
         project_matrix(&call.down, &inner, call.hidden, call.intermediate)
     }
 
-    fn routed_ffn(&self, call: RoutedFfnCall<'_>) -> Result<Vec<f32>, VindexError> {
-        let routed_input = router_input(&call)?;
-        let mut logits = matmul_vec(&routed_input, call.router, call.experts, call.hidden);
-        let selected = select_experts(&call, &mut logits)?;
-        let two_inter = FUSED_BRANCHES * call.intermediate;
-        let mut out = vec![0.0f32; call.hidden];
-        for (expert, weight) in selected {
-            let mut fused = matmul_vec(
-                call.x,
-                call.gate_up[expert].as_f32()?,
-                two_inter,
-                call.hidden,
-            );
-            add_expert_bias(&mut fused, call.gate_up_bias, expert);
-            let inner = expert_inner(&call, &fused);
-            let mut expert_out = matmul_vec(
-                &inner,
-                call.down[expert].as_f32()?,
-                call.hidden,
+    /// **CPU-7C2.** The dense FFN over several positions, with each
+    /// projection taken as ONE weight traversal.
+    ///
+    /// The activation stays per position — it is elementwise, it is small
+    /// against the projections, and grouping it would be a change to the
+    /// arithmetic rather than to the schedule.
+    ///
+    /// Note what is NOT here: no `par_iter` over positions. Rows own the
+    /// machine and positions live inside the row traversal. The previous
+    /// shape ran positions in parallel and each of them re-entered the
+    /// executor, where `caller_owns_the_machine` collapsed every
+    /// projection to a single worker — CPU-7C1 measured that as
+    /// `slabs/call` 5.03 -> 2.81 and a 42% loss against serial decode.
+    fn ffn_many(&self, call: FfnManyCall<'_>) -> Result<Vec<Vec<f32>>, VindexError> {
+        require_executable_gate("production", call.gate_policy)?;
+        let ups = project_matrix_many(&call.up, call.xs, call.intermediate, call.hidden)?;
+        let gates = match &call.gate {
+            Some(w) => Some(project_matrix_many(
+                w,
+                call.xs,
                 call.intermediate,
-            );
-            add_expert_bias(&mut expert_out, call.down_bias, expert);
-            for (acc, v) in out.iter_mut().zip(&expert_out) {
-                *acc += weight * v;
+                call.hidden,
+            )?),
+            None => None,
+        };
+        let inners: Vec<Vec<f32>> = (0..call.xs.len())
+            .map(|p| {
+                ffn_activation(
+                    gates.as_ref().map(|g| g[p].as_slice()),
+                    &ups[p],
+                    call.activation,
+                    call.gate_policy,
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        let refs: Vec<&[f32]> = inners.iter().map(Vec::as_slice).collect();
+        project_matrix_many(&call.down, &refs, call.hidden, call.intermediate)
+    }
+
+    fn routed_ffn(&self, call: RoutedFfnCall<'_>) -> Result<Vec<f32>, VindexError> {
+        let selected = {
+            let _stage = stage(Stage::Router);
+            let routed_input = router_input(&call)?;
+            // The router's `k` is the width of what it READS, which is
+            // not `call.hidden` once the experts run behind a bottleneck:
+            // `call.hidden` is then the latent width, while the router
+            // still projects from the block input. Taking it from the
+            // vector itself keeps the two impossible to desync.
+            let k = routed_input.len();
+            let mut logits = matmul_vec(&routed_input, call.router, call.experts, k);
+            select_experts(&call, &mut logits)?
+        };
+        routing_trace::record(&selected);
+        if let ExpertSlices::Separate {
+            gate,
+            up,
+            down,
+            access,
+        } = &call.weights
+        {
+            // The selected experts' pages, ahead of the loop that reads
+            // them — the access realization, timed apart from the loop
+            // so a fault moved is a fault moved, not a fault removed.
+            let _prefetch = stage(Stage::Prefetch);
+            let ranges: Vec<prefetch::Range> = selected
+                .iter()
+                .flat_map(|(e, _)| [&gate[*e], &up[*e], &down[*e]])
+                .filter_map(|w| match w {
+                    WeightSlice::Bf16(rows) => Some(prefetch::Range::of(rows)),
+                    WeightSlice::F32(rows) => Some(prefetch::Range::of(rows)),
+                    _ => None,
+                })
+                .collect();
+            let parallelism = super::cpu::shared().map(|e| e.workers()).unwrap_or(1);
+            prefetch::prefetch(*access, &ranges, parallelism);
+        }
+        let _stage = stage(Stage::RoutedExperts);
+        let mut out = vec![0.0f32; call.hidden];
+        match call.weights {
+            ExpertSlices::Fused {
+                gate_up,
+                down,
+                layout,
+            } => {
+                let two_inter = FUSED_BRANCHES * call.intermediate;
+                for (expert, weight) in selected {
+                    let mut fused =
+                        matmul_vec(call.x, gate_up[expert].as_f32()?, two_inter, call.hidden);
+                    add_expert_bias(&mut fused, call.gate_up_bias, expert);
+                    let inner = expert_inner(&call, layout, &fused);
+                    let mut expert_out = matmul_vec(
+                        &inner,
+                        down[expert].as_f32()?,
+                        call.hidden,
+                        call.intermediate,
+                    );
+                    add_expert_bias(&mut expert_out, call.down_bias, expert);
+                    for (acc, v) in out.iter_mut().zip(&expert_out) {
+                        *acc += weight * v;
+                    }
+                }
+            }
+            // A per-expert bank: each selected expert's three whole
+            // matrices run through the SAME production projection
+            // kernels a dense FFN uses — bf16 in place, f32 through BLAS
+            // — so the bank stays in its stored form. No bias layout is
+            // defined for separate experts, and none is planned; one
+            // arriving here is a plan the executor does not know.
+            ExpertSlices::Separate { gate, up, down, .. } => {
+                if call.gate_up_bias.is_some() || call.down_bias.is_some() {
+                    return Err(VindexError::Parse(
+                        "a per-expert bank carries no expert bias; the call declares one"
+                            .to_string(),
+                    ));
+                }
+                let rule = MoeGateRule::from_arch(call.gate_policy, call.activation);
+                for (expert, weight) in selected {
+                    let g = project_matrix(&gate[expert], call.x, call.intermediate, call.hidden)?;
+                    let u = project_matrix(&up[expert], call.x, call.intermediate, call.hidden)?;
+                    let inner: Vec<f32> = g
+                        .iter()
+                        .zip(&u)
+                        .map(|(g, u)| rule.combine(*g, *u))
+                        .collect();
+                    let expert_out =
+                        project_matrix(&down[expert], &inner, call.hidden, call.intermediate)?;
+                    for (acc, v) in out.iter_mut().zip(&expert_out) {
+                        *acc += weight * v;
+                    }
+                }
             }
         }
         Ok(out)

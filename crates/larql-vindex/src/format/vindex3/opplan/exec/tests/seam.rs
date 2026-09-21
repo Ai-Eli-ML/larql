@@ -25,6 +25,7 @@ use crate::format::vindex3::opplan::exec::backend::{
     AttentionCall, AttentionOut, AttentionStepCall, AttentionStepOut, FfnCall, NormCall,
     PlanBackend, ProjectCall, RoutedFfnCall, WeightSlice,
 };
+use crate::format::vindex3::opplan::exec::lowering::LoweringIdentity;
 use crate::format::vindex3::opplan::exec::operands::OperandStore;
 use crate::format::vindex3::opplan::exec::production::ProductionBackend;
 use crate::format::vindex3::opplan::exec::reference::ReferenceBackend;
@@ -58,6 +59,10 @@ impl RecordingBackend {
 impl PlanBackend for RecordingBackend {
     fn name(&self) -> &str {
         "recording"
+    }
+
+    fn identity(&self) -> LoweringIdentity {
+        LoweringIdentity::new("test-recording", 1)
     }
 
     fn embed(&self, table: &[f32], hidden: usize, token: u32, scale: Option<f32>) -> Vec<f32> {
@@ -123,6 +128,10 @@ struct PerturbedBackend(ReferenceBackend);
 impl PlanBackend for PerturbedBackend {
     fn name(&self) -> &str {
         "perturbed"
+    }
+
+    fn identity(&self) -> LoweringIdentity {
+        LoweringIdentity::new("test-perturbed", 1)
     }
 
     fn embed(&self, table: &[f32], hidden: usize, token: u32, scale: Option<f32>) -> Vec<f32> {
@@ -204,12 +213,12 @@ fn a_delegating_backend_reproduces_the_reference_trace_bit_for_bit() {
 
     for (layer, (a, b)) in reference.layers.iter().zip(&recorded.layers).enumerate() {
         assert_eq!(
-            max_abs(&a.post_attention, &b.post_attention),
+            max_abs(a.post_attention.rows(), b.post_attention.rows()),
             0.0,
             "layer {layer} post_attention differs across backends"
         );
         assert_eq!(
-            max_abs(&a.post_layer, &b.post_layer),
+            max_abs(a.post_layer.rows(), b.post_layer.rows()),
             0.0,
             "layer {layer} post_layer differs across backends"
         );
@@ -276,8 +285,8 @@ fn a_backend_with_different_arithmetic_changes_the_result() {
     let perturbed = run_on(container.path(), &PerturbedBackend(ReferenceBackend::new()));
 
     let divergence = max_abs(
-        &reference.layers[0].post_attention,
-        &perturbed.layers[0].post_attention,
+        reference.layers[0].post_attention.rows(),
+        perturbed.layers[0].post_attention.rows(),
     );
     assert!(
         divergence > 0.0,
@@ -319,14 +328,14 @@ fn the_triangle_closes_on_the_miniature_fixture() {
             (
                 "post_attention",
                 &golden.layers[layer].post_attention,
-                &reference.layers[layer].post_attention,
-                &production.layers[layer].post_attention,
+                reference.layers[layer].post_attention.rows(),
+                production.layers[layer].post_attention.rows(),
             ),
             (
                 "post_layer",
                 &golden.layers[layer].post_layer,
-                &reference.layers[layer].post_layer,
-                &production.layers[layer].post_layer,
+                reference.layers[layer].post_layer.rows(),
+                production.layers[layer].post_layer.rows(),
             ),
         ] {
             let vs_golden = max_abs(p, g);

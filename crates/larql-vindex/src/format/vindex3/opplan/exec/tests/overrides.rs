@@ -35,7 +35,7 @@ fn fixture() -> (tempfile::TempDir, ComponentOpPlan, OperandStore) {
 /// Layer 0's dense FFN gate operand — the compose install's target.
 fn gate_ref(plan: &ComponentOpPlan) -> crate::format::vindex3::opplan::OperandRef {
     match &plan.layers[0].ffn {
-        LayerFfn::Dense(op) => op.gate.clone().expect("miniature FFN is gated"),
+        Some(LayerFfn::Dense(op)) => op.gate.clone().expect("miniature FFN is gated"),
         other => panic!("miniature layer 0 is dense, got {other:?}"),
     }
 }
@@ -57,7 +57,11 @@ fn an_empty_source_is_the_bare_store_bit_for_bit() {
 
     assert_eq!(base.logits, overlaid.logits, "logits diverge");
     for (a, b) in base.layers.iter().zip(&overlaid.layers) {
-        assert_eq!(a.post_layer, b.post_layer, "a residual diverges");
+        assert_eq!(
+            a.post_layer.rows(),
+            b.post_layer.rows(),
+            "a residual diverges"
+        );
     }
 }
 
@@ -107,7 +111,7 @@ fn a_row_override_is_observed_by_execution_and_reverts_cleanly() {
 fn a_column_override_lands_on_the_declared_column() {
     let (_c, plan, store) = fixture();
     let down = match &plan.layers[0].ffn {
-        LayerFfn::Dense(op) => op.down.clone(),
+        Some(LayerFfn::Dense(op)) => op.down.clone(),
         other => panic!("miniature layer 0 is dense, got {other:?}"),
     };
     let (rows, cols) = (down.shape[0], down.shape[1]);

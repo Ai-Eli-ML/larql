@@ -91,6 +91,35 @@ pub struct ArchitectureInventory {
 pub struct Identity {
     /// `model_type`, read from `text_config` first, then top level.
     pub model_type: String,
+    /// The *other* declaration, when a nested text config supplied
+    /// [`Self::model_type`] and the container declares one too.
+    ///
+    /// Kept because the two are not interchangeable facts and the reader
+    /// above throws one of them away. Kimi K3 declares `kimi_k3` at the
+    /// container and `kimi_linear` under `text_config`, and taking the
+    /// text declaration alone dispatches a 93-layer, 1.56 TB model to the
+    /// Kimi-Linear-48B implementation.
+    ///
+    /// K3-ARCH-1 registered `kimi_k3` and had it declare `kimi_linear` as
+    /// its text component, so the container reading no longer falls to
+    /// the generic architecture: it resolves to a registry entry that is
+    /// identified and deliberately not executable. That makes the gate's
+    /// job narrower, not unnecessary — a container declaring a family it
+    /// does NOT relate to its text component still refuses, and only both
+    /// declarations surviving lets the gate tell the two cases apart.
+    ///
+    /// Registry lookup only. `detect_from_json` still prefers
+    /// `text_config.model_type` and hands a real K3 config to the
+    /// ancestor; that gap is pinned in `architectures::kimi_k3` and is
+    /// the reason this field cannot be collapsed into one reading.
+    ///
+    /// `None` when the config is flat, or when only one level declares.
+    /// Usually equal-in-meaning rather than conflicting — 27 of the 28
+    /// checkpoints in the conformance corpus that declare at both levels
+    /// use the `<container>_text` suffix form — so the divergence that
+    /// matters is not string inequality but the two resolving to
+    /// different architectures.
+    pub container_model_type: Option<String>,
     /// HF `architectures` list, verbatim.
     pub architectures: Vec<String>,
     /// Checkpoint dtype (`dtype` or `torch_dtype`).
@@ -118,6 +147,24 @@ pub struct Detection {
     pub validation_errors: Vec<String>,
 }
 
+/// Where the resolution's `vocab_size` came from.
+///
+/// Two authorities can answer, and the answer is recorded beside the
+/// number so a consumer never has to guess which one spoke. The
+/// embedding table's row count is the fact the output head actually
+/// runs against (the tied head emits exactly that many logits), so it is
+/// evidence for the width, not a default standing in for one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum VocabSizeProvenance {
+    /// The checkpoint declares `vocab_size` (root or `text_config`).
+    Declared,
+    /// The checkpoint omits it — Gemma 3 leaves it at the HF class
+    /// default — and the embedding table's row count answered. `tensor`
+    /// is the name as the estate spells it.
+    EmbeddingRows { tensor: String },
+}
+
 /// The topology the serving path would run, including the per-layer
 /// attention policy table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,11 +172,27 @@ pub struct ResolvedTopology {
     pub num_layers: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    /// Per-layer dense-FFN width a derived checkpoint declares; `None`
+    /// means every layer runs at `intermediate_size`. Additive: an
+    /// inventory JSON written before it reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffn_intermediate_size_by_layer: Option<Vec<usize>>,
     pub num_q_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub vocab_size: Option<usize>,
+    /// Which authority answered `vocab_size`. Additive: an inventory JSON
+    /// written before it reads as `None`, which for a declared vocab is
+    /// the only answer it could have had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocab_size_provenance: Option<VocabSizeProvenance>,
     pub sliding_window: Option<usize>,
+    /// How far the programme is declared to run — `max_position_embeddings`
+    /// or a family's spelling of it. Read here so the graph can record it:
+    /// the encoder already judged it execution-semantic, and a judged fact
+    /// with nowhere to land is the same as an unread one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<usize>,
     pub attention: AttentionSummary,
     /// One entry per layer, in layer order.
     pub layers: Vec<LayerPolicy>,
@@ -142,6 +205,52 @@ pub struct ResolvedTopology {
     /// any. `None` on a model whose every layer attends by softmax.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_attention: Option<LinearAttentionTopology>,
+    /// The KDA block's declared geometry, when the checkpoint declares one
+    /// (`linear_attn_config`). Disjoint from [`Self::linear_attention`] in
+    /// every observed checkpoint: the two describe different operators, so
+    /// carrying them in one field would force a reader to guess which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda: Option<crate::config::KdaGeometry>,
+    /// KDA's decay-gate lower bound (`linear_attn_config.gate_lower_bound`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_gate_lower_bound: Option<f32>,
+    /// What the family's reference actually does with
+    /// [`Self::kda_gate_lower_bound`] — an architecture fact, resolved by
+    /// [`ModelArchitecture::kda_gate_form`](crate::config::ModelArchitecture::kda_gate_form),
+    /// because the declared value does not determine it. `None` = the
+    /// family has not been judged, which must reach a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_gate_form: Option<crate::config::KdaGateForm>,
+    /// The FORM of KDA's output gate (`linear_attn_config.use_full_rank_gate`),
+    /// verbatim: `Some(true)` = one full-rank `g_proj`, `Some(false)` = the
+    /// low-rank pair, `None` = undeclared (the reference's own default is the
+    /// pair). Carried as declared so an executor can hold the shipped
+    /// operands to it rather than infer the form from them. K3-REP-GATE-1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_use_full_rank_gate: Option<bool>,
+    /// The Mamba2 mixer's declared geometry, when the checkpoint declares
+    /// one. Disjoint from [`Self::linear_attention`] and [`Self::kda`] in
+    /// every observed checkpoint — a third recurrence family, and the
+    /// geometries are not interchangeable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mamba2: Option<crate::config::Mamba2Geometry>,
+    /// How the Mamba2 geometry was read: dialect and recorded family
+    /// defaults. Present exactly when [`Self::mamba2`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mamba2_provenance: Option<crate::config::Mamba2Provenance>,
+    /// The hybrid stack's conv-QKV attention geometry, when declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_qkv_attn: Option<crate::config::ConvQkvAttnGeometry>,
+    /// How the conv-QKV geometry was read: dialect and recorded family
+    /// defaults. Present exactly when [`Self::conv_qkv_attn`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_qkv_provenance: Option<crate::config::ConvQkvProvenance>,
+    /// `pad_vocab_size_multiple` — the embedding rows are the declared
+    /// vocab rounded UP to this multiple (mamba_ssm lineage). The head
+    /// genuinely emits the padded width; the declared vocab names the
+    /// meaningful prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_vocab_size_multiple: Option<usize>,
 }
 
 /// The precision a recurrent state is kept at.
@@ -284,6 +393,15 @@ pub struct ResolvedExecution {
     /// recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moe: Option<MoeExecution>,
+    /// Multi-Latent Attention geometry when the family declares one
+    /// (`ModelArchitecture::uses_mla`); `None` = ordinary per-position K/V
+    /// attention. Applies to every [`LayerPolicy`] whose declared kind is
+    /// [`crate::config::LayerKind::Full`] — MLA compresses the KV cache,
+    /// not the FFN, so it is orthogonal to `moe`'s dense-prefix layers and
+    /// uniform across a family's non-recurrent layers, the same way KDA's
+    /// geometry is uniform across its recurrent ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mla: Option<MlaExecution>,
     pub activation: crate::config::Activation,
     pub ffn_type: crate::config::FfnType,
     /// How the FFN's gate combines with its up branch. `Gated` is the
@@ -327,6 +445,41 @@ pub struct ResolvedExecution {
     /// declares no such operation, distinct from `Some(1.0)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub residual_scale: Option<f32>,
+    /// Whether the residual stream is kept at fp32 against a
+    /// lower-precision model (`residual_in_fp32`), verbatim. `None` = the
+    /// checkpoint declares nothing, which is not `false` — an executor
+    /// must not choose a residual precision the checkpoint never stated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_in_fp32: Option<bool>,
+    /// How the residual stream is shaped and recombined across this
+    /// component. A component fact, because every consumer of the
+    /// residual — embedding, branch operators, head — must agree.
+    ///
+    /// `None` means the checkpoint declared the topology PARTIALLY and
+    /// nothing resolved it. That is deliberately not the same as
+    /// `Some(SingleStream)`: defaulting a half-declared bundle to one
+    /// stream is precisely the failure this field exists to prevent, so
+    /// the surface refuses to build instead.
+    #[serde(default = "single_stream_topology")]
+    pub residual_topology: Option<crate::config::ResidualTopology>,
+    /// Why [`Self::residual_topology`] is absent, verbatim from the one
+    /// authority that decided it
+    /// ([`ModelArchitecture::residual_topology`](crate::config::ModelArchitecture::residual_topology)).
+    ///
+    /// Two different declarations resolve to nothing and they mean
+    /// opposite things to whoever acts on them: a Sinkhorn declaration
+    /// missing a parameter may be a topology this build has not judged,
+    /// while a checkpoint declaring TWO topologies has told this build
+    /// two incompatible things about one residual. A single hardcoded
+    /// reason downstream sent a reader of the second case to look for a
+    /// missing iteration count, so the reason travels with the absence
+    /// rather than being re-invented where it is printed.
+    ///
+    /// `Some` exactly when [`Self::residual_topology`] is `None` on an
+    /// inventory this build resolved; both `None` on a pre-existing
+    /// inventory JSON written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_topology_refusal: Option<String>,
     /// Whether a missing standalone output-head tensor means "tied to the
     /// embedding matrix" rather than "lost". See
     /// [`ModelArchitecture::output_head_reuses_embedding`](crate::config::ModelArchitecture::output_head_reuses_embedding).
@@ -353,10 +506,18 @@ pub struct LayerPolicy {
     /// [`Self::declared_span`] is the finer-grained fact when the
     /// checkpoint states one.
     pub attention: String,
-    /// The checkpoint's own `layer_types` entry for this layer, verbatim,
-    /// when it declares one. `None` when the config states no per-layer
-    /// array (an implicit stride, or a plain single-attention-type model)
-    /// — [`Self::attention`] is then the only source of truth.
+    /// The checkpoint's own per-layer declaration for this layer, in
+    /// `layer_types` vocabulary.
+    ///
+    /// Verbatim from `layer_types` when the checkpoint writes that array.
+    /// When it does not, the equivalent declaration in the index-set
+    /// spelling (`linear_attn_config.{kda_layers, full_attn_layers}`)
+    /// answers instead, normalised into the same vocabulary — the fact is
+    /// the same one, and carrying two spellings downstream would grow a
+    /// second code path in every consumer. `None` only when the checkpoint
+    /// states no per-layer split at all (an implicit stride, or a plain
+    /// single-attention-type model) — [`Self::attention`] is then the only
+    /// source of truth.
     ///
     /// Carries a vocabulary [`Self::attention`] cannot: a hybrid
     /// linear-attention interleave (`"linear_attention"`) is neither
@@ -365,6 +526,12 @@ pub struct LayerPolicy {
     /// §4.7.8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_span: Option<String>,
+    /// The same declaration in the canonical vocabulary, carrying what the
+    /// `layer_types` spelling cannot: which recurrence family, and a
+    /// sliding layer's window. `None` when the checkpoint declares no
+    /// per-layer topology, or declared one this build could not resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_kind: Option<crate::config::LayerKind>,
     /// Window size when sliding, `None` on full-attention layers.
     pub window: Option<usize>,
     /// How this layer encodes position — rotary at a base, or not at all.
@@ -393,6 +560,15 @@ pub struct LayerPolicy {
 /// reads — none is re-derived from operand names downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MoeExecution {
+    /// Multiplier on the routed-expert branch (`routed_scaling_factor`).
+    /// `None` when undeclared — never 1.0, which is a different claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_scale: Option<f64>,
+    /// Leading layers that run a dense MLP instead of the routed block
+    /// (`first_k_dense_replace`). `None` when the checkpoint declares no
+    /// prefix; `Some(0)` is a declared absence of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_prefix_layers: Option<usize>,
     /// Routed experts per layer.
     pub experts: usize,
     /// Experts selected per token.
@@ -414,8 +590,109 @@ pub struct MoeExecution {
     pub gate_up_layout: Option<crate::config::GateUpLayout>,
     /// Always-active experts alongside the routed ones.
     pub shared_experts: usize,
+    /// The width of that always-active branch, resolved once by
+    /// [`ModelArchitecture::shared_expert_intermediate_size`](crate::config::ModelArchitecture::shared_expert_intermediate_size)
+    /// — the checkpoint's own key where it declares one, the
+    /// count-times-routed-width convention where it declares a count
+    /// instead. `None` iff [`Self::shared_experts`] is zero.
+    ///
+    /// Carried rather than re-derived downstream: the two conventions
+    /// disagree by 4x on Qwen1.5-MoE, so a second derivation is a second
+    /// answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_expert_intermediate_size: Option<usize>,
+    /// The gate on that branch's output, where the family runs one
+    /// (Qwen MoE's `sigmoid(shared_expert_gate(x)) *`). `None` = summed
+    /// unscaled, the DeepSeek/Kimi form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_expert_gate: Option<crate::config::SharedExpertGateSpec>,
     /// A dense MLP summed with the expert block every layer (Gemma 4 A4B).
     pub hybrid: bool,
+    /// Where the ROUTED experts run: at `hidden_size`, or behind a
+    /// bottleneck of their own width (Kimi-K3's
+    /// `routed_expert_hidden_size`).
+    ///
+    /// This is the authority every routed expert-bank shape is sized
+    /// from. It is not a hint that a wrapper operand exists: the form is
+    /// declared by config, and a checkpoint shipping wrapper tensors
+    /// under [`RoutedExpertForm::Uniform`](crate::config::RoutedExpertForm::Uniform)
+    /// fails operand closure rather than being re-read as latent.
+    ///
+    /// The router and the shared experts are deliberately NOT sized from
+    /// this — both read the un-projected block input at `hidden_size`,
+    /// and the shared branch is summed only after the up-projection.
+    #[serde(default, skip_serializing_if = "is_uniform_routed_form")]
+    pub routed_expert_form: crate::config::RoutedExpertForm,
+}
+
+/// Serde skip predicate: the uniform form is the overwhelming default,
+/// and omitting it keeps every non-latent container byte-unchanged.
+fn is_uniform_routed_form(form: &crate::config::RoutedExpertForm) -> bool {
+    !form.is_latent()
+}
+
+/// Multi-Latent Attention geometry, resolved once from the architecture.
+/// `None` on [`ResolvedExecution::mla`] means the family runs ordinary
+/// per-position K/V, not "MLA with defaulted dimensions" — every field
+/// here is load-bearing for the compressed-KV operand shapes, and a
+/// wrong-but-plausible default would silently accept a mis-shaped tensor.
+///
+/// Kimi Linear ships no `q_lora_rank` (`assert self.q_lora_rank is None`
+/// in the checkpoint's own `modeling_kimi.py` — Q is one dense
+/// projection, only K/V are low-rank compressed). A family that DOES
+/// compress Q needed its own extension rather than a guess from this
+/// one; [`MlaQueryForm`](crate::config::MlaQueryForm) is that extension,
+/// carried in [`Self::query`] as a form rather than as a bare rank, so
+/// that a layer without the factorisation cannot describe one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MlaExecution {
+    // (`query`'s serde default lives at `direct_query`, below.)
+    /// Query/output head count (`num_attention_heads`) — the decompressed
+    /// K/V side always produces this many heads' worth of output, not
+    /// `num_key_value_heads`: MLA's compression is the efficiency
+    /// mechanism, not a GQA-style head reduction after decompression.
+    pub num_heads: usize,
+    /// Compressed KV latent width (`kv_lora_rank`).
+    pub kv_lora_rank: usize,
+    /// Non-RoPE portion of the query/key head width.
+    pub qk_nope_head_dim: usize,
+    /// RoPE portion of the query/key head width, shared (MQA-style)
+    /// across every head from the SAME compressed projection.
+    pub qk_rope_head_dim: usize,
+    /// Value head width — independent of the query/key head width; MLA's
+    /// asymmetry is structural, not an approximation.
+    pub v_head_dim: usize,
+    /// Epsilon of the latent norm (`kv_a_layernorm`) that stands between
+    /// the compressed cache and its decompression — the family's own
+    /// reference value, NOT `rms_norm_eps` (see
+    /// [`ModelArchitecture::mla_kv_a_norm_eps`](crate::config::ModelArchitecture::mla_kv_a_norm_eps)).
+    ///
+    /// `None` = this family's reference has not been read for it, and an
+    /// executor must refuse rather than substitute the layer eps.
+    /// Defaults for inventories written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_a_norm_eps: Option<f64>,
+    /// Which query these layers build — one dense `q_proj`, or Kimi-K3's
+    /// `q_a_proj` -> `q_a_layernorm` -> `q_b_proj` factorisation under a
+    /// declared `q_lora_rank`.
+    ///
+    /// Resolved from the DECLARATION
+    /// ([`ModelArchitecture::mla_query_form`](crate::config::ModelArchitecture::mla_query_form)),
+    /// never from which operands the checkpoint ships: `q_proj` and
+    /// `q_b_proj` share a row count and differ only in their columns.
+    /// Defaults to `Direct` for inventories written before it was
+    /// recorded, which is what those checkpoints declared.
+    #[serde(default = "direct_query")]
+    pub query: crate::config::MlaQueryForm,
+    /// The output gate the checkpoint declares on its MLA layers
+    /// (`mla_use_output_gate: true`), as the generic gated-attention
+    /// operation it implements — the same spec the softmax family's
+    /// `attn_output_gate` resolves to, judged from Kimi-K3's own reference
+    /// ([`AttentionGateSpec::from_attention_input_sigmoid_before_output_projection`]).
+    /// `None` = no gate: undeclared, or declared `false`. Defaults for
+    /// inventories written before it was recorded. K3-REP-GATE-1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_gate: Option<crate::config::AttentionGateSpec>,
 }
 
 /// One flattened `config.json` leaf.
@@ -489,9 +766,158 @@ pub struct TensorFact {
     pub file: String,
 }
 
+/// Containers written before residual topology was a field carried one
+/// stream, which is what every family judged then used.
+fn single_stream_topology() -> Option<crate::config::ResidualTopology> {
+    Some(crate::config::ResidualTopology::SingleStream)
+}
+
+/// `serde` default for [`MlaExecution::query`]: what every inventory
+/// written before the query form was recorded declared.
+fn direct_query() -> crate::config::MlaQueryForm {
+    crate::config::MlaQueryForm::Direct
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A routed block with no bottleneck, for the serialisation arms
+    /// below. Every other field is arbitrary and unread by them.
+    fn uniform_moe() -> MoeExecution {
+        MoeExecution {
+            branch_scale: None,
+            dense_prefix_layers: None,
+            experts: 8,
+            top_k: 2,
+            expert_intermediate_size: 64,
+            router_kind: crate::config::MoeRouterKind::TopKSoftmax,
+            routing_policy: crate::config::ExpertRoutingPolicy::NormalisedOverSelected,
+            router_bias: false,
+            expert_format: crate::config::ExpertFormat::PerExpert,
+            gate_up_layout: None,
+            shared_experts: 0,
+            shared_expert_intermediate_size: None,
+            shared_expert_gate: None,
+            hybrid: false,
+            routed_expert_form: crate::config::RoutedExpertForm::Uniform,
+        }
+    }
+
+    /// **A routed block that declares no bottleneck serialises exactly
+    /// as it did before the latent form existed.**
+    ///
+    /// The skip predicate is the whole reason for this: `Uniform` is the
+    /// overwhelming default, and a container that started carrying
+    /// `routed_expert_form: "Uniform"` on every MoE row would make every
+    /// stored plan differ from its predecessor for a fact none of them
+    /// declares. Measured on the conformance corpus, this is what keeps
+    /// 108 of 109 rows byte-identical apart from the semantics stamp.
+    ///
+    /// The latent arm beside it is what stops this from having been
+    /// implemented as "never write the field": a declared bottleneck
+    /// must appear, or the container would silently lose it.
+    #[test]
+    fn a_routed_block_without_a_bottleneck_serialises_as_it_always_did() {
+        let uniform = serde_json::to_value(uniform_moe()).expect("serialises");
+        assert!(
+            uniform.get("routed_expert_form").is_none(),
+            "the uniform form must add nothing to the container: {uniform}"
+        );
+
+        let mut latent = uniform_moe();
+        latent.routed_expert_form = crate::config::RoutedExpertForm::Latent {
+            width: 3584,
+            norm: Some(crate::config::LatentNormSpec { eps: 1e-5 }),
+        };
+        let encoded = serde_json::to_value(latent).expect("serialises");
+        assert!(
+            encoded.get("routed_expert_form").is_some(),
+            "a declared bottleneck must reach the container: {encoded}"
+        );
+        assert_eq!(
+            serde_json::from_value::<MoeExecution>(encoded).expect("reads back"),
+            latent,
+            "and must round-trip unchanged"
+        );
+
+        // The absent field reads back as the uniform form, so a
+        // container written before this rung is not a container that
+        // declares something unknown.
+        assert_eq!(
+            serde_json::from_value::<MoeExecution>(uniform).expect("reads back"),
+            uniform_moe()
+        );
+    }
+
+    /// **The recurrent state dtype round-trips, and refuses what it
+    /// does not represent.**
+    ///
+    /// `None` means undeclared or spelled in a way this build cannot
+    /// represent — never "float32 by default". Qwen3.8 declares
+    /// `float32` against a bf16 model, so a defaulted answer would put
+    /// the recurrence at the model's precision and quietly change the
+    /// operator.
+    #[test]
+    fn the_recurrent_state_dtype_round_trips_and_refuses_the_unrepresented() {
+        for spelling in ["float32", "f32"] {
+            assert_eq!(
+                RecurrentStateDtype::from_declared(spelling),
+                Some(RecurrentStateDtype::Float32),
+                "`{spelling}` is a spelling of the same dtype"
+            );
+        }
+        assert_eq!(
+            RecurrentStateDtype::Float32.declared_name(),
+            "float32",
+            "the canonical spelling is what a container records"
+        );
+        assert_eq!(
+            RecurrentStateDtype::from_declared(RecurrentStateDtype::Float32.declared_name()),
+            Some(RecurrentStateDtype::Float32),
+            "the canonical spelling must parse back"
+        );
+        for unknown in ["bfloat16", "float16", "fp32", "", "FLOAT32"] {
+            assert_eq!(
+                RecurrentStateDtype::from_declared(unknown),
+                None,
+                "`{unknown}` is not represented, so it must be refused rather than \
+                 approximated by the one variant that exists"
+            );
+        }
+    }
+
+    /// **The linear-attention widths are DERIVED, so they cannot drift
+    /// from the head counts they come from.**
+    ///
+    /// Checked at Qwen3.8's real geometry, where the key and value sides
+    /// genuinely differ: `2·16·128 + 48·128 = 10240`, the observed
+    /// `in_proj_qkv` row count. A build that folded the two sides into
+    /// one head count would have to pick one, and either choice misses.
+    #[test]
+    fn the_linear_attention_widths_are_derived_from_both_sides() {
+        let qwen38 = LinearAttentionTopology {
+            key_heads: 16,
+            key_head_dim: 128,
+            value_heads: 48,
+            value_head_dim: 128,
+            conv_kernel: 4,
+            state_dtype: Some(RecurrentStateDtype::Float32),
+        };
+        assert_eq!(
+            qwen38.qkv_channels(),
+            10240,
+            "q and k at the KEY geometry, v at the value's"
+        );
+        assert_eq!(qwen38.value_width(), 6144);
+        // Folding the sides would give a different number either way,
+        // which is why they stay separate.
+        assert_ne!(
+            qwen38.qkv_channels(),
+            3 * qwen38.key_heads * qwen38.key_head_dim
+        );
+        assert_ne!(qwen38.qkv_channels(), 3 * qwen38.value_width());
+    }
 
     #[test]
     fn key_status_serialises_lowercase() {

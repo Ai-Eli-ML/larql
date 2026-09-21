@@ -8,14 +8,16 @@ use larql_models::config::ExpertFormat;
 
 use super::super::device::LoopDevice;
 use super::super::{lcg_values, norm_values, ShardBuilder};
-use crate::format::vindex3::encode::encode_system;
+use crate::format::vindex3::encode::encode_system_unenforced as encode_system;
 use crate::format::vindex3::inspect::inspect_container;
 use crate::format::vindex3::opplan::exec::backend::{WeightFormat, WeightFormats, WeightSlice};
 use crate::format::vindex3::opplan::exec::device::DevicePlanBackend;
 use crate::format::vindex3::opplan::exec::experts::FfnOperands;
 use crate::format::vindex3::opplan::exec::operands::OperandStore;
 use crate::format::vindex3::opplan::exec::weights::{quantize_mxfp4, LoadedWeight};
-use crate::format::vindex3::opplan::{plan_component_ops, ComponentOpPlan, LayerFfn, RoutedFfnOp};
+use crate::format::vindex3::opplan::{
+    plan_component_ops, ComponentOpPlan, ExpertBank, LayerFfn, RoutedFfnOp,
+};
 
 // ── Routed miniature geometry: MXFP4 needs k ≡ 0 (mod 32) on both projections ──
 pub(super) const HIDDEN: usize = 32;
@@ -290,6 +292,7 @@ pub(super) struct RoutedFixture {
     _container: tempfile::TempDir,
     pub(super) store: OperandStore,
     pub(super) op: RoutedFfnOp,
+    pub(super) plan: ComponentOpPlan,
 }
 
 pub(super) fn routed_fixture() -> RoutedFixture {
@@ -299,6 +302,8 @@ pub(super) fn routed_fixture() -> RoutedFixture {
     let (plan, store) = closed_plan(container.path());
     let op = plan.layers[0]
         .ffn
+        .as_ref()
+        .expect("layer 0 has an FFN")
         .routed()
         .expect("layer 0 is routed")
         .clone();
@@ -307,6 +312,7 @@ pub(super) fn routed_fixture() -> RoutedFixture {
         _container: container,
         store,
         op,
+        plan,
     }
 }
 
@@ -326,7 +332,10 @@ pub(super) fn bf16_carrier_store() -> (tempfile::TempDir, tempfile::TempDir, Ope
 pub(super) fn bf16_op(op: &RoutedFfnOp) -> RoutedFfnOp {
     let mut op = op.clone();
     op.expert_format = ExpertFormat::PackedBF16;
-    for projection in [&mut op.gate_up, &mut op.down] {
+    let ExpertBank::Packed { gate_up, down } = &mut op.bank else {
+        panic!("fixture builds a packed bank");
+    };
+    for projection in [gate_up, down] {
         projection.weights.tensor = projection
             .weights
             .tensor
@@ -341,14 +350,27 @@ pub(super) fn routed(op: &RoutedFfnOp) -> LayerFfn {
 }
 
 pub(super) fn load(op: &RoutedFfnOp, store: &OperandStore, format: WeightFormat) -> FfnOperands {
-    FfnOperands::load(&routed(op), store.into(), &|_: &OperandRef| format, format).unwrap()
+    FfnOperands::load(
+        &routed(op),
+        store.into(),
+        &|_: &OperandRef| Ok(format),
+        format.into(),
+        &|_: &OperandRef| Ok(format),
+    )
+    .unwrap()
 }
 
 pub(super) fn load_err(op: &RoutedFfnOp, store: &OperandStore, format: WeightFormat) -> String {
-    FfnOperands::load(&routed(op), store.into(), &|_: &OperandRef| format, format)
-        .err()
-        .expect("loading must refuse")
-        .to_string()
+    FfnOperands::load(
+        &routed(op),
+        store.into(),
+        &|_: &OperandRef| Ok(format),
+        format.into(),
+        &|_: &OperandRef| Ok(format),
+    )
+    .err()
+    .expect("loading must refuse")
+    .to_string()
 }
 
 /// A device backend that binds the FFN class in `format` and everything

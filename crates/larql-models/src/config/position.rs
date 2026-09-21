@@ -13,12 +13,58 @@
 //! [`PositionPolicy::from_declared_theta`]; everything downstream matches on
 //! the variant.
 
-use super::rope::YarnRopeScaling;
+use super::rope::{Llama3RopeScaling, YarnRopeScaling};
 use serde::{Deserialize, Serialize};
 
 /// The HF `layer_rope_theta` sentinel for "no positional encoding on this
 /// layer". Consumed at the parse boundary only.
 const NOPE_THETA_SENTINEL: f64 = 0.0;
+
+/// The `no_rope_layers` entry meaning "no positional encoding on this
+/// layer". Consumed at the parse boundary only, by
+/// [`PositionPolicy::rope_enabled_by_flag`].
+const NOPE_LAYER_FLAG: i64 = 0;
+
+/// Whether this build's rotary pairs dimensions by INTERLEAVING them.
+///
+/// It does not: `larql-compute`'s rope rotates `(x[i], x[i + half])` —
+/// split-half, HuggingFace's default and MLX's `traditional=False` — and
+/// there is exactly one pairing in the executor.
+///
+/// Declared here rather than left implicit because a checkpoint can SAY
+/// otherwise. SmolLM2-135M ships `rope_interleaved: false`, which agrees;
+/// the value of naming the fact is that a checkpoint shipping `true`
+/// becomes a mismatch the planner reports instead of a rotation quietly
+/// performed the other way round. An interleaved pairing rotates the same
+/// dimensions against different partners, so nothing about the output
+/// looks wrong — it is simply a different operator.
+///
+/// `larql-compute`'s `the_executor_pairs_split_half` pins the executor to
+/// this value, so the constant cannot drift away from the code it
+/// describes.
+pub const ROPE_PAIRING_INTERLEAVED: bool = false;
+
+/// The frequency-scaling family a checkpoint declares, resolved once.
+///
+/// One value rather than a pair of `Option`s so that "which family is
+/// this" has a single answer. Two independent options make a fourth state
+/// — both present — that no `rope_type` can express and nothing would
+/// have decided between.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeclaredRopeScaling {
+    /// The checkpoint declares no frequency scaling.
+    None,
+    Yarn(YarnRopeScaling),
+    Llama3(Llama3RopeScaling),
+    /// `rope_scaling = {rope_type: linear, factor}`: every position is
+    /// divided by `factor` before the rotation. The checkpoint-wide
+    /// declaration; which layers it reaches is the architecture's
+    /// answer (`ModelArchitecture::rope_position_divisor_for_layer` —
+    /// Gemma 3 applies it to its full-attention layers only).
+    Linear {
+        factor: f64,
+    },
+}
 
 /// How a layer encodes position.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -26,6 +72,46 @@ const NOPE_THETA_SENTINEL: f64 = 0.0;
 pub enum PositionPolicy {
     /// Rotary position embedding at the given base frequency.
     Rope { theta: f64 },
+    /// Rotary position embedding at `theta` with every position divided
+    /// by `factor` before the rotation — HF's `rope_type: "linear"`
+    /// (Llama 2 long-context variants; Gemma 3's global layers, whose
+    /// `rope_scaling = {linear, 8.0}` HF applies to full-attention
+    /// layers only).
+    ///
+    /// Its own variant for the reason [`Self::Llama3`] is: a consumer
+    /// that only knew `Rope { theta }` would rotate the global layers
+    /// eight times too fast on Gemma 3 and, because every backend
+    /// dropped the same fact, CPU-vs-Metal parity would never see it
+    /// (the defect `RopeScaling::to_config_json` records). Not YaRN (no
+    /// amplitude, no band ramp) and not Llama-3 (every frequency is
+    /// divided, not a wavelength band), so it folds into neither.
+    ///
+    /// A *carriage* variant, not new mathematics: `larql-compute`'s
+    /// `rope_freq_plan` has always taken a position divisor. What was
+    /// missing was a way for the container to say so, which is why
+    /// every Gemma 3 checkpoint was refused at `plan`.
+    Linear { theta: f64, factor: f64 },
+    /// Rotary position embedding at `theta`, with Llama-3 wavelength-band
+    /// frequency scaling.
+    ///
+    /// Its own variant for the reason [`Self::Yarn`] is: the block changes
+    /// what a forward pass computes, and a consumer that only knew
+    /// `Rope { theta }` would serve the model on unscaled frequencies. It
+    /// is *not* YaRN, and must not be folded into it — llama3 adjusts
+    /// frequencies by wavelength band and leaves `cos`/`sin` at unit
+    /// amplitude, where YaRN also rescales every logit at every position.
+    /// Folding the two would apply an attention-temperature change no
+    /// Llama checkpoint declares.
+    ///
+    /// This is a *carriage* variant, not new mathematics:
+    /// `larql-compute::attention::rope::llama3::apply_llama3_inv_freq`
+    /// has always implemented it. What was missing was a way for the
+    /// container to say so, which is why every Llama 3.x checkpoint was
+    /// refused at `plan` rather than served wrongly.
+    Llama3 {
+        theta: f64,
+        scaling: Llama3RopeScaling,
+    },
     /// Rotary position embedding at `theta`, with YaRN scaling: a
     /// per-dimension blend of extrapolated and interpolated frequencies
     /// **and** an amplitude on `cos`/`sin` that rescales every logit at
@@ -95,6 +181,23 @@ pub enum PositionPolicy {
         /// contiguous blocks (`TTT…HHH…WWW…`).
         interleaved: bool,
     },
+    /// A **relative** position scheme: position enters through a learned
+    /// relative term of width `d_rel` over a bounded `extent`, not through
+    /// any rotation of Q/K.
+    ///
+    /// Its own variant for the reason [`Self::Yarn`] and [`Self::MRope`]
+    /// are: a consumer that only knows rotary would otherwise be handed a
+    /// `theta` this checkpoint never declared and rotate a model that does
+    /// not rotate. Inkling-Small is the case — `d_rel: 16`,
+    /// `rel_extent: 1024`, and no rope key anywhere — and before this
+    /// variant it resolved to `Rope { theta }` at the parser's default
+    /// base, on all 42 layers.
+    ///
+    /// **Declared, not executable.** No backend consumes this yet; the
+    /// variant exists so the graph can say what the checkpoint said
+    /// instead of inventing a rotation, and so execution refuses
+    /// explicitly rather than running the wrong operator.
+    Relative { d_rel: usize, extent: usize },
     /// No positional encoding — the layer attends position-agnostically.
     None,
 }
@@ -159,12 +262,55 @@ impl PositionPolicy {
         }
     }
 
-    /// Interpret a declared per-layer theta under a checkpoint-wide YaRN
-    /// block: the NoPE sentinel still means none; a rotating layer carries
-    /// the scaling.
-    pub fn from_declared_theta_with_yarn(theta: f64, scaling: Option<YarnRopeScaling>) -> Self {
+    /// Whether one `no_rope_layers` entry means "this layer rotates".
+    ///
+    /// The second sentinel this type exists to honour exactly once, and
+    /// the more dangerous of the two, because **the key's name says the
+    /// opposite of its values**. SmolLM3's config documents *"A `1` at an
+    /// index position indicates that the corresponding layer will use
+    /// RoPE, while a `0` indicates that it's a NoPE layer"*, and both
+    /// SmolLM3 and Llama 4 read it as
+    /// `self.use_rope = config.no_rope_layers[layer_idx]`.
+    ///
+    /// So a reader who trusts the name inverts the entire schedule. On
+    /// SmolLM3-3B that is 27 of 36 layers rotated that should not be, and
+    /// 9 left unrotated that should be — a model that still emits fluent
+    /// text, which is exactly why it needs a named boundary rather than
+    /// an inline `!= 0` at each use site.
+    pub fn rope_enabled_by_flag(flag: i64) -> bool {
+        flag != NOPE_LAYER_FLAG
+    }
+
+    /// Whether the interval fallback rotates `layer`.
+    ///
+    /// Both references generate the mask as
+    /// `int((layer_idx + 1) % interval != 0)`, so every `interval`-th
+    /// layer counting from one is the NoPE layer.
+    ///
+    /// An interval of zero is not a schedule — upstream divides by it and
+    /// raises — so it leaves the layer UNSCHEDULED (rotating) rather than
+    /// answering. Answering `false` would turn a malformed declaration
+    /// into a silently NoPE model, which is the larger of the two
+    /// mistakes and the direction a plain `interval != 0 &&` guard falls
+    /// in.
+    pub fn rope_enabled_by_interval(layer: usize, interval: usize) -> bool {
+        interval == 0 || !(layer + 1).is_multiple_of(interval)
+    }
+
+    /// Interpret a declared per-layer theta under a checkpoint-wide
+    /// frequency-scaling block: the NoPE sentinel still means none; a
+    /// rotating layer carries the scaling.
+    pub fn from_declared_theta_with_scaling(theta: f64, scaling: DeclaredRopeScaling) -> Self {
         match (Self::from_declared_theta(theta), scaling) {
-            (Self::Rope { theta }, Some(scaling)) => Self::Yarn { theta, scaling },
+            (Self::Rope { theta }, DeclaredRopeScaling::Yarn(scaling)) => {
+                Self::Yarn { theta, scaling }
+            }
+            (Self::Rope { theta }, DeclaredRopeScaling::Llama3(scaling)) => {
+                Self::Llama3 { theta, scaling }
+            }
+            (Self::Rope { theta }, DeclaredRopeScaling::Linear { factor }) => {
+                Self::Linear { theta, factor }
+            }
             (policy, _) => policy,
         }
     }
@@ -175,10 +321,13 @@ impl PositionPolicy {
     pub fn rope_theta(self) -> Option<f64> {
         match self {
             Self::Rope { theta }
+            | Self::Linear { theta, .. }
             | Self::Yarn { theta, .. }
+            | Self::Llama3 { theta, .. }
             | Self::PartialRope { theta, .. }
             | Self::MRope { theta, .. } => Some(theta),
-            Self::None => None,
+            // A relative scheme has no base: it does not rotate.
+            Self::Relative { .. } | Self::None => None,
         }
     }
 
@@ -193,7 +342,14 @@ impl PositionPolicy {
             | Self::MRope {
                 rotary_fraction, ..
             } => Some(rotary_fraction),
-            Self::Rope { .. } | Self::Yarn { .. } | Self::None => None,
+            // Llama-3 and linear scaling adjust the frequencies of a FULL
+            // rotary; they state nothing about a rotated fraction.
+            Self::Rope { .. }
+            | Self::Linear { .. }
+            | Self::Yarn { .. }
+            | Self::Llama3 { .. }
+            | Self::Relative { .. }
+            | Self::None => None,
         }
     }
 
@@ -204,6 +360,8 @@ impl PositionPolicy {
     pub fn declared_rope_type(self) -> Option<&'static str> {
         match self {
             Self::Yarn { .. } => Some(super::rope_types::ROPE_TYPE_YARN),
+            Self::Llama3 { .. } => Some(super::rope_types::ROPE_TYPE_LLAMA3),
+            Self::Linear { .. } => Some(super::rope_types::ROPE_TYPE_LINEAR),
             Self::PartialRope {
                 basis: RotaryFrequencyBasis::HeadWidth,
                 ..
@@ -224,6 +382,7 @@ impl PositionPolicy {
                 ..
             }
             | Self::Rope { .. }
+            | Self::Relative { .. }
             | Self::None => None,
         }
     }
@@ -233,7 +392,50 @@ impl PositionPolicy {
     pub fn yarn(self) -> Option<YarnRopeScaling> {
         match self {
             Self::Yarn { scaling, .. } => Some(scaling),
-            Self::Rope { .. } | Self::PartialRope { .. } | Self::MRope { .. } | Self::None => None,
+            // Llama-3 is NOT a YaRN block and must not answer here. Its
+            // frequencies are adjusted by wavelength band and its
+            // amplitude stays at unity, where YaRN rescales every logit
+            // at every position; answering this accessor would apply an
+            // attention-temperature change no Llama checkpoint declares.
+            Self::Llama3 { .. }
+            | Self::Linear { .. }
+            | Self::Rope { .. }
+            | Self::PartialRope { .. }
+            | Self::MRope { .. }
+            | Self::Relative { .. }
+            | Self::None => None,
+        }
+    }
+
+    /// The Llama-3 wavelength-band block when the policy carries one;
+    /// `None` otherwise.
+    pub fn llama3(self) -> Option<Llama3RopeScaling> {
+        match self {
+            Self::Llama3 { scaling, .. } => Some(scaling),
+            Self::Yarn { .. }
+            | Self::Linear { .. }
+            | Self::Rope { .. }
+            | Self::PartialRope { .. }
+            | Self::MRope { .. }
+            | Self::Relative { .. }
+            | Self::None => None,
+        }
+    }
+
+    /// The linear position divisor when the policy carries one; `None`
+    /// otherwise — including for the unscaled layers of a checkpoint
+    /// whose declaration reaches only some layers (Gemma 3's sliding
+    /// layers rotate plain, so they answer nothing here).
+    pub fn linear(self) -> Option<f64> {
+        match self {
+            Self::Linear { factor, .. } => Some(factor),
+            Self::Llama3 { .. }
+            | Self::Yarn { .. }
+            | Self::Rope { .. }
+            | Self::PartialRope { .. }
+            | Self::MRope { .. }
+            | Self::Relative { .. }
+            | Self::None => None,
         }
     }
 
@@ -247,7 +449,13 @@ impl PositionPolicy {
                 interleaved,
                 ..
             } => Some((section, interleaved)),
-            Self::Rope { .. } | Self::Yarn { .. } | Self::PartialRope { .. } | Self::None => None,
+            Self::Rope { .. }
+            | Self::Linear { .. }
+            | Self::Yarn { .. }
+            | Self::Llama3 { .. }
+            | Self::PartialRope { .. }
+            | Self::Relative { .. }
+            | Self::None => None,
         }
     }
 
@@ -294,11 +502,61 @@ mod tests {
         );
     }
 
+    /// Gemma 3's global layers: `{rope_type: linear, factor: 8.0}` at
+    /// the family's global base. The tag is the HF spelling so a
+    /// container written by this build is read back as the same policy.
+    #[test]
+    fn linear_serialises_tagged_and_answers_its_own_accessors() {
+        let policy = PositionPolicy::Linear {
+            theta: 1e6,
+            factor: 8.0,
+        };
+        assert_eq!(
+            serde_json::to_string(&policy).unwrap(),
+            "{\"kind\":\"linear\",\"theta\":1000000.0,\"factor\":8.0}"
+        );
+        assert_eq!(policy.rope_theta(), Some(1e6));
+        assert_eq!(policy.linear(), Some(8.0));
+        assert_eq!(
+            policy.declared_rope_type(),
+            Some(super::super::rope_types::ROPE_TYPE_LINEAR)
+        );
+        // A full rotary: no fraction, and neither of the other blocks.
+        assert_eq!(policy.rotary_fraction(), None);
+        assert_eq!(policy.yarn(), None);
+        assert_eq!(policy.llama3(), None);
+        // And the plain policy answers nothing for the divisor — the
+        // sliding layers of the same checkpoint must not inherit it.
+        assert_eq!(PositionPolicy::Rope { theta: 1e4 }.linear(), None);
+    }
+
+    /// Composition at the declared-theta boundary: a plain rotary takes
+    /// the linear divisor; a NoPE sentinel does not grow one.
+    #[test]
+    fn linear_composes_with_a_declared_theta_but_not_with_nope() {
+        let scaling = DeclaredRopeScaling::Linear { factor: 4.0 };
+        assert_eq!(
+            PositionPolicy::from_declared_theta_with_scaling(5e5, scaling),
+            PositionPolicy::Linear {
+                theta: 5e5,
+                factor: 4.0
+            }
+        );
+        assert_eq!(
+            PositionPolicy::from_declared_theta_with_scaling(NOPE_THETA_SENTINEL, scaling),
+            PositionPolicy::None
+        );
+    }
+
     #[test]
     fn round_trips() {
         for policy in [
             PositionPolicy::None,
             PositionPolicy::Rope { theta: 1e6 },
+            PositionPolicy::Linear {
+                theta: 1e6,
+                factor: 8.0,
+            },
             PositionPolicy::Yarn {
                 theta: 150000.0,
                 scaling: gpt_oss_yarn(),
@@ -326,7 +584,10 @@ mod tests {
     fn a_yarn_block_attaches_only_to_a_rotating_layer() {
         let scaling = gpt_oss_yarn();
         assert_eq!(
-            PositionPolicy::from_declared_theta_with_yarn(150000.0, Some(scaling)),
+            PositionPolicy::from_declared_theta_with_scaling(
+                150000.0,
+                DeclaredRopeScaling::Yarn(scaling)
+            ),
             PositionPolicy::Yarn {
                 theta: 150000.0,
                 scaling
@@ -334,12 +595,15 @@ mod tests {
         );
         // The NoPE sentinel wins over a checkpoint-wide YaRN block.
         assert_eq!(
-            PositionPolicy::from_declared_theta_with_yarn(0.0, Some(scaling)),
+            PositionPolicy::from_declared_theta_with_scaling(
+                0.0,
+                DeclaredRopeScaling::Yarn(scaling)
+            ),
             PositionPolicy::None
         );
         // No block: plain rotary, exactly as `from_declared_theta`.
         assert_eq!(
-            PositionPolicy::from_declared_theta_with_yarn(150000.0, None),
+            PositionPolicy::from_declared_theta_with_scaling(150000.0, DeclaredRopeScaling::None),
             PositionPolicy::Rope { theta: 150000.0 }
         );
     }
@@ -418,5 +682,172 @@ mod tests {
         }
         .is_rotary());
         assert!(!PositionPolicy::None.is_rotary());
+    }
+
+    /// **The M-RoPE axis table is the operator, not a label.**
+    ///
+    /// `section` counts FREQUENCY slots (`rotary_dim / 2`), and the two
+    /// layouts place the same counts differently: contiguous blocks
+    /// (`TTT…HHH…WWW…`) versus HF's interleaving (`THWTHW…`). A
+    /// consumer that built one while the checkpoint declared the other
+    /// would rotate the right dimensions by the wrong axis's position.
+    #[test]
+    fn the_mrope_axis_table_places_each_axis_where_the_layout_says() {
+        // Contiguous: 4 T slots, then 3 H, then 2 W, over 10 freqs.
+        let blocked = mrope_axis_table([4, 3, 2], false, 10);
+        assert_eq!(blocked, vec![0, 0, 0, 0, 1, 1, 1, 2, 2, 0]);
+
+        // Interleaved: H at 1, 4, 7…, W at 2, 5, 8…, everything else T.
+        let woven = mrope_axis_table([4, 3, 2], true, 10);
+        assert_eq!(woven, vec![0, 1, 2, 0, 1, 2, 0, 1, 0, 0]);
+
+        // The two are genuinely different placements of one section.
+        assert_ne!(blocked, woven);
+
+        // Slots past what `section` accounts for stay on T, matching
+        // HF's "overwrite the first dimension" construction.
+        assert!(mrope_axis_table([1, 1, 1], false, 8)[3..]
+            .iter()
+            .all(|a| *a == 0));
+
+        // A section wider than the frequency count truncates rather
+        // than writing past the table.
+        assert_eq!(mrope_axis_table([9, 9, 9], false, 4).len(), 4);
+        assert_eq!(mrope_axis_table([9, 9, 9], true, 4).len(), 4);
+        // Qwen3.8's real geometry: [11, 11, 10] over 32 frequencies.
+        let real = mrope_axis_table([11, 11, 10], false, 32);
+        assert_eq!(real.len(), 32);
+        assert_eq!(real.iter().filter(|a| **a == 0).count(), 11);
+        assert_eq!(real.iter().filter(|a| **a == 1).count(), 11);
+        assert_eq!(real.iter().filter(|a| **a == 2).count(), 10);
+    }
+
+    /// Each accessor answers for the variants that carry the fact and
+    /// `None` for the rest — never an implied default, which is the
+    /// whole reason these are `Option`.
+    #[test]
+    fn the_accessors_answer_only_where_the_fact_exists() {
+        let rope = PositionPolicy::Rope { theta: 10000.0 };
+        let partial_rot = PositionPolicy::PartialRope {
+            theta: 10000.0,
+            rotary_fraction: 0.25,
+            basis: RotaryFrequencyBasis::RotaryWidth,
+        };
+        let partial_head = PositionPolicy::PartialRope {
+            theta: 10000.0,
+            rotary_fraction: 0.5,
+            basis: RotaryFrequencyBasis::HeadWidth,
+        };
+        let mrope_rot = PositionPolicy::MRope {
+            theta: 10000.0,
+            rotary_fraction: 0.25,
+            basis: RotaryFrequencyBasis::RotaryWidth,
+            section: [11, 11, 10],
+            interleaved: false,
+        };
+        let mrope_head = PositionPolicy::MRope {
+            theta: 10000.0,
+            rotary_fraction: 0.25,
+            basis: RotaryFrequencyBasis::HeadWidth,
+            section: [8, 8, 8],
+            interleaved: true,
+        };
+        let nope = PositionPolicy::None;
+
+        // rotary_fraction: only the two partial-width policies have one.
+        assert_eq!(partial_rot.rotary_fraction(), Some(0.25));
+        assert_eq!(mrope_rot.rotary_fraction(), Some(0.25));
+        assert_eq!(rope.rotary_fraction(), None);
+        assert_eq!(nope.rotary_fraction(), None);
+
+        // mrope: the axis split, and None for everything that declares
+        // no axis split — never an implied single axis.
+        assert_eq!(mrope_rot.mrope(), Some(([11, 11, 10], false)));
+        assert_eq!(mrope_head.mrope(), Some(([8, 8, 8], true)));
+        assert_eq!(partial_rot.mrope(), None);
+        assert_eq!(rope.mrope(), None);
+        assert_eq!(nope.mrope(), None);
+
+        // declared_rope_type: the HF spelling, and only when it is not
+        // the default class. M-RoPE's own spelling lives in
+        // `mrope_section`, so a rotary-width M-RoPE answers None.
+        assert_eq!(partial_head.declared_rope_type(), Some("proportional"));
+        assert_eq!(mrope_head.declared_rope_type(), Some("proportional"));
+        assert_eq!(partial_rot.declared_rope_type(), None);
+        assert_eq!(mrope_rot.declared_rope_type(), None);
+        assert_eq!(rope.declared_rope_type(), None);
+        assert_eq!(nope.declared_rope_type(), None);
+
+        // is_rotary: everything but NoPE.
+        for p in [rope, partial_rot, partial_head, mrope_rot, mrope_head] {
+            assert!(p.is_rotary(), "{p:?} rotates");
+        }
+        assert!(!nope.is_rotary());
+    }
+
+    #[test]
+    fn a_llama3_block_resolves_to_its_own_policy_and_never_to_yarn() {
+        let scaling = Llama3RopeScaling {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192.0,
+        };
+        let policy = PositionPolicy::from_declared_theta_with_scaling(
+            500000.0,
+            DeclaredRopeScaling::Llama3(scaling),
+        );
+        assert_eq!(
+            policy,
+            PositionPolicy::Llama3 {
+                theta: 500000.0,
+                scaling
+            }
+        );
+        assert_eq!(policy.llama3(), Some(scaling));
+        assert_eq!(policy.rope_theta(), Some(500000.0));
+        assert_eq!(policy.declared_rope_type(), Some("llama3"));
+
+        // The hazard this guards: llama3 folded into Yarn would apply
+        // YaRN's attention amplitude — a rescale of every logit at every
+        // position — which no Llama checkpoint declares. The accessor
+        // must not answer for a family that has no such block.
+        assert_eq!(policy.yarn(), None);
+        // ...and the reverse, so neither accessor drifts into the other.
+        let yarn = YarnRopeScaling {
+            factor: 32.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position_embeddings: 4096.0,
+            truncate: true,
+            mscale: None,
+            mscale_all_dim: None,
+        };
+        let yarn_policy = PositionPolicy::from_declared_theta_with_scaling(
+            150000.0,
+            DeclaredRopeScaling::Yarn(yarn),
+        );
+        assert_eq!(yarn_policy.llama3(), None);
+        assert_eq!(yarn_policy.yarn(), Some(yarn));
+    }
+
+    #[test]
+    fn a_nope_layer_stays_nope_under_a_llama3_block() {
+        // The composition guard: a checkpoint-wide scaling block says how
+        // a ROTATING layer rotates. A layer scheduled not to rotate must
+        // not acquire a rotation from it.
+        let scaling = Llama3RopeScaling {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192.0,
+        };
+        assert_eq!(
+            PositionPolicy::from_declared_theta_with_scaling(
+                0.0,
+                DeclaredRopeScaling::Llama3(scaling)
+            ),
+            PositionPolicy::None
+        );
     }
 }

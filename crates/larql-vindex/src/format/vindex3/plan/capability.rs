@@ -43,7 +43,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::{Component, ComponentRole, Modality, SystemGraph};
-use super::report::Finding;
+use super::report::{Finding, FindingId, PlannedFinding};
 
 /// One thing a caller can ask the model to do.
 ///
@@ -121,6 +121,11 @@ const IMAGE_BINDING_KEYS: &[&str] = &[
     "eoi_token_id",
     "video_token_id",
     "vision_soft_tokens_per_image",
+    // Gemma 3's spellings of the same binding.
+    "image_token_index",
+    "boi_token_index",
+    "eoi_token_index",
+    "mm_tokens_per_image",
 ];
 
 const AUDIO_BINDING_KEYS: &[&str] = &[
@@ -254,7 +259,11 @@ fn outside_closure(capability: Capability, finding: &Finding, graph: &SystemGrap
         // the key blocks as before.
         "output_gate_type" => text_component(graph)
             .and_then(|c| c.execution.as_ref())
-            .is_some_and(|e| e.attention.output_gate.is_some()),
+            .is_some_and(|e| {
+                e.attention
+                    .as_ref()
+                    .is_some_and(|a| a.output_gate.is_some())
+            }),
         // A packaging statement, not an operator one — and unlike the
         // gate key it is not even an HF key: zero references across all
         // of transformers. What makes it excludable is that the graph
@@ -277,12 +286,13 @@ fn outside_closure(capability: Capability, finding: &Finding, graph: &SystemGrap
     }
 }
 
-/// The primary text component, when the graph has one.
+/// The primary text component, when the graph has exactly one.
+///
+/// Ambiguity resolves to `None`, never to the first match (drill F10):
+/// grading capabilities against an arbitrarily chosen text component
+/// would be quiet wrongness; absence downgrades visibly instead.
 fn text_component(graph: &SystemGraph) -> Option<&Component> {
-    graph
-        .components
-        .iter()
-        .find(|c| c.role == ComponentRole::PrimaryText)
+    graph.primary_text_component().ok()
 }
 
 /// Admissibility of one capability: does anything it depends on block?
@@ -294,10 +304,10 @@ fn text_component(graph: &SystemGraph) -> Option<&Component> {
 /// is the entire point.
 pub fn admissible_for<'a>(
     capability: Capability,
-    findings: impl IntoIterator<Item = &'a Finding>,
+    findings: impl IntoIterator<Item = &'a PlannedFinding>,
     graph: &SystemGraph,
 ) -> CapabilityStatus {
-    let mut blocking = 0usize;
+    let mut blocker_ids = Vec::new();
     let mut required = 0usize;
     for finding in findings {
         if !requires(capability, finding, graph) {
@@ -305,16 +315,17 @@ pub fn admissible_for<'a>(
         }
         required += 1;
         if finding.blocks() {
-            blocking += 1;
+            blocker_ids.push(finding.id);
         }
     }
     CapabilityStatus {
         capability,
-        admissible: blocking == 0,
+        admissible: blocker_ids.is_empty(),
         available: available_for(capability, graph),
         supported: supported(capability),
         required,
-        blocking,
+        blocking: blocker_ids.len(),
+        blocker_ids,
     }
 }
 
@@ -421,6 +432,15 @@ pub struct CapabilityStatus {
     pub required: usize,
     /// Of those, how many block.
     pub blocking: usize,
+    /// Which ones — by [`FindingId`], in document order.
+    ///
+    /// The count alone made every leverage estimate an upper bound:
+    /// knowing a checkpoint has six blockers says nothing about which
+    /// concepts they belong to, so "retiring idea X clears N rows" had to
+    /// be computed over whole-model findings and hedged. With the set
+    /// named, a reader can intersect it with any grouping and get the
+    /// exact answer.
+    pub blocker_ids: Vec<FindingId>,
 }
 
 impl CapabilityStatus {

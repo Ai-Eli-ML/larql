@@ -36,6 +36,8 @@
 //! the silent conversion §9.1 forbids, buried one layer below where anyone
 //! would look for it. Regions are placed exactly as their producer wrote them.
 
+pub mod artifact;
+pub mod auxiliary_references;
 pub mod build;
 pub mod compact;
 pub mod compile;
@@ -45,6 +47,8 @@ pub mod encode;
 /// integration tests can encode a real container without duplicating
 /// the frozen fixture geometry the executor's parity gates certify.
 pub mod fixtures;
+pub mod fixtures_kimi;
+pub mod gguf;
 pub mod graph;
 pub mod import;
 pub mod index;
@@ -56,7 +60,9 @@ pub mod opplan;
 pub mod plan;
 pub mod profile;
 pub mod read;
+pub mod remote;
 pub mod represent;
+pub mod representation_attestations;
 /// Conformance fixture A, public so integration tests and future gate arms can
 /// build a real container without duplicating its frozen dimensions.
 pub mod test_support;

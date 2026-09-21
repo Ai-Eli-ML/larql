@@ -328,6 +328,34 @@ pub(super) fn rope_table_key(position: &PositionPolicy, head_dim: usize) -> Opti
     };
     match position {
         PositionPolicy::Rope { theta } => Some(with_width(theta.to_bits())),
+        // Llama-3's table is the wavelength-band adjustment of the base
+        // frequencies, so every parameter that moves a band is part of
+        // the key. Keying on `theta` alone would let two layers scaled
+        // for different pre-trained windows share one table.
+        PositionPolicy::Llama3 { theta, scaling } => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            theta.to_bits().hash(&mut h);
+            scaling.factor.to_bits().hash(&mut h);
+            scaling.low_freq_factor.to_bits().hash(&mut h);
+            scaling.high_freq_factor.to_bits().hash(&mut h);
+            scaling
+                .original_max_position_embeddings
+                .to_bits()
+                .hash(&mut h);
+            head_dim.hash(&mut h);
+            Some(h.finish() | 1)
+        }
+        // Linear's table is the plain series divided by the factor, so
+        // the factor joins the key: the same theta scaled and unscaled
+        // (Gemma 3's global vs sliding layers share neither theta nor
+        // scaling, but a family could) must never share one table.
+        PositionPolicy::Linear { theta, factor } => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            theta.to_bits().hash(&mut h);
+            factor.to_bits().hash(&mut h);
+            head_dim.hash(&mut h);
+            Some(h.finish() | 1)
+        }
         // The partial rotary's table is the full-head rotate-half table
         // with the top frequencies zero (head-width basis); fraction and
         // basis join the key.
@@ -364,7 +392,11 @@ pub(super) fn rope_table_key(position: &PositionPolicy, head_dim: usize) -> Opti
         // is never asked for. `None` rather than a hash keeps a
         // half-built session from sharing a table with plain rope.
         PositionPolicy::MRope { .. } => None,
-        PositionPolicy::None => None,
+        // A relative scheme has no rotary table to key, and no lowering
+        // consumes it. `None` here means "no table", which is the truthful
+        // answer for a policy that does not rotate; execution refuses
+        // separately rather than running unpositioned.
+        PositionPolicy::Relative { .. } | PositionPolicy::None => None,
     }
 }
 
@@ -383,7 +415,26 @@ pub(super) fn rope_inv_freq_table(position: &PositionPolicy, head_dim: usize) ->
                 );
             inv_freq.iter().map(|f| *f as f32).collect()
         }
-        PositionPolicy::None => Vec::new(),
+        PositionPolicy::Llama3 { theta, scaling } => {
+            larql_vindex::format::vindex3::opplan::exec::kernels::llama3_frequencies(
+                scaling, head_dim, *theta,
+            )
+            .iter()
+            .map(|f| *f as f32)
+            .collect()
+        }
+        // The interpreter's own linear table: plain series over the
+        // factor, so the lowered kernel rotates exactly what the
+        // reference arm rotates.
+        PositionPolicy::Linear { theta, factor } => {
+            larql_vindex::format::vindex3::opplan::exec::kernels::linear_frequencies(
+                head_dim, *theta, *factor,
+            )
+            .iter()
+            .map(|f| *f as f32)
+            .collect()
+        }
+        PositionPolicy::Relative { .. } | PositionPolicy::None => Vec::new(),
         // Head-width basis: the interpreter's own table (zeros above the
         // fraction → identity rotation on those pairs). The rotary-width
         // basis rotates a prefix as its own block, which the rope kernel

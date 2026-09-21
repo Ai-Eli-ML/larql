@@ -25,6 +25,34 @@ const COMPONENT_CONFIG_SUFFIX: &str = "_config";
 /// Components owned by the main `ModelConfig` parser, not this reader.
 const MAIN_PARSER_COMPONENTS: &[&str] = &["text_config", "language_config"];
 
+/// `*_config` sections that parameterise an **operator of the main stack**
+/// rather than describing a component of their own.
+///
+/// The `_config` suffix is a naming convention, not a declaration of
+/// component-hood, and `linear_attn_config` is the case that shows the
+/// difference: it carries a `num_heads` and a `head_dim`, so it satisfies
+/// [`ComponentTopology::declares_topology`] and was read as a sibling
+/// sub-model. Kimi Linear then grew a phantom `linear_attn` component
+/// whose execution surface was reported *incomplete* — for a component
+/// that does not exist, and which has no embedding, no layers and no
+/// tensors of its own.
+///
+/// The cost was not only the noise. Its keys were credited to that
+/// component's `consumed_paths`, so `linear_attn_config.head_dim` graded
+/// **representable** on Kimi and `unrepresented` on GLM-5.3-Flash — the
+/// same key, the same meaning, two verdicts, decided by whether the
+/// section happened to sit at the config root.
+const OPERATOR_CONFIG_SECTIONS: &[&str] = &["linear_attn_config"];
+
+/// Whether a `*_config` key names an operator section rather than a
+/// component. Public because the plan's own path→component mapping must
+/// agree: a section that builds no component must not be named as one, or
+/// every carriage probe for its keys looks for a component that does not
+/// exist and reports facts as uncarried that are carried perfectly well.
+pub fn is_operator_config_section(key: &str) -> bool {
+    OPERATOR_CONFIG_SECTIONS.contains(&key)
+}
+
 /// One nested component's declared topology.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentTopology {
@@ -33,6 +61,12 @@ pub struct ComponentTopology {
     pub model_type: Option<String>,
     pub hidden_size: Option<usize>,
     pub intermediate_size: Option<usize>,
+    /// Per-layer dense-FFN width a derived checkpoint declares for this
+    /// component (`larql_ffn_intermediate_size_by_layer`), verbatim;
+    /// `None` = every layer at `intermediate_size`. Additive: inventories
+    /// written before it read as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffn_intermediate_size_by_layer: Option<Vec<usize>>,
     pub num_layers: Option<usize>,
     pub num_attention_heads: Option<usize>,
     pub num_key_value_heads: Option<usize>,
@@ -84,6 +118,12 @@ pub struct TowerExecution {
     pub use_clipped_linears: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_head_dim: Option<usize>,
+    /// SigLIP's attention-pooling head (Gemma 3's `vision_use_head`):
+    /// `true` places a `head.*` parameter set after the encoder, `false`
+    /// — what every Gemma 3 checkpoint ships — means the tower's last
+    /// hidden state is its output and no head tensors exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_head: Option<bool>,
 }
 
 impl TowerExecution {
@@ -167,6 +207,7 @@ pub fn read_components(config: &Value) -> Vec<ComponentReading> {
             value.is_object()
                 && key.ends_with(COMPONENT_CONFIG_SUFFIX)
                 && !MAIN_PARSER_COMPONENTS.contains(&key.as_str())
+                && !OPERATOR_CONFIG_SECTIONS.contains(&key.as_str())
         })
         .map(|(key, value)| read_component(key, value))
         // A `*_config` object that declares no topology is not a component
@@ -241,6 +282,14 @@ fn read_component(root_key: &str, object: &Value) -> ComponentReading {
         model_type: cursor.string_at("model_type"),
         hidden_size: cursor.usize_at("hidden_size"),
         intermediate_size: cursor.usize_at("intermediate_size"),
+        ffn_intermediate_size_by_layer: cursor
+            .get("larql_ffn_intermediate_size_by_layer")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|k| k as usize))
+                    .collect::<Vec<_>>()
+            }),
         // Alias spellings of the SAME fact, read canonical-first. Qwen3-VL
         // towers say `depth` and `num_heads` where the canonical vocabulary
         // says `num_hidden_layers` and `num_attention_heads`; the tower is
@@ -297,6 +346,7 @@ fn read_component(root_key: &str, object: &Value) -> ComponentReading {
             standardize: cursor.bool_at("standardize"),
             use_clipped_linears: cursor.bool_at("use_clipped_linears"),
             global_head_dim: cursor.usize_at("global_head_dim"),
+            use_head: cursor.bool_at("vision_use_head"),
         },
     };
     ComponentReading {

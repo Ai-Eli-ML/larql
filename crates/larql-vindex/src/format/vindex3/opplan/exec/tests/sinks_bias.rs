@@ -20,7 +20,9 @@ use super::golden::{
     executor_trace_from, golden_forward, max_abs, miniature_glimmer, miniature_glimmer_with,
     MiniatureExtras, BIAS_SUFFIXES, G_LAYERS, G_TOKENS, SINKS_SUFFIX,
 };
-use crate::format::vindex3::encode::{encode_system, SYSTEM_GRAPH_JSON};
+use crate::format::vindex3::encode::{
+    encode_system_unenforced as encode_system, SYSTEM_GRAPH_JSON,
+};
 use crate::format::vindex3::graph::OperandRole;
 use crate::format::vindex3::inspect::inspect_container;
 use crate::format::vindex3::opplan::exec::backend::WeightFormat;
@@ -96,7 +98,7 @@ fn biases_and_sinks_match_the_independent_golden_semantics() {
     let executed = executor_trace_from(container.path());
     for layer in 0..G_LAYERS {
         let attn = max_abs(
-            &executed.layers[layer].post_attention,
+            executed.layers[layer].post_attention.rows(),
             &golden.layers[layer].post_attention,
         );
         assert!(
@@ -104,7 +106,7 @@ fn biases_and_sinks_match_the_independent_golden_semantics() {
             "layer {layer} post_attention {attn:e}"
         );
         let post = max_abs(
-            &executed.layers[layer].post_layer,
+            executed.layers[layer].post_layer.rows(),
             &golden.layers[layer].post_layer,
         );
         assert!(post < GOLDEN_TOLERANCE, "layer {layer} post_layer {post:e}");
@@ -121,7 +123,7 @@ fn biases_and_sinks_match_the_independent_golden_semantics() {
 
 fn assert_traces_agree(a: &ExecutionTrace, b: &ExecutionTrace, label: &str) {
     for (index, (da, db)) in a.layers.iter().zip(&b.layers).enumerate() {
-        let delta = max_abs(&da.post_layer, &db.post_layer);
+        let delta = max_abs(da.post_layer.rows(), db.post_layer.rows());
         assert!(delta < GOLDEN_TOLERANCE, "{label}: layer {index} {delta:e}");
     }
     let logits = max_abs(
@@ -165,8 +167,8 @@ fn each_bias_and_the_sinks_are_load_bearing() {
             std::slice::from_ref(moved.logits.as_ref().unwrap()),
         );
         let attn0 = max_abs(
-            &base.layers[0].post_attention,
-            &moved.layers[0].post_attention,
+            base.layers[0].post_attention.rows(),
+            moved.layers[0].post_attention.rows(),
         );
         eprintln!("perturb {suffix}: layer0 post_attention {attn0:e}, logits {delta:e}");
         assert!(

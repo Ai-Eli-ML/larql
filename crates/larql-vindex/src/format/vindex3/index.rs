@@ -129,6 +129,25 @@ pub struct Vindex3Index {
     /// graph recorded", never "single-component assumed".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_graph: Option<String>,
+    /// Filename of the auxiliary reference table
+    /// ([`super::auxiliary_references::AuxiliaryReferences`]), relative to
+    /// the root: which represented object stands for each codec's named
+    /// dependency. Absent on every container that declares none — absence
+    /// means "no dependency is declared", never "the dependencies follow
+    /// from a naming rule". A table this names and the container does not
+    /// hold is a refusal, not an empty table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_references: Option<String>,
+    /// Filename of the representation attestation table
+    /// ([`super::representation_attestations::RepresentationAttestations`]),
+    /// relative to the root: what each represented operand instance
+    /// ACHIEVED at an extent, as measured, as opposed to what its codec's
+    /// scheme guarantees. Absent on every container that attests nothing
+    /// — and absence means the guarantee is UNAVAILABLE, never that the
+    /// error is zero. A table this names and the container does not hold
+    /// is a refusal, not an empty table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub representation_attestations: Option<String>,
     /// Representation directory: representation id
     /// (`{object_id}@{encoding}`) → where its bytes physically live.
     /// Graph edges and objects never reference source tensor names — once
@@ -182,6 +201,17 @@ pub struct Vindex3Index {
     /// is what an operator needs to find the authority again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_from_model: Option<String>,
+    /// Fields this build does not understand, carried verbatim.
+    ///
+    /// The compatibility rules (candidate spec §5.7) bind the writer, not
+    /// just the reader: additive 3.x vocabulary must survive a rewrite.
+    /// Ontology-drill finding F13 was exactly this loss — COMPILE
+    /// round-tripped the index through this struct and dropped newer
+    /// fields, while COMPACT (which carries the file byte-identically)
+    /// preserved them. The flatten map closes that asymmetry for every
+    /// struct round-trip at once.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn is_canonical(a: &ContainerAuthority) -> bool {
@@ -206,6 +236,8 @@ impl Vindex3Index {
             num_layers,
             moe_manifest: Some(moe_manifest.into()),
             system_graph: None,
+            auxiliary_references: None,
+            representation_attestations: None,
             representations: BTreeMap::new(),
             profiles: vec![Profile::exact()],
             variants: VariantCatalogue::new(),
@@ -213,6 +245,7 @@ impl Vindex3Index {
             authority: ContainerAuthority::Canonical,
             precision_map: None,
             derived_from_model: None,
+            extra: BTreeMap::new(),
         }
     }
 

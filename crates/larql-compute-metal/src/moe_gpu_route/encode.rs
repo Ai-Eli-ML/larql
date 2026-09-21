@@ -240,6 +240,15 @@ impl MetalBackend {
             let g_offset = (e * inter * 4) as u64;
             let a_offset = (e * inter_padded * 4) as u64;
             match moe.gate_rule {
+                // Refused at admission by
+                // `kernels::ffn::expert_activation_supported`, which
+                // owns the reason. The backstop stays for any path that
+                // does not come through that gate — and must never be
+                // the thing that reports it, because a panic here
+                // leaves the encoder unended.
+                larql_compute::MoeGateRule::ClampedGated { .. } => {
+                    unreachable!("{}", crate::kernels::ffn::CLAMPED_GATED_REFUSAL)
+                }
                 larql_compute::MoeGateRule::ClampedGlu { limit, alpha } => {
                     let has_bias: u32 = u32::from(stage_gate_up_bias);
                     enc.set_compute_pipeline_state(&self.ffn.clamped_glu_bias_pipeline);
@@ -252,6 +261,19 @@ impl MetalBackend {
                     enc.set_bytes(6, 4, &has_bias as *const u32 as *const c_void);
                     enc.set_bytes(7, 4, &limit as *const f32 as *const c_void);
                     enc.set_bytes(8, 4, &alpha as *const f32 as *const c_void);
+                }
+                larql_compute::MoeGateRule::SituGlu { beta, linear_beta } => {
+                    crate::kernels::ffn::bind_situ_glu(
+                        enc,
+                        &self.ffn.situ_glu_pipeline,
+                        (&scratch.g_out, g_offset),
+                        (&scratch.u_out, g_offset),
+                        (&scratch.act_buf, a_offset),
+                        inter_u32,
+                        beta,
+                        linear_beta,
+                        stage_gate_up_bias,
+                    );
                 }
                 larql_compute::MoeGateRule::Gated(activation) => {
                     let pipeline = if activation.gate_up_is_gelu_tanh() {
@@ -478,7 +500,21 @@ impl MetalBackend {
             }
             _ => false,
         };
-        router_input_transform(moe).is_some()
+        // SiTU-GLU has no bias form in the reference (K3's experts are
+        // bias-free `nn.Linear`s) and `situ_glu` has no bias slots, so a
+        // layer staging per-expert gate/up biases under it is refused
+        // HERE — at admission, before an encoder exists — rather than at
+        // the dispatch. `bind_situ_glu` still asserts, as the backstop for
+        // any path that does not come through this gate, but a refusal
+        // raised mid-encode leaves the encoder unended and Metal aborts
+        // the process instead of reporting it.
+        let situ_bias_ok = !matches!(moe.gate_rule, larql_compute::MoeGateRule::SituGlu { .. })
+            || moe.experts_gate_up_bias.is_empty();
+        situ_bias_ok
+            // The same admission rule, for the combine that has no
+            // kernel at all rather than no bias form.
+            && crate::kernels::ffn::expert_activation_supported(&moe.gate_rule)
+            && router_input_transform(moe).is_some()
             && format_ok
             && matches!(
                 moe.routing_policy.post_expert_norm,

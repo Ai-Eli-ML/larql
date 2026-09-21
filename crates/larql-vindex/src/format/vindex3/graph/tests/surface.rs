@@ -52,19 +52,20 @@ fn builder_fills_every_component_surface() {
         .find(|c| c.id == "target")
         .unwrap();
     let surface = target.execution.as_ref().unwrap();
+    // An attention-class program carries its groups (schema 6: presence
+    // means the program runs them).
+    let attention = surface.attention.as_ref().expect("the program attends");
+    let ffn = surface.ffn.as_ref().expect("the program runs an FFN");
     // Scales stay separate: declared query factor, canonical score scale.
-    let query_scale = surface
-        .attention
-        .query_scale
-        .expect("declared qk_scale_factor");
+    let query_scale = attention.query_scale.expect("declared qk_scale_factor");
     assert!((query_scale - 3.87).abs() < 1e-12);
-    assert!((surface.attention.score_scale - (8f64).powf(-0.5)).abs() < 1e-12);
+    assert!((attention.score_scale - (8f64).powf(-0.5)).abs() < 1e-12);
     // Judged semantics from the registered family.
-    assert!(surface.attention.output_gate.is_some());
-    assert!(surface.attention.parameter_free_qk_norm.q);
-    assert_eq!(surface.attention.num_q_heads, 8);
-    assert_eq!(surface.attention.num_kv_heads, 2);
-    assert_eq!(surface.ffn.intermediate_size, 256);
+    assert!(attention.output_gate.is_some());
+    assert!(attention.parameter_free_qk_norm.q);
+    assert_eq!(attention.num_q_heads, 8);
+    assert_eq!(attention.num_kv_heads, 2);
+    assert_eq!(ffn.intermediate_size, Some(256));
     // Each norm site carries a complete spec. The declared post_norm_eps
     // reaches the post sites as a distinct value, and Glimmer's centred
     // layer norms reach every site that needs them — while the final norm
@@ -108,10 +109,12 @@ fn perception_surface_derives_from_nested_evidence() {
         .find(|c| c.id == "vision")
         .unwrap();
     let surface = vision.execution.as_ref().unwrap();
-    assert_eq!(surface.attention.num_q_heads, 4);
-    assert_eq!(surface.attention.head_dim, 8); // 32 / 4, derived
-    assert_eq!(surface.ffn.activation, Activation::Gelu);
-    assert_eq!(surface.ffn.ffn_type, FfnType::Standard);
+    let attention = surface.attention.as_ref().expect("the tower attends");
+    let ffn = surface.ffn.as_ref().expect("the tower runs an FFN");
+    assert_eq!(attention.num_q_heads, 4);
+    assert_eq!(attention.head_dim, 8); // 32 / 4, derived
+    assert_eq!(ffn.activation, Activation::Gelu);
+    assert_eq!(ffn.ffn_type, FfnType::Standard);
     assert_eq!(surface.norm.pre.kind, NormType::LayerNorm); // layer_norm_eps spelling
     assert!(surface.head.is_none());
 }
@@ -176,8 +179,9 @@ fn non_uniform_head_geometry_is_carried_per_layer() {
     );
     // The surface still states the component's declared geometry.
     let surface = target.execution.as_ref().expect("surface built");
-    assert_eq!(surface.attention.head_dim, uniform_head_dim);
-    assert_eq!(surface.attention.num_kv_heads, uniform_kv_heads);
+    let attention = surface.attention.as_ref().expect("the program attends");
+    assert_eq!(attention.head_dim, uniform_head_dim);
+    assert_eq!(attention.num_kv_heads, uniform_kv_heads);
 }
 
 /// Every nested-derivation refusal names its missing fact — a bare
@@ -191,6 +195,7 @@ fn nested_refusals_name_every_missing_fact() {
         model_type: None,
         hidden_size: Some(32),
         intermediate_size: None,
+        ffn_intermediate_size_by_layer: None,
         num_layers: Some(2),
         num_attention_heads: None,
         num_key_value_heads: None,
@@ -256,6 +261,65 @@ fn completeness_defects_display_the_component() {
     };
     assert!(head.to_string().contains("`draft`"));
     assert!(head.to_string().contains("head group"));
+    let norm = CompletenessDefect::MissingNormPlacement {
+        component: "target".to_string(),
+    };
+    assert!(norm.to_string().contains("norm placement"));
+    let operation = CompletenessDefect::MissingOperationSurface {
+        component: "target".to_string(),
+        operation: "attention",
+    };
+    assert!(operation.to_string().contains("`target`"));
+    assert!(operation.to_string().contains("attention group"));
+}
+
+/// **Schema 6: the operation surfaces follow the program — each family
+/// that runs must find its group present.** Stripping a group whose
+/// operators are in the table is a completeness defect naming the
+/// operation; a mixer-only program legitimately carries neither
+/// attention nor FFN and is complete without them.
+#[test]
+fn a_program_that_runs_a_family_requires_its_surface_group() {
+    let (_a, _b, named) = glimmer_pair();
+    let mut built = build_from_inventories(&named);
+    assert!(execution_completeness(&built.graph).is_empty());
+    let strip = |built: &mut crate::format::vindex3::graph::BuiltGraph,
+                 f: &dyn Fn(&mut crate::format::vindex3::graph::ExecutionSurface)| {
+        let target = built
+            .graph
+            .components
+            .iter_mut()
+            .find(|c| c.id == "target")
+            .unwrap();
+        f(target.execution.as_mut().unwrap());
+    };
+    // The target attends and runs an FFN; each group is load-bearing.
+    strip(&mut built, &|s| s.attention = None);
+    let defects = execution_completeness(&built.graph);
+    assert!(
+        defects.iter().any(|d| matches!(
+            d,
+            CompletenessDefect::MissingOperationSurface {
+                operation: "attention",
+                ..
+            }
+        )),
+        "{defects:?}"
+    );
+    let (_a, _b, named) = glimmer_pair();
+    let mut built = build_from_inventories(&named);
+    strip(&mut built, &|s| s.ffn = None);
+    let defects = execution_completeness(&built.graph);
+    assert!(
+        defects.iter().any(|d| matches!(
+            d,
+            CompletenessDefect::MissingOperationSurface {
+                operation: "ffn",
+                ..
+            }
+        )),
+        "{defects:?}"
+    );
 }
 
 /// A component owning a head object whose surface lost its head group is
@@ -360,5 +424,89 @@ fn a_component_implying_no_ops_needs_no_surface() {
     assert!(
         execution_completeness(&built.graph).is_empty(),
         "a component that implies no operations cannot be missing a surface"
+    );
+}
+
+/// **The execution semantic is the authority, not the tokenizer's copy.**
+///
+/// `max_position_embeddings` says how far the programme is declared to
+/// run and changes what a forward pass does. `model_max_length` in
+/// `tokenizer_config.json` is a serving bound on a different component.
+/// They usually agree, which is exactly why the disagreement is planted
+/// here: a lowering that reached for the tokenizer's number would pass
+/// every test where the two match, and be wrong on the one model where
+/// they do not.
+#[test]
+fn context_length_comes_from_the_execution_semantic_not_the_tokenizer_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let inv = crate::format::vindex3::plan::tests_support::known_dense_with_config(
+        dir.path(),
+        serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "torch_dtype": "bfloat16",
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 256,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+            "vocab_size": 128,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": 262144
+        }),
+    );
+    let surface = crate::format::vindex3::graph::surface::surface_from_resolved(&inv)
+        .expect("a complete config yields a surface");
+    assert_eq!(
+        surface.context_length,
+        Some(262144),
+        "the graph records the judged execution semantic"
+    );
+}
+
+/// A checkpoint that declares no extent records none. Absence is a fact
+/// about the source, and inventing a default here would be the silent
+/// substitution the whole surface exists to refuse.
+#[test]
+fn a_checkpoint_with_no_declared_extent_records_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let inv = known_dense(dir.path());
+    let surface =
+        crate::format::vindex3::graph::surface::surface_from_resolved(&inv).expect("surface");
+    assert_eq!(
+        surface.context_length, None,
+        "undeclared is None, never a chosen number"
+    );
+}
+
+/// The field is additive within GRAPH_SCHEMA 6: a graph written before
+/// it existed still parses, and one written with it round-trips.
+#[test]
+fn context_length_is_additive_within_schema_six() {
+    use crate::format::vindex3::graph::surface::ExecutionSurface;
+    let dir = tempfile::tempdir().unwrap();
+    let inv = known_dense(dir.path());
+    let mut surface = crate::format::vindex3::graph::surface::surface_from_resolved(&inv).unwrap();
+
+    // A v6 graph written before the field existed: the key is simply
+    // absent from the JSON.
+    let json = serde_json::to_value(&surface).unwrap();
+    assert!(
+        json.get("context_length").is_none(),
+        "None is skipped, so old and new writers agree byte-for-byte when it is absent"
+    );
+    let reparsed: ExecutionSurface = serde_json::from_value(json).unwrap();
+    assert_eq!(reparsed, surface, "an old graph still reads");
+
+    // And one that carries it round-trips unchanged.
+    surface.context_length = Some(262144);
+    let json = serde_json::to_value(&surface).unwrap();
+    assert_eq!(json["context_length"], 262144);
+    let reparsed: ExecutionSurface = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        reparsed.context_length,
+        Some(262144),
+        "a new graph round-trips"
     );
 }

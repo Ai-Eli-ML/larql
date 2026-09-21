@@ -46,10 +46,11 @@ use std::sync::Mutex;
 use larql_compute::backend::MatMul;
 use larql_models::config::{Activation, GateActivation, GateCombine, GatePlacement, GateSource};
 
+use super::super::planned::Operation;
 use super::backend::{
-    AttentionCall, AttentionOut, AttentionStepCall, AttentionStepOut, DispatchStats, FfnCall,
-    GateCall, MatrixOperand, NormCall, PlanBackend, ProjectCall, ProjectedQkv, RoutedFfnCall,
-    WeightFormat, WeightFormats, WeightSlice,
+    AttentionCall, AttentionOut, AttentionStepCall, AttentionStepOut, DispatchStats, ExpertSlices,
+    FfnCall, GateCall, MatrixClass, NormCall, PlanBackend, ProjectCall, ProjectedQkv,
+    RoutedFfnCall, WeightFormat, WeightFormats, WeightSlice,
 };
 use super::production::{
     add_expert_bias, add_output_bias, add_projection_biases, aggregate_heads,
@@ -61,8 +62,19 @@ use larql_compute::cpu::ops::geglu::{geglu_silu_alloc, silu};
 use ndarray::ArrayView2;
 use rayon::prelude::*;
 
+use super::lowering::LoweringIdentity;
 use super::production::unsupported_activation;
+use super::realization::{
+    class_of, common_selection, resident_profile, RealizationBackend, RealizationForm,
+    RealizationId, RefusalKind, RepresentationFacts, Selection, SelectionReason, SelectionRefusal,
+};
+use crate::format::vindex3::opplan::planned::PlannedOperand;
 use larql_compute::ffn::gelu_tanh;
+
+/// The provider's family ([`PlanBackend::identity`]): the plan's matrix
+/// work on an injected [`MatMul`] device, production CPU glue between.
+pub const IDENTITY_FAMILY: &str = "device-matmul";
+pub const IDENTITY_REVISION: u32 = 1;
 
 /// One MXFP4 matrix as the device trait consumes it:
 /// `(packed, scales, n, k)`.
@@ -137,14 +149,21 @@ impl<M: MatMul + Send> DevicePlanBackend<M> {
         let device = self.device.lock().expect("device dispatch lock");
         // No device kernel consumes stored bf16 yet; refusing names the
         // gap rather than silently widening 50 GB on the host.
-        if matches!(weight, WeightSlice::Bf16(_) | WeightSlice::Q8 { .. }) {
+        if matches!(
+            weight,
+            WeightSlice::Bf16(_) | WeightSlice::Q8 { .. } | WeightSlice::Q4 { .. }
+        ) {
             return Err(VindexError::Parse(format!(
                 "the device backend has no {} kernel; declare F16 or F32 for it",
                 weight.representation()
             )));
         }
         let result = match weight {
-            WeightSlice::Bf16(_) | WeightSlice::Q8 { .. } => {
+            WeightSlice::Bf16(_)
+            | WeightSlice::Q8 { .. }
+            | WeightSlice::Q4 { .. }
+            | WeightSlice::KQuant { .. }
+            | WeightSlice::Fp8Block { .. } => {
                 return Err(VindexError::Parse(format!(
                     "the device backend has no {} kernel; declare F16 or F32 for it",
                     weight.representation()
@@ -333,6 +352,17 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
         &self.name
     }
 
+    /// One identity for every instance, whatever device was injected and
+    /// whatever format table it was built with: the PROVIDER is the plan's
+    /// matrix work over a `MatMul` device with production glue, and that
+    /// is what a pin will hold it to. The device and the per-class formats
+    /// are configuration — the format is already pinned in the
+    /// realization form, and the device is the caller's to name in
+    /// [`Self::name`].
+    fn identity(&self) -> LoweringIdentity {
+        LoweringIdentity::new(IDENTITY_FAMILY, IDENTITY_REVISION)
+    }
+
     fn dispatch_stats(&self) -> Option<DispatchStats> {
         use std::sync::atomic::Ordering;
         Some(DispatchStats {
@@ -346,8 +376,54 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
     /// resident in device memory, and neither of those turns on a host
     /// cache boundary. The operand's size is available and ignored on
     /// purpose.
-    fn weight_format(&self, operand: MatrixOperand) -> WeightFormat {
-        self.formats.for_class(operand.class)
+    fn select(
+        &self,
+        operand: &PlannedOperand,
+        facts: &RepresentationFacts,
+    ) -> Result<Selection, Box<SelectionRefusal>> {
+        let refuse = |kind| {
+            Box::new(SelectionRefusal {
+                operand: operand.operand.clone(),
+                operation: operand.operation,
+                representation: facts.label.clone(),
+                requested: operand.access,
+                kind,
+                considered: vec![],
+            })
+        };
+        // A mapped host bank is a CPU realization; the device path binds
+        // packed banks only, and its routed FFN sums no shared branch.
+        // Both are refused by name before the common arms could admit a
+        // host binding on the device's behalf.
+        if matches!(
+            operand.operation,
+            Operation::ExpertProject { .. } | Operation::SharedExpertProject
+        ) {
+            return Err(refuse(RefusalKind::MissingRealization));
+        }
+        let bank = self.formats.for_class(MatrixClass::RoutedExpertBank);
+        if let Some(common) = common_selection(operand, facts, bank) {
+            return common;
+        }
+        let Some(class) = class_of(operand.operation) else {
+            return Err(refuse(RefusalKind::MissingRealization));
+        };
+        if facts.registered.is_none() {
+            return Err(refuse(RefusalKind::UnregisteredRepresentation));
+        }
+        // This backend's class table is its own declaration for its own
+        // target: the one candidate it offers, named as such.
+        let format = self.formats.for_class(class);
+        let id = RealizationId {
+            backend: RealizationBackend::Device,
+            form: RealizationForm::DeviceResident(format),
+        };
+        Ok(Selection {
+            realization: id,
+            residency: resident_profile(format),
+            reason: SelectionReason::DeviceClassTable,
+            candidates: vec![id],
+        })
     }
 
     fn prepare(&self, weights: &[WeightSlice<'_>]) {
@@ -362,7 +438,11 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
                 // A residency hint computes nothing and must change no
                 // number, so an unplaceable format is skipped here; the
                 // refusal that matters fires where it would be USED.
-                WeightSlice::Bf16(_) | WeightSlice::Q8 { .. } => continue,
+                WeightSlice::Bf16(_)
+                | WeightSlice::Q8 { .. }
+                | WeightSlice::Q4 { .. }
+                | WeightSlice::KQuant { .. }
+                | WeightSlice::Fp8Block { .. } => continue,
                 WeightSlice::F16(bytes) => streams.push(bytes),
                 WeightSlice::Mxfp4 { packed, scales }
                 | WeightSlice::Nvfp4 { packed, scales, .. } => {
@@ -436,8 +516,7 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
                     GateSource::AttentionInput => {}
                     GateSource::FusedQueryProjection => {
                         return Err(VindexError::Parse(
-                            "a fused query/gate projection has no device kernel; refusing"
-                                .to_string(),
+                            super::device_refusal::fused_query_gate_projection_refusal(),
                         ))
                     }
                 }
@@ -522,7 +601,7 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
                 GateSource::AttentionInput => {}
                 GateSource::FusedQueryProjection => {
                     return Err(VindexError::Parse(
-                        "a fused query/gate projection has no device kernel; refusing".to_string(),
+                        super::device_refusal::fused_query_gate_projection_refusal(),
                     ))
                 }
             }
@@ -558,14 +637,25 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
             &routed_input,
         )?;
         let selected = select_experts(&call, &mut logits)?;
+        let ExpertSlices::Fused {
+            gate_up,
+            down,
+            layout,
+        } = call.weights
+        else {
+            return Err(VindexError::Parse(
+                "the device backend binds packed expert banks; a per-expert bank has no device \
+                 realization"
+                    .to_string(),
+            ));
+        };
         let two_inter = FUSED_BRANCHES * call.intermediate;
         let mut out = vec![0.0f32; call.hidden];
         for (expert, weight) in selected {
-            let mut fused = self.gemv(call.gate_up[expert], two_inter, call.hidden, call.x)?;
+            let mut fused = self.gemv(gate_up[expert], two_inter, call.hidden, call.x)?;
             add_expert_bias(&mut fused, call.gate_up_bias, expert);
-            let inner = expert_inner(&call, &fused);
-            let mut expert_out =
-                self.gemv(call.down[expert], call.hidden, call.intermediate, &inner)?;
+            let inner = expert_inner(&call, layout, &fused);
+            let mut expert_out = self.gemv(down[expert], call.hidden, call.intermediate, &inner)?;
             add_expert_bias(&mut expert_out, call.down_bias, expert);
             for (acc, v) in out.iter_mut().zip(&expert_out) {
                 *acc += weight * v;
@@ -575,7 +665,7 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
     }
 
     fn ffn(&self, call: FfnCall<'_>) -> Result<Vec<f32>, VindexError> {
-        super::production::require_plain_gate("device", call.gate_policy)?;
+        super::production::require_executable_gate("device", call.gate_policy)?;
         let inner = match call.gate {
             Some(gate_weight) => {
                 // Up and gate read the same input: one submission.
@@ -588,14 +678,27 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
                 )?;
                 let gate = pair.pop().expect("two matrices in, two vectors out");
                 let up = pair.pop().expect("two matrices in, two vectors out");
-                match call.activation {
-                    Activation::Silu => geglu_silu_alloc(&gate, &up),
-                    Activation::GeluTanh => gate
-                        .iter()
+                // A non-plain gate policy owns the whole combine; the
+                // nonlinearity beside it is inert (K3-ACT-1). Checked
+                // first so the two are never applied together.
+                if let larql_models::ExpertGatePolicy::SituGlu { beta, linear_beta } =
+                    call.gate_policy
+                {
+                    let rule = larql_compute::MoeGateRule::SituGlu { beta, linear_beta };
+                    gate.iter()
                         .zip(&up)
-                        .map(|(g, u)| gelu_tanh(*g) * u)
-                        .collect(),
-                    other => return Err(unsupported_activation("gated", other)),
+                        .map(|(g, u)| rule.combine(*g, *u))
+                        .collect()
+                } else {
+                    match call.activation {
+                        Activation::Silu => geglu_silu_alloc(&gate, &up),
+                        Activation::GeluTanh => gate
+                            .iter()
+                            .zip(&up)
+                            .map(|(g, u)| gelu_tanh(*g) * u)
+                            .collect(),
+                        other => return Err(unsupported_activation("gated", other)),
+                    }
                 }
             }
             None => {

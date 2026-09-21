@@ -7,11 +7,11 @@
 //! present. A corrupted byte must fail verify by name.
 
 use larql_vindex::format::vindex3::fixtures::{
-    dense_f32_model, encode_fixture_container, miniature_glimmer,
+    dense_f32_model, encode_fixture_container, hybrid_lllf_f32_model, miniature_glimmer,
 };
 use vindex_cli::{
-    describe_facts, diff_facts, inspect_facts, precision_facts, represent_facts,
-    representations_facts, verify_facts,
+    describe_facts, diff_facts, inspect_facts, layers_facts, precision_facts,
+    precision_matrix_facts, represent_facts, representations_facts, verify_facts,
 };
 
 fn container() -> tempfile::TempDir {
@@ -53,16 +53,34 @@ fn representations_list_the_physical_directory_with_fidelity() {
 #[test]
 fn describe_finds_an_object_by_suffix_and_shows_its_tensor_table() {
     let dir = container();
-    let v = describe_facts(dir.path(), "decoder_stack", 4).unwrap();
+    let v = describe_facts(dir.path(), "decoder_stack", 4, None).unwrap();
     assert_eq!(v["object"]["id"], "target.decoder_stack");
     let head = &v["directory"][0]["tensor_table_head"];
     assert!(!head.as_array().unwrap().is_empty(), "{v}");
 }
 
 #[test]
+fn describe_peek_decodes_the_actual_values_of_one_tensor() {
+    let dir = container();
+    let v = describe_facts(
+        dir.path(),
+        "decoder_stack",
+        4,
+        Some("input_layernorm.weight"),
+    )
+    .unwrap();
+    let vals = v["peek"]["values"].as_array().unwrap();
+    assert_eq!(vals.len(), 4, "{v}");
+    assert!(vals.iter().all(|x| x.as_f64().unwrap().is_finite()), "{v}");
+
+    let err = describe_facts(dir.path(), "decoder_stack", 4, Some("no.such.tensor")).unwrap_err();
+    assert!(err.contains("tensors:"), "{err}");
+}
+
+#[test]
 fn describe_refuses_an_unknown_address_by_naming_the_holdings() {
     let dir = container();
-    let err = describe_facts(dir.path(), "no.such.object", 4).unwrap_err();
+    let err = describe_facts(dir.path(), "no.such.object", 4, None).unwrap_err();
     assert!(err.contains("the graph holds"), "{err}");
 }
 
@@ -138,6 +156,120 @@ fn diff_refuses_an_encoding_the_container_does_not_hold() {
     let object = report["compiled"][0]["object"].as_str().unwrap();
     let err = diff_facts(out.path(), "F32", "INT8", object, 4, None).unwrap_err();
     assert!(err.contains("the container holds"), "{err}");
+}
+
+#[test]
+fn semantic_addresses_resolve_through_the_plan_not_filenames() {
+    let (out, _) = compiled_container();
+    let v = describe_facts(out.path(), "layer.0.ffn.down", 4, None).unwrap();
+    assert_eq!(v["role"], "FFN DOWN PROJECTION", "{v}");
+    assert_eq!(v["values"].as_array().unwrap().len(), 4, "{v}");
+    let encs: Vec<&str> = v["representations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["encoding"].as_str())
+        .collect();
+    assert!(encs.contains(&"NVFP4"), "{v}");
+
+    let err = describe_facts(out.path(), "layer.99.ffn.down", 4, None).unwrap_err();
+    assert!(err.contains("the plan holds layers"), "{err}");
+}
+
+#[test]
+fn a_semantic_diff_scopes_to_its_one_tensor() {
+    let (out, _) = compiled_container();
+    let v = diff_facts(out.path(), "F32", "NVFP4", "layer.0.ffn.down", 4, None).unwrap();
+    assert_eq!(v["tensors"].as_array().unwrap().len(), 1, "{v}");
+    assert!(v["rms_error"].as_f64().unwrap() > 0.0, "{v}");
+}
+
+#[test]
+fn the_precision_matrix_reads_the_compiled_representation_by_programme() {
+    let (out, _) = compiled_container();
+    let v = precision_matrix_facts(out.path()).unwrap();
+    let programmes = v["programmes"].as_array().unwrap();
+    assert!(!programmes.is_empty(), "{v}");
+    let rows = programmes[0]["rows"].as_array().unwrap();
+    let down = rows[0]["bits"]["down"].as_f64().unwrap();
+    assert!(
+        (down - 4.5).abs() < 0.1,
+        "compiled down at {down} — expected ~4.5\n{v}"
+    );
+    assert!(
+        !v["surfaces"].as_array().unwrap().is_empty(),
+        "embedding/head surfaces expected: {v}"
+    );
+}
+
+#[test]
+fn a_deltanet_layer_refuses_qkvo_and_a_full_attention_layer_answers() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    encode_fixture_container(
+        hybrid_lllf_f32_model,
+        checkpoint.path(),
+        dir.path(),
+        "vindex-cli-hybrid",
+    );
+    // LLLF cadence: layers 0–2 are GatedDelta recurrences, layer 3 attends.
+    let err = describe_facts(dir.path(), "layer.0.attention.q", 2, None).unwrap_err();
+    assert!(err.contains("token mixer is GATED DELTANET"), "{err}");
+    assert!(err.contains("layer.0.mixer"), "{err}");
+
+    let v = describe_facts(dir.path(), "layer.3.attention.q", 2, None).unwrap();
+    assert_eq!(v["role"], "ATTENTION QUERY PROJECTION", "{v}");
+    assert_eq!(v["values"].as_array().unwrap().len(), 2, "{v}");
+}
+
+#[test]
+fn the_mixer_is_a_first_class_semantic_component() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    encode_fixture_container(
+        hybrid_lllf_f32_model,
+        checkpoint.path(),
+        dir.path(),
+        "vindex-cli-hybrid",
+    );
+    let v = describe_facts(dir.path(), "layer.0.mixer", 2, None).unwrap();
+    assert_eq!(v["mixer"], "GATED DELTANET", "{v}");
+    let roles: Vec<&str> = v["operands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|o| o["role"].as_str())
+        .collect();
+    assert!(roles.contains(&"fused recurrent q|k|v"), "{roles:?}");
+    assert!(roles.contains(&"decay projection"), "{roles:?}");
+
+    // Exactly, not "one of these two": a disjunction here passes
+    // whichever answer arrives, and that is how a mixer label derived
+    // from the wrong source survived this suite. See `tests/mixer.rs`.
+    let v = describe_facts(dir.path(), "layer.3.mixer", 2, None).unwrap();
+    assert_eq!(v["mixer"], "SOFTMAX ATTENTION", "{v}");
+
+    let l = layers_facts(dir.path()).unwrap();
+    let mixers: Vec<&str> = l["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["mixer"].as_str())
+        .collect();
+    // The whole sequence. `assert_ne!(mixers[3], "GATED DELTANET")`
+    // stood here and passed for the wrong reason: it holds for every
+    // operator that is not Gated DeltaNet, including the several this
+    // build once mislabelled as one.
+    assert_eq!(
+        mixers,
+        vec![
+            "GATED DELTANET",
+            "GATED DELTANET",
+            "GATED DELTANET",
+            "SOFTMAX ATTENTION"
+        ],
+        "{l}"
+    );
 }
 
 #[test]

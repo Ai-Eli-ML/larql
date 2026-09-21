@@ -5,6 +5,7 @@
 use std::io::Write;
 use std::path::Path;
 
+use larql_models::config::{LAYER_TYPE_FULL_ATTENTION, LAYER_TYPE_LINEAR_ATTENTION};
 use larql_models::inventory::{build_inventory, ArchitectureInventory};
 
 /// Number of layers in the fixture target model.
@@ -460,6 +461,147 @@ pub fn gemma4_shaped_target_with(
     inventory_from(dir, &config, &serde_json::Value::Object(header))
 }
 
+// ── Gemma 3 ──────────────────────────────────────────────────────────
+//
+// The miniature mirrors `google/gemma-3-4b-it`'s config shape and tensor
+// spelling: a multimodal root with `*_index` token roles and
+// `mm_tokens_per_image`; a `text_config` that declares NO `vocab_size`,
+// NO head count and NO head width (HF leaves all three at class defaults
+// — 8 / 4 / 256 — which the parser supplies and the tensors below are
+// shaped to, so the estate binds only if the defaults are right), a
+// flat `rope_scaling = {linear, 8.0}` and a sliding window; a SigLIP
+// `vision_config` with `vision_use_head: false`.
+
+pub const GEMMA3_FIXTURE_LAYERS: usize = 12;
+/// HF's `sliding_window_pattern` class default is 6: every sixth layer
+/// is full attention, so at twelve layers two are — an instrument, not a
+/// single special case.
+pub const GEMMA3_FULL_LAYERS: [usize; 2] = [5, 11];
+pub const GEMMA3_HIDDEN: usize = 32;
+pub const GEMMA3_INTER: usize = 64;
+/// The attention class defaults the real 4B config leaves implicit.
+pub const GEMMA3_Q_HEADS: usize = 8;
+pub const GEMMA3_KV_HEADS: usize = 4;
+pub const GEMMA3_HEAD_DIM: usize = 256;
+/// Deliberately not a power of two and not a multiple of anything the
+/// stack pads to: a width read off the wrong axis or rounded shows.
+pub const GEMMA3_VOCAB: usize = 300;
+pub const GEMMA3_GLOBAL_THETA: f64 = 1_000_000.0;
+pub const GEMMA3_LOCAL_THETA: f64 = 10_000.0;
+pub const GEMMA3_ROPE_FACTOR: f64 = 8.0;
+pub const GEMMA3_SLIDING_WINDOW: usize = 16;
+pub const GEMMA3_VISION_HIDDEN: usize = 16;
+/// The embedding as the checkpoint spells it — the tensor that answers
+/// `vocab_size` when the config does not.
+pub const GEMMA3_EMBED_TENSOR: &str = "language_model.model.embed_tokens.weight";
+
+pub fn gemma3_shaped_target(dir: &Path) -> ArchitectureInventory {
+    gemma3_shaped_target_with(dir, |_| {}, |_| {})
+}
+
+/// The same fixture with `mutate_config` applied to its config and
+/// `mutate_tensors` to its `(name, shape)` list before writing.
+pub fn gemma3_shaped_target_with(
+    dir: &Path,
+    mutate_config: impl FnOnce(&mut serde_json::Value),
+    mutate_tensors: impl FnOnce(&mut Vec<(String, Vec<usize>)>),
+) -> ArchitectureInventory {
+    let mut config = serde_json::json!({
+        "architectures": ["Gemma3ForConditionalGeneration"],
+        "boi_token_index": 255999,
+        "eoi_token_index": 256000,
+        "eos_token_id": [1, 106],
+        "image_token_index": 262144,
+        "initializer_range": 0.02,
+        "mm_tokens_per_image": 256,
+        "model_type": "gemma3",
+        "text_config": {
+            "hidden_size": GEMMA3_HIDDEN,
+            "intermediate_size": GEMMA3_INTER,
+            "model_type": "gemma3_text",
+            "num_hidden_layers": GEMMA3_FIXTURE_LAYERS,
+            "rope_scaling": { "factor": GEMMA3_ROPE_FACTOR, "rope_type": "linear" },
+            "sliding_window": GEMMA3_SLIDING_WINDOW
+        },
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.50.0.dev0",
+        "vision_config": {
+            "hidden_size": GEMMA3_VISION_HIDDEN,
+            "image_size": 896,
+            "intermediate_size": 32,
+            "model_type": "siglip_vision_model",
+            "num_attention_heads": 4,
+            "num_hidden_layers": 1,
+            "patch_size": 14,
+            "vision_use_head": false
+        }
+    });
+    mutate_config(&mut config);
+
+    let h = GEMMA3_HIDDEN;
+    let mut tensors: Vec<(String, Vec<usize>)> = vec![
+        (GEMMA3_EMBED_TENSOR.into(), vec![GEMMA3_VOCAB, h]),
+        ("language_model.model.norm.weight".into(), vec![h]),
+        (
+            "multi_modal_projector.mm_input_projection_weight".into(),
+            vec![GEMMA3_VISION_HIDDEN, h],
+        ),
+        (
+            "multi_modal_projector.mm_soft_emb_norm.weight".into(),
+            vec![GEMMA3_VISION_HIDDEN],
+        ),
+        (
+            "vision_tower.vision_model.embeddings.patch_embedding.weight".into(),
+            vec![GEMMA3_VISION_HIDDEN, 3, 14, 14],
+        ),
+        (
+            "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight".into(),
+            vec![GEMMA3_VISION_HIDDEN, GEMMA3_VISION_HIDDEN],
+        ),
+    ];
+    let q_rows = GEMMA3_Q_HEADS * GEMMA3_HEAD_DIM;
+    let kv_rows = GEMMA3_KV_HEADS * GEMMA3_HEAD_DIM;
+    for layer in 0..GEMMA3_FIXTURE_LAYERS {
+        let stack = format!("language_model.model.layers.{layer}");
+        tensors.push((format!("{stack}.self_attn.q_proj.weight"), vec![q_rows, h]));
+        tensors.push((format!("{stack}.self_attn.k_proj.weight"), vec![kv_rows, h]));
+        tensors.push((format!("{stack}.self_attn.v_proj.weight"), vec![kv_rows, h]));
+        tensors.push((format!("{stack}.self_attn.o_proj.weight"), vec![h, q_rows]));
+        tensors.push((
+            format!("{stack}.self_attn.q_norm.weight"),
+            vec![GEMMA3_HEAD_DIM],
+        ));
+        tensors.push((
+            format!("{stack}.self_attn.k_norm.weight"),
+            vec![GEMMA3_HEAD_DIM],
+        ));
+        for norm in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            tensors.push((format!("{stack}.{norm}.weight"), vec![h]));
+        }
+        tensors.push((
+            format!("{stack}.mlp.gate_proj.weight"),
+            vec![GEMMA3_INTER, h],
+        ));
+        tensors.push((format!("{stack}.mlp.up_proj.weight"), vec![GEMMA3_INTER, h]));
+        tensors.push((
+            format!("{stack}.mlp.down_proj.weight"),
+            vec![h, GEMMA3_INTER],
+        ));
+    }
+    mutate_tensors(&mut tensors);
+    let mut header = serde_json::Map::new();
+    let mut offset = 0u64;
+    for (name, shape) in &tensors {
+        push_tensor(&mut header, &mut offset, name, shape);
+    }
+    inventory_from(dir, &config, &serde_json::Value::Object(header))
+}
+
 /// A drafter-shaped artifact declaring `target_layer_ids` taps into a
 /// deeper producer.
 pub fn drafter_shaped(dir: &Path) -> ArchitectureInventory {
@@ -573,8 +715,53 @@ pub fn drafter_shaped(dir: &Path) -> ArchitectureInventory {
 
 /// A fully-known dense model: recognised family, no unconsumed keys beyond
 /// metadata, uniform attention.
-pub fn known_dense(dir: &Path) -> ArchitectureInventory {
-    let config = serde_json::json!({
+/// [`known_dense`] with the caller's config, for gates that turn on one
+/// declared key rather than on the shape.
+/// Write a config plus one or more **header-only** safetensors shards and
+/// build the inventory over them.
+///
+/// The shards carry the 8-byte length prefix and the header JSON, and stop
+/// there — no payload byte is written. `scan_tensors` reads exactly that
+/// much (`read_shard_header` never seeks past the header and never checks
+/// the file against its own offsets), so every tensor fact — name, dtype,
+/// shape, and the byte count derived from `data_offsets` — is the real one
+/// while the file on disk stays kilobytes.
+///
+/// That is what lets a fixture carry a REAL checkpoint's estate at its real
+/// sizes. [`known_dense_with_config`] and friends write payloads because
+/// encode tests compare bytes; a fixture whose subject is the tensor-address
+/// plane needs the names and geometry, and materialising 1.56 TB to get them
+/// is not an option. Any test that reads a byte of payload must NOT use this.
+///
+/// `shards` maps a shard filename to its safetensors header object.
+pub fn header_only_shards(
+    dir: &Path,
+    config: &serde_json::Value,
+    shards: &serde_json::Map<String, serde_json::Value>,
+) -> ArchitectureInventory {
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    for (name, header) in shards {
+        let header_bytes = serde_json::to_vec(header).unwrap();
+        let mut file = std::fs::File::create(dir.join(name)).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+    }
+    build_inventory(dir).unwrap()
+}
+
+pub fn known_dense_with_config(dir: &Path, config: serde_json::Value) -> ArchitectureInventory {
+    let header = serde_json::json!({
+        "model.embed_tokens.weight":
+            {"dtype": "BF16", "shape": [128, 64], "data_offsets": [0, 16384]}
+    });
+    inventory_from(dir, &config, &header)
+}
+
+/// [`known_dense`]'s config, for gates that add one declared key to a
+/// recognised dense family rather than to the Glimmer shape.
+pub fn known_dense_config() -> serde_json::Value {
+    serde_json::json!({
         "architectures": ["LlamaForCausalLM"],
         "torch_dtype": "bfloat16",
         "model_type": "llama",
@@ -586,10 +773,72 @@ pub fn known_dense(dir: &Path) -> ArchitectureInventory {
         "vocab_size": 128,
         "rms_norm_eps": 1e-5,
         "rope_theta": 10000.0
-    });
-    let header = serde_json::json!({
-        "model.embed_tokens.weight":
-            {"dtype": "BF16", "shape": [128, 64], "data_offsets": [0, 16384]}
-    });
-    inventory_from(dir, &config, &header)
+    })
+}
+
+pub fn known_dense(dir: &Path) -> ArchitectureInventory {
+    known_dense_with_config(dir, known_dense_config())
+}
+
+/// Period of the hybrid interleave: one `full_attention` layer in every
+/// [`HYBRID_FULL_ATTENTION_INTERVAL`], the rest recurrent. The 3:1 Qwen3.8
+/// / Kimi-Linear cadence.
+pub const HYBRID_FULL_ATTENTION_INTERVAL: usize = 4;
+
+/// Depthwise causal conv width over the fused q|k|v channels.
+pub const HYBRID_CONV_KERNEL: usize = 4;
+/// Dk — key-side head width.
+pub const HYBRID_KEY_HEAD_DIM: usize = 16;
+/// Dv — value-side head width.
+pub const HYBRID_VALUE_HEAD_DIM: usize = 16;
+/// Hk — key-side head count.
+pub const HYBRID_KEY_HEADS: usize = 2;
+/// Hv — value-side head count. Larger than [`HYBRID_KEY_HEADS`], as on
+/// Qwen3.8, so a fixture cannot pass by folding the two sides together.
+pub const HYBRID_VALUE_HEADS: usize = 4;
+/// Precision the recurrence keeps its state at.
+pub const HYBRID_STATE_DTYPE: &str = "float32";
+
+/// Whether layer `i` is the full-attention layer of the hybrid cadence.
+fn is_full_attention_layer(i: usize) -> bool {
+    i % HYBRID_FULL_ATTENTION_INTERVAL == HYBRID_FULL_ATTENTION_INTERVAL - 1
+}
+
+/// Write the 3:1 `linear_attention` / `full_attention` cadence into a
+/// config, the way Qwen3.8 and Kimi Linear write it.
+///
+/// Declares *that* the stack is hybrid and nothing about which recurrence
+/// it runs — [`declare_gated_delta_geometry`] is the separate fact that
+/// identifies the operator.
+pub fn declare_hybrid_cadence(config: &mut serde_json::Value) {
+    let layer_types: Vec<&str> = (0..FIXTURE_LAYERS)
+        .map(|i| {
+            if is_full_attention_layer(i) {
+                LAYER_TYPE_FULL_ATTENTION
+            } else {
+                LAYER_TYPE_LINEAR_ATTENTION
+            }
+        })
+        .collect();
+    config["text_config"]["layer_types"] = serde_json::json!(layer_types);
+    config["text_config"]["full_attention_interval"] =
+        serde_json::json!(HYBRID_FULL_ATTENTION_INTERVAL);
+}
+
+/// Declare the geometry that *identifies* the recurrence as Gated
+/// DeltaNet.
+///
+/// Kept separate from [`declare_hybrid_cadence`] because the two are
+/// independent facts and the discriminator is precisely whether this one
+/// is present: a cadence names a recurrence, and only the geometry names
+/// *which* recurrence. `LinearAttentionTopology::from_config` refuses a
+/// partial declaration, so these are declared together or not at all.
+pub fn declare_gated_delta_geometry(config: &mut serde_json::Value) {
+    let text = &mut config["text_config"];
+    text["linear_conv_kernel_dim"] = serde_json::json!(HYBRID_CONV_KERNEL);
+    text["linear_key_head_dim"] = serde_json::json!(HYBRID_KEY_HEAD_DIM);
+    text["linear_value_head_dim"] = serde_json::json!(HYBRID_VALUE_HEAD_DIM);
+    text["linear_num_key_heads"] = serde_json::json!(HYBRID_KEY_HEADS);
+    text["linear_num_value_heads"] = serde_json::json!(HYBRID_VALUE_HEADS);
+    text["mamba_ssm_dtype"] = serde_json::json!(HYBRID_STATE_DTYPE);
 }

@@ -2,10 +2,27 @@
 //! explicit, and closure blocks on every shortfall.
 
 mod closure;
+pub(crate) mod conv_qkv;
 mod coverage_opplan;
 mod gemma4_closure;
+mod heterogeneous_ffn_width;
+mod hyper_connection_refusal;
+mod k3_attnres_addressing;
+mod k3_latentmoe_closure;
+mod k3_q_lora_closure;
+mod k3_rep_gate_closure;
+mod kda_mla_exec;
+mod kda_op;
+mod kimi_mla_closure;
+mod kimi_moe_closure;
+pub(crate) mod mamba2;
+mod mla_op;
 mod plan;
+mod planned;
+mod post_norm_placement;
+mod tied_head_realization;
 mod unjudged;
+mod wave18_hc_carriage;
 
 use std::path::PathBuf;
 
@@ -52,3 +69,4 @@ pub(super) fn encoded_fixture() -> PlannedFixture {
         named,
     }
 }
+mod wave18_hc_baseline;

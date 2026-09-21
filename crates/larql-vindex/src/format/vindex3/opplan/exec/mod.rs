@@ -18,56 +18,226 @@
 //! after the FFN residual add) so parity can compare layer by layer
 //! against a checkpoint-driven oracle.
 
+pub mod accounting;
+pub mod attention_residual;
+pub mod attested_fidelity;
 pub mod backend;
 pub mod continuation;
+pub mod controls;
+pub mod conv_qkv;
 pub mod cpu;
 pub mod decode;
 pub mod device;
+pub mod device_refusal;
 mod experts;
+pub mod fidelity_carriage;
 pub mod gated_delta;
+pub mod hyper_connection;
+pub mod intervene;
+pub mod intervene_heads;
+pub mod kda;
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+pub mod kda_metal;
 pub mod kernels;
+pub mod kimi_kda_layer;
+pub mod kimi_mla_layer;
+pub mod kimi_moe_block;
+pub mod kimi_router;
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+pub mod kimi_source;
 pub mod kv;
+pub mod lowering;
+pub mod mamba2;
+pub mod mla;
 pub mod narrow;
 pub mod observe;
+pub mod observe_heads;
+pub mod observe_lens;
+pub mod observe_stats;
 pub mod operands;
+pub mod prefetch;
 pub mod prepared;
 pub mod production;
+pub mod provenance;
 pub mod quantise;
+pub mod realization;
 pub mod reference;
+pub mod requirements;
+pub mod routing_trace;
+pub mod stack;
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+pub mod stack_metal;
+pub mod stages;
 pub mod timing;
+pub mod token;
 pub mod weights;
 
 #[cfg(test)]
 mod tests;
 
-use larql_models::config::GateSource;
+use std::borrow::Cow;
 
+use larql_models::config::{GateSource, HyperConnection};
+
+use self::attention_residual::{BoundaryPhase, History};
 use super::{AttentionOp, ComponentOpPlan, LayerPlan};
 use crate::error::VindexError;
+
 use backend::{
     AttentionCall, AttentionStepCall, BiasCall, GateCall, NormCall, PlanBackend, ProjectCall,
     QkNormCall, SinkCall,
 };
+use hyper_connection::{Bundle, Mutation, SinkhornSplit, SiteReduction};
 use kv::KvState;
+use observe::HcSite;
 use operands::OperandSource;
-use prepared::{ExecutionSlice, PreparedAttention, PreparedLayer, PreparedOperands};
+use prepared::{
+    ExecutionSlice, PreparedAttention, PreparedAttnResSite, PreparedHcSite, PreparedLayer,
+    PreparedOperands,
+};
 use rayon::prelude::*;
-use reference::ReferenceBackend;
 use weights::{load_weight, LoadedWeight};
+
+/// One plane of the traversal — the residual at a layer boundary, one
+/// entry per position — typed by the component's residual topology
+/// (wave 19b).
+///
+/// The batch carrier is `[positions, streams, hidden]` on a
+/// hyper-connected component and `[positions, hidden]` everywhere else,
+/// and the two are different types rather than one wider row: the
+/// stream count and the hidden width are different semantic dimensions,
+/// and a consumer that reads a plane must say which it expects. A
+/// `[hidden]` row never comes out of a bundle here; it comes out of a
+/// site's reduction or the head's, inside the traversal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Plane {
+    /// One `[hidden]` row per position — every component before
+    /// hyper-connections. Serialises and persists exactly as it always
+    /// has.
+    Rows(Vec<Vec<f32>>),
+    /// One bundle per position — a hyper-connected component's residual.
+    Bundles(Vec<Bundle>),
+    /// One residual HISTORY per position — an attention-residual
+    /// component's carrier (K3-ATTNRES-1 2b).
+    ///
+    /// The invariant this type exists to hold: **batching may vectorise
+    /// the branch computation; it may not merge, share, reorder or
+    /// reinterpret residual history.** Each position's snapshots are its
+    /// own, taken at the same layers but from its own entering states,
+    /// and a plane that collapsed them to one shared history would still
+    /// produce plausible numbers at every site.
+    Histories(Vec<attention_residual::History>),
+}
+
+impl Plane {
+    /// How many positions the plane holds.
+    pub fn positions(&self) -> usize {
+        match self {
+            Self::Rows(rows) => rows.len(),
+            Self::Bundles(bundles) => bundles.len(),
+            Self::Histories(histories) => histories.len(),
+        }
+    }
+
+    /// The `[hidden]` rows, refused on a bundle plane. For consumers that
+    /// can only mean one thing by a plane — persistence, comparison
+    /// against a single-stream reference.
+    pub fn try_rows(&self) -> Result<&[Vec<f32>], VindexError> {
+        match self {
+            Self::Rows(rows) => Ok(rows),
+            Self::Bundles(bundles) => Err(VindexError::Parse(format!(
+                "this plane holds {} bundles of {} streams, not [hidden] rows; the component is \
+                 hyper-connected and the reader must say what a bundle means to it",
+                bundles.len(),
+                bundles.first().map_or(0, Bundle::streams)
+            ))),
+            Self::Histories(histories) => Err(VindexError::Parse(format!(
+                "this plane holds {} residual histories, not [hidden] rows; the component \
+                 declares the attention-residual topology and the reader must say what a \
+                 prefix-plus-snapshots state means to it",
+                histories.len()
+            ))),
+        }
+    }
+
+    /// [`Self::try_rows`] for callers on a single-stream component, where
+    /// a bundle is a programming error rather than a model.
+    pub fn rows(&self) -> &[Vec<f32>] {
+        self.try_rows().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// The bundles, `None` on a row plane.
+    pub fn bundles(&self) -> Option<&[Bundle]> {
+        match self {
+            Self::Rows(_) | Self::Histories(_) => None,
+            Self::Bundles(bundles) => Some(bundles),
+        }
+    }
+
+    /// The residual histories, `None` on every other plane.
+    pub fn histories(&self) -> Option<&[attention_residual::History]> {
+        match self {
+            Self::Rows(_) | Self::Bundles(_) => None,
+            Self::Histories(histories) => Some(histories),
+        }
+    }
+}
 
 /// Per-layer hidden-state taps, mirroring the production hook points.
 #[derive(Debug)]
 pub struct LayerTrace {
-    /// Hidden state after the attention residual add, per position.
-    pub post_attention: Vec<Vec<f32>>,
+    /// The residual after the attention sublayer's update, per position.
+    pub post_attention: Plane,
     /// The FFN's NORMED input (pre-FFN norm applied), per position —
     /// the vector the layer's gates multiply. This is the residual
     /// statistic V2's walk-FFN trace captures, and therefore the tap
     /// mutation capture must use: a gate built from anything else
-    /// fires against a different vector than it was aimed at.
+    /// fires against a different vector than it was aimed at. A
+    /// `[hidden]` row on every topology: it is the ordinary operator's
+    /// input, which a site has already reduced.
     pub ffn_input: Vec<Vec<f32>>,
-    /// Hidden state after the FFN residual add, per position.
-    pub post_layer: Vec<Vec<f32>>,
+    /// The residual after the FFN sublayer's update, per position.
+    pub post_layer: Plane,
+}
+
+/// What the stack's exit produced: the `[hidden]` vector the final norm
+/// and head read, or — on a layer-range image of a hyper-connected
+/// component, which has no exit — the bundle after the last layer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FinalState {
+    Hidden(Vec<f32>),
+    Bundle(Bundle),
+    /// The last position's residual history, on a layer-range image of
+    /// an attention-residual component — its output IS the state it
+    /// hands on, and there is no `[hidden]` exit without the exit
+    /// reduction a whole-stack image runs.
+    History(attention_residual::History),
+}
+
+impl FinalState {
+    /// The final `[hidden]` vector, refused when the run ended on a
+    /// bundle.
+    pub fn try_hidden(&self) -> Result<&[f32], VindexError> {
+        match self {
+            Self::Hidden(h) => Ok(h),
+            Self::Bundle(b) => Err(VindexError::Parse(format!(
+                "the run ended on a bundle of {} streams — a layer-range image of a \
+                 hyper-connected component has no [hidden] exit",
+                b.streams()
+            ))),
+            Self::History(h) => Err(VindexError::Parse(format!(
+                "the run ended on a residual history of {} snapshot(s) — a layer-range image \
+                 of an attention-residual component has no [hidden] exit until the exit \
+                 reduction runs",
+                h.snapshot_count()
+            ))),
+        }
+    }
+
+    /// [`Self::try_hidden`] for callers on a single-stream component.
+    pub fn hidden(&self) -> &[f32] {
+        self.try_hidden().unwrap_or_else(|e| panic!("{e}"))
+    }
 }
 
 /// The full execution record of one component over one token sequence.
@@ -81,12 +251,91 @@ pub struct ExecutionTrace {
     /// per-layer margin below means what it appears to mean. It is the
     /// same tap `scripts/dump_layers_hf.py` takes with a pre-hook on
     /// layer 0.
-    pub embedded: Vec<Vec<f32>>,
+    pub embedded: Plane,
     pub layers: Vec<LayerTrace>,
-    /// Final-normed hidden state of the last position.
-    pub final_hidden: Vec<f32>,
+    /// Plan indices of the layers that actually ran, in order.
+    ///
+    /// A reduced-depth run has to be able to prove it executed the
+    /// prefix it asked for rather than silently falling back to the
+    /// whole stack — and a full run has to be able to prove the reverse.
+    /// `layers` alone cannot say that: a count is not an identity.
+    pub executed_layers: Vec<usize>,
+    /// What the last position left the stack as.
+    pub exit: FinalState,
     /// Logits of the last position, when the plan carries an output op.
     pub logits: Option<Vec<f32>>,
+}
+
+impl ExecutionTrace {
+    /// Final-normed hidden state of the last position (single-stream
+    /// callers; see [`FinalState::hidden`]).
+    pub fn final_hidden(&self) -> &[f32] {
+        self.exit.hidden()
+    }
+}
+
+/// One hyper-connection site's intermediate state for every position of
+/// the batch (wave 19b) — the batch form of
+/// [`observe::HcSiteRecord`], indexed by position.
+#[derive(Debug, Clone, Copy)]
+pub struct HcSitePlane<'a> {
+    pub layer: usize,
+    pub site: HcSite,
+    pub splits: &'a [SinkhornSplit],
+    pub reduced: &'a [Vec<f32>],
+    pub branch_outputs: &'a [Vec<f32>],
+    pub bundles_out: &'a [Bundle],
+}
+
+/// One attention-residual site across every position (K3-ATTNRES-1 2b) —
+/// the batch counterpart of
+/// [`AttnResSiteRecord`](super::observe::AttnResSiteRecord).
+///
+/// Everything here is per position and in position order, and that is
+/// the point: a witness that could not tell the positions apart would
+/// pass a traversal that shared one history between them.
+#[derive(Debug)]
+pub struct AttnResSitePlane<'a> {
+    pub layer: usize,
+    pub site: HcSite,
+    /// Each position's distribution over its OWN candidates, and the
+    /// vector it mixed to.
+    pub reductions: &'a [attention_residual::Reduction],
+    /// Each position's prefix as the site was ENTERED — before any
+    /// boundary event of this layer reset it, which is the point the
+    /// decode record captures too. Recording it after the reset would
+    /// make the two paths describe different moments and A7 would be
+    /// comparing a batch fact against a decode fact of another name.
+    pub prefixes_before: &'a [Vec<f32>],
+    /// Each position's snapshot count as the site was entered.
+    ///
+    /// Per position rather than one scalar even though the schedule
+    /// makes them equal: a witness handed the count of position 0 could
+    /// not tell a traversal whose positions had drifted apart in DEPTH
+    /// from one whose positions agree, and the equality is a property to
+    /// be checked rather than a shape to be assumed.
+    pub snapshot_counts_before: &'a [usize],
+    pub branch_outputs: &'a [Vec<f32>],
+    /// Each position's history after its own write.
+    pub histories_out: &'a [attention_residual::History],
+}
+
+/// One block-boundary event across every position — the batch
+/// counterpart of
+/// [`AttnResBoundaryRecord`](super::observe::AttnResBoundaryRecord).
+#[derive(Debug)]
+pub struct AttnResBoundaryPlane<'a> {
+    pub layer: usize,
+    pub snapshots_before: usize,
+    pub snapshots_after: usize,
+    /// The vector appended at each position — its OWN entering prefix
+    /// state, never a shared one.
+    pub values: &'a [Vec<f32>],
+    /// Each position's entering prefix, so a witness can ASSERT that the
+    /// appended vector is that prefix rather than trusting the caller
+    /// passed the right one. Two of the rung's controls perturb exactly
+    /// the difference between these two fields.
+    pub entering_prefixes: &'a [Vec<f32>],
 }
 
 /// A plane handed to the caller the moment it exists, so a long run can
@@ -96,9 +345,22 @@ pub struct ExecutionTrace {
 pub enum PlaneEvent<'a> {
     /// The residual entering layer 0 — plane 000. Not emitted when a
     /// [`ResumePoint`] skips the embedding.
-    Embedded(&'a [Vec<f32>]),
+    Embedded(&'a Plane),
     /// One completed layer's taps, in layer order.
     Layer { index: usize, trace: LayerTrace },
+    /// One hyper-connection site's state, every position, emitted after
+    /// the site's update and before the layer's own plane. Only a
+    /// hyper-connected component emits it.
+    HyperConnectionSite(HcSitePlane<'a>),
+    /// One attention-residual site's state at every position, emitted
+    /// after that site's per-position updates. Only a component that
+    /// declares the topology emits it, and only where the reference
+    /// reduces — layer 0's attention site emits nothing.
+    AttentionResidualSite(AttnResSitePlane<'a>),
+    /// One block-boundary event across every position, emitted between
+    /// the attention site's reduction and the attention branch — the
+    /// third contract point of a site under this topology.
+    AttentionResidualBoundary(AttnResBoundaryPlane<'a>),
 }
 
 /// Where an interrupted execution restarts.
@@ -106,22 +368,31 @@ pub enum PlaneEvent<'a> {
 /// The residual leaving layer `next_layer - 1` (plane `next_layer`) is
 /// exactly the state entering `next_layer`, so a persisted plane resumes
 /// the run bit-identically — no separate checkpoint format exists, and
-/// none should: two formats could disagree.
+/// none should: two formats could disagree. On a hyper-connected
+/// component the plane is bundles, and a row plane is refused.
 #[derive(Debug)]
 pub struct ResumePoint {
     /// Index of the first layer still to execute.
     pub next_layer: usize,
-    /// The residual entering that layer, one row per position.
-    pub hidden: Vec<Vec<f32>>,
+    /// The residual entering that layer, one entry per position.
+    pub hidden: Plane,
 }
 
 /// What execution produces beyond the streamed planes.
 #[derive(Debug)]
 pub struct FinalOutput {
-    /// Final-normed hidden state of the last position.
-    pub final_hidden: Vec<f32>,
+    /// What the last position left the stack as.
+    pub exit: FinalState,
     /// Logits of the last position, when the plan carries an output op.
     pub logits: Option<Vec<f32>>,
+}
+
+impl FinalOutput {
+    /// Final-normed hidden state of the last position (single-stream
+    /// callers; see [`FinalState::hidden`]).
+    pub fn final_hidden(&self) -> &[f32] {
+        self.exit.hidden()
+    }
 }
 
 /// Execute a text-component plan on the reference backend.
@@ -133,7 +404,15 @@ pub fn execute_text<'s>(
     store: impl Into<OperandSource<'s>>,
     tokens: &[u32],
 ) -> Result<ExecutionTrace, VindexError> {
-    execute_plan(plan, store.into(), tokens, &ReferenceBackend::new())
+    // The oracle by request, from the shipped registry — not by
+    // privileged construction (LOWERING-PLUGIN-1, L3).
+    execute_plan_via(
+        plan,
+        store.into(),
+        tokens,
+        &lowering::LoweringRegistry::shipped(),
+        &lowering::LoweringIdentity::reference(),
+    )
 }
 
 /// Execute a text-component plan over `tokens` on `backend`, tracing
@@ -147,20 +426,65 @@ pub fn execute_plan<'s, B: PlanBackend + ?Sized>(
     tokens: &[u32],
     backend: &B,
 ) -> Result<ExecutionTrace, VindexError> {
+    execute_slice(plan, store, tokens, backend, ExecutionSlice::Full)
+}
+
+/// [`execute_plan`] on the provider `provider` names in `lowerings` — the
+/// registry-carried path (LOWERING-PLUGIN-1, L2).
+///
+/// The registry is the caller's value and the identity is the caller's
+/// choice; a provider the registry does not hold is refused here, by
+/// identity and naming every provider it does hold, before any operand
+/// is read. Nothing below constructs a provider the caller did not
+/// register.
+pub fn execute_plan_via<'s>(
+    plan: &ComponentOpPlan,
+    store: impl Into<OperandSource<'s>>,
+    tokens: &[u32],
+    lowerings: &lowering::LoweringRegistry,
+    provider: &lowering::LoweringIdentity,
+) -> Result<ExecutionTrace, VindexError> {
+    let backend = lowerings.provider(provider)?;
+    execute_plan(plan, store, tokens, backend)
+}
+
+/// [`execute_plan`] over a chosen [`ExecutionSlice`].
+///
+/// `execute_plan` is this with [`ExecutionSlice::Full`], so the two can
+/// never disagree about what a whole model means.
+pub fn execute_slice<'s, B: PlanBackend + ?Sized>(
+    plan: &ComponentOpPlan,
+    store: impl Into<OperandSource<'s>>,
+    tokens: &[u32],
+    backend: &B,
+    slice: ExecutionSlice,
+) -> Result<ExecutionTrace, VindexError> {
     let store = store.into();
-    let mut embedded = Vec::new();
+    let mut embedded = Plane::Rows(Vec::new());
     let mut layers = Vec::with_capacity(plan.layers.len());
-    let out = execute_plan_streaming(plan, store, tokens, backend, None, &mut |event| {
+    let mut executed_layers = Vec::with_capacity(plan.layers.len());
+    let ops = PreparedOperands::load(plan, store, backend, slice)?;
+    let out = execute_prepared_streaming(plan, &ops, tokens, backend, None, &mut |event| {
         match event {
-            PlaneEvent::Embedded(rows) => embedded = rows.to_vec(),
-            PlaneEvent::Layer { trace, .. } => layers.push(trace),
+            PlaneEvent::Embedded(plane) => embedded = plane.clone(),
+            PlaneEvent::Layer { index, trace } => {
+                layers.push(trace);
+                executed_layers.push(index);
+            }
+            // The trace is the layer boundaries; a site's state and a
+            // boundary event are for the streaming sink, which is where
+            // the witness reads them.
+            PlaneEvent::HyperConnectionSite(_)
+            | PlaneEvent::AttentionResidualSite(_)
+            | PlaneEvent::AttentionResidualBoundary(_) => {}
         }
         Ok(())
     })?;
     Ok(ExecutionTrace {
         embedded,
         layers,
-        final_hidden: out.final_hidden,
+        executed_layers,
+        exit: out.exit,
         logits: out.logits,
     })
 }
@@ -195,6 +519,41 @@ pub fn execute_prepared_streaming<B: PlanBackend + ?Sized>(
     resume: Option<ResumePoint>,
     sink: &mut dyn FnMut(PlaneEvent) -> Result<(), VindexError>,
 ) -> Result<FinalOutput, VindexError> {
+    execute_prepared_streaming_with(plan, ops, tokens, backend, resume, sink, Mutation::None)
+}
+
+/// [`execute_prepared_streaming`] under a deliberate defect — the
+/// wave-19b negative controls on the batch path. Test-only: production
+/// has exactly one way in, and it passes [`Mutation::None`].
+#[cfg(test)]
+pub(super) fn execute_prepared_streaming_mutated<B: PlanBackend + ?Sized>(
+    plan: &ComponentOpPlan,
+    ops: &PreparedOperands,
+    tokens: &[u32],
+    backend: &B,
+    resume: Option<ResumePoint>,
+    sink: &mut dyn FnMut(PlaneEvent) -> Result<(), VindexError>,
+    mutation: Mutation,
+) -> Result<FinalOutput, VindexError> {
+    execute_prepared_streaming_with(plan, ops, tokens, backend, resume, sink, mutation)
+}
+
+fn execute_prepared_streaming_with<B: PlanBackend + ?Sized>(
+    plan: &ComponentOpPlan,
+    ops: &PreparedOperands,
+    tokens: &[u32],
+    backend: &B,
+    resume: Option<ResumePoint>,
+    sink: &mut dyn FnMut(PlaneEvent) -> Result<(), VindexError>,
+    mutation: Mutation,
+) -> Result<FinalOutput, VindexError> {
+    // A pin whose provider has gone or changed invalidates the image;
+    // nothing here falls back to another realization. The registry is
+    // the image's own — the store's — never a built-in default.
+    ops.ensure_providers_in(ops.registry())?;
+    // And the pin's OTHER authority: the provider executing these pins
+    // is the provider that decided them (LOWERING-PLUGIN-1, L4).
+    ops.ensure_lowered_by(backend)?;
     // A one-shot forward owns whatever continuation state the plan needs.
     //
     // For a wholly-softmax stack that is nothing: `None` keeps the
@@ -213,13 +572,23 @@ pub fn execute_prepared_streaming<B: PlanBackend + ?Sized>(
             resume,
             sink,
             None::<&mut dyn KvState>,
+            mutation,
         );
     }
     let mut owned = kv::RowKvState::default();
     owned.prepare_continuation(
         &continuation::plan_continuation_geometry(plan).map_err(VindexError::Parse)?,
     )?;
-    traverse(plan, ops, tokens, backend, resume, sink, Some(&mut owned))
+    traverse(
+        plan,
+        ops,
+        tokens,
+        backend,
+        resume,
+        sink,
+        Some(&mut owned),
+        mutation,
+    )
 }
 
 /// Batch prefill (VI3-INF-3): the batch traversal over `tokens`,
@@ -280,6 +649,7 @@ pub fn prefill_prepared<B: PlanBackend + ?Sized>(
         None,
         &mut |_| Ok(()),
         Some(&mut *kv),
+        Mutation::None,
     )?;
     kv.set_position(base + tokens.len());
     Ok(out)
@@ -292,6 +662,7 @@ pub fn prefill_prepared<B: PlanBackend + ?Sized>(
 /// decode-vs-batch parity gates are the guarantee), plus the rows.
 /// `kv` and `resume` do not combine: a resumed run has already skipped
 /// layers whose rows a provider would need.
+#[allow(clippy::too_many_arguments)]
 fn traverse<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
     plan: &ComponentOpPlan,
     ops: &PreparedOperands,
@@ -300,6 +671,7 @@ fn traverse<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
     resume: Option<ResumePoint>,
     sink: &mut dyn FnMut(PlaneEvent) -> Result<(), VindexError>,
     mut kv: Option<&mut K>,
+    mutation: Mutation,
 ) -> Result<FinalOutput, VindexError> {
     let embedding = plan.embedding.as_ref().ok_or_else(|| {
         VindexError::Parse(format!(
@@ -308,6 +680,11 @@ fn traverse<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
         ))
     })?;
     let hidden = embedding.table.shape[1];
+    let topology = ops.hyper_connection();
+    // The declared block period, `None` on every other topology — the
+    // ONE fact the attention-residual schedule needs, and the same fact
+    // the decode traversal reads.
+    let block_size = ops.attention_residual_block_size();
 
     // **Refuse before any output.** A recurrence needs durable buffers,
     // and discovering at layer 63 that nobody can hold them would mean
@@ -316,8 +693,37 @@ fn traverse<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
     // QW-1 put this refusal up front for exactly that reason; the
     // question it asks has changed (from "can this run at all" to "can
     // this provider hold the state"), its position must not.
+    //
+    // Scoped to the layers this slice will actually execute. For `Full`
+    // that is every layer and the check is unchanged; a reduced-depth
+    // draft must not be refused — or charged state — for a recurrence in
+    // a layer it never runs.
+    //
+    // Driven by the CONTINUATION GEOMETRY, not by "is this layer
+    // softmax": the question is which region a layer needs, and there
+    // are now three answers. An earlier form asked every non-softmax
+    // layer for recurrent buffers, which was right while a recurrence
+    // was the only alternative to rows and became wrong the moment MLA
+    // executed — it keeps a per-position latent cache and no recurrence
+    // at all, so the pre-flight would have refused a state the provider
+    // was holding perfectly well.
+    let executed = ops.first_layer()..ops.first_layer() + ops.layers().len();
+    let regions = continuation::plan_continuation_geometry(plan).map_err(|e| {
+        VindexError::Parse(format!(
+            "component `{}` declares continuation state this build cannot size: {e}",
+            plan.component
+        ))
+    })?;
     for (offset, layer) in plan.layers.iter().enumerate() {
-        if layer.attention.softmax().is_some() {
+        if !executed.contains(&offset) {
+            continue;
+        }
+        let region = &regions[offset];
+        if matches!(
+            region,
+            continuation::LayerContinuationGeometry::Kv(_)
+                | continuation::LayerContinuationGeometry::Stateless
+        ) {
             continue;
         }
         let Some(provider) = kv.as_mut() else {
@@ -328,13 +734,24 @@ fn traverse<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
                 layer.attention.declared_name(),
             )));
         };
-        provider.recurrent_state(offset).map_err(|e| {
+        let named = |e: kv::ContinuationError| {
             VindexError::Parse(format!(
                 "layer {} carries `{}`: {e}",
                 layer.layer,
                 layer.attention.declared_name(),
             ))
-        })?;
+        };
+        match region {
+            continuation::LayerContinuationGeometry::Recurrent(_)
+            | continuation::LayerContinuationGeometry::KvAndRecurrent { .. } => {
+                provider.recurrent_state(offset).map_err(named)?;
+            }
+            continuation::LayerContinuationGeometry::LatentKv(_) => {
+                provider.latent_state(offset).map_err(named)?;
+            }
+            continuation::LayerContinuationGeometry::Kv(_)
+            | continuation::LayerContinuationGeometry::Stateless => {}
+        }
     }
 
     let (start_layer, mut h) = match resume {
@@ -346,17 +763,68 @@ fn traverse<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
                     plan.layers.len()
                 )));
             }
-            if point.hidden.len() != tokens.len() {
+            if point.hidden.positions() != tokens.len() {
                 return Err(VindexError::Parse(format!(
                     "resume state carries {} positions but the fixture has {} tokens",
-                    point.hidden.len(),
+                    point.hidden.positions(),
                     tokens.len()
                 )));
             }
-            if point.hidden.iter().any(|row| row.len() != hidden) {
-                return Err(VindexError::Parse(format!(
-                    "resume state rows do not match the plan's hidden size {hidden}"
-                )));
+            // The plane's kind must be the component's residual: a row
+            // plane on a hyper-connected component would run the bundle
+            // as one stream, and a bundle plane on a single stream has
+            // no reading at all.
+            match (&point.hidden, topology) {
+                (Plane::Rows(rows), None) => {
+                    if rows.iter().any(|row| row.len() != hidden) {
+                        return Err(VindexError::Parse(format!(
+                            "resume state rows do not match the plan's hidden size {hidden}"
+                        )));
+                    }
+                }
+                (Plane::Bundles(bundles), Some(hc)) => {
+                    if bundles
+                        .iter()
+                        .any(|b| b.streams() != hc.streams || b.hidden() != hidden)
+                    {
+                        return Err(VindexError::Parse(format!(
+                            "resume bundles do not match the component's {} streams x {hidden}",
+                            hc.streams
+                        )));
+                    }
+                }
+                (Plane::Rows(_), Some(hc)) => {
+                    return Err(VindexError::Parse(format!(
+                        "component `{}` declares {} residual streams; a resume point for it \
+                         carries bundles, not rows",
+                        plan.component, hc.streams
+                    )));
+                }
+                // A history resume point is REFUSED, not supported.
+                // Carrying a typed state through a traversal and being
+                // able to reconstruct it from an external representation
+                // are different capabilities: nothing reads a serialised
+                // prefix-plus-snapshots state back, and inventing a
+                // format for one nothing consumes is the addressability
+                // -without-execution mistake in a new place. It returns
+                // when a real reader is built.
+                (Plane::Histories(histories), _) => {
+                    return Err(VindexError::Parse(format!(
+                        "component `{}` declares the attention-residual topology; a resume \
+                         point carrying {} residual histories is not supported — nothing \
+                         reads a snapshot history back from an external representation, and \
+                         this build will not invent a format for one",
+                        plan.component,
+                        histories.len()
+                    )));
+                }
+                (Plane::Bundles(_), None) => {
+                    return Err(VindexError::Parse(format!(
+                        "component `{}` declares a single residual stream; a resume point for \
+                         it carries rows, not bundles",
+                        plan.component
+                    )));
+                }
             }
             (point.next_layer, point.hidden)
         }
@@ -388,6 +856,26 @@ fn traverse<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
                     });
                 }
             }
+            // The embedding enters a hyper-connected stack replicated
+            // into every stream, per position — after its scale and
+            // norm, which belong to the lookup.
+            let h = match (topology, block_size) {
+                (Some(hc), _) => Plane::Bundles(
+                    h.iter()
+                        .map(|row| Bundle::replicate(row, hc.streams))
+                        .collect(),
+                ),
+                // Each position enters as its OWN first prefix with an
+                // EMPTY history — nothing is replicated and nothing is
+                // shared. Every later divergence between positions
+                // begins here.
+                (None, Some(_)) => Plane::Histories(
+                    h.into_iter()
+                        .map(attention_residual::History::new)
+                        .collect(),
+                ),
+                (None, None) => Plane::Rows(h),
+            };
             sink(PlaneEvent::Embedded(&h))?;
             (0, h)
         }
@@ -407,35 +895,117 @@ fn traverse<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
             hidden,
             backend,
             capture,
+            topology,
+            block_size,
+            index,
+            sink,
+            mutation,
         )?;
         sink(PlaneEvent::Layer { index, trace })?;
     }
 
-    let last = h.last().ok_or_else(|| {
-        VindexError::Parse("cannot execute over an empty token sequence".to_string())
-    })?;
-    let final_hidden = match ops.final_norm() {
-        Some(norm) => norm.apply(backend, last),
-        None => last.clone(),
-    };
-    let logits = match ops.output() {
-        Some((output, weight)) => {
-            let vocab = output.projection.shape[0];
-            Some(backend.output_head(
-                weight.slice(),
-                vocab,
-                hidden,
-                &final_hidden,
-                output.multiplier,
-                output.softcapping,
-            )?)
+    // ── The exit ──
+    //
+    // A bundle leaves the stack through the head's OWN reduction (a
+    // different operation from a site's — no Sinkhorn) when the image
+    // carries one, and a whole-stack image of a hyper-connected
+    // component always does (preparation refuses otherwise). A
+    // layer-range image has no exit: the bundle after its last layer IS
+    // its output, and it produces no logits.
+    let empty = || VindexError::Parse("cannot execute over an empty token sequence".to_string());
+    let (exit, logits) = match h {
+        Plane::Rows(rows) => {
+            let last = rows.last().ok_or_else(empty)?;
+            let final_hidden = match ops.final_norm() {
+                Some(norm) => norm.apply(backend, last),
+                None => last.clone(),
+            };
+            let logits = ops.head_over_normed(backend, &final_hidden)?;
+            (FinalState::Hidden(final_hidden), logits)
         }
-        None => None,
+        // The attention-residual exit: the same reduction a site runs,
+        // once per position, over that position's WHOLE history plus its
+        // prefix, before the final norm. Required by the declaration —
+        // preparation refuses a whole-stack image without the pair — so
+        // the `None` arm is the layer-range image, whose output IS the
+        // history it hands on.
+        Plane::Histories(mut histories) => {
+            let last = histories.pop().ok_or_else(empty)?;
+            match ops.attention_residual_exit() {
+                Some(exit) if mutation != Mutation::AttnResExitSkipped => {
+                    let pair = match mutation {
+                        // The control that makes "the SHIPPED pair" a
+                        // claim: reduce with a layer's pair instead.
+                        Mutation::AttnResExitUsesALayerPair => ops.layers()[0]
+                            .attention_residual
+                            .as_ref()
+                            .map(|sites| sites.ffn.pair())
+                            .unwrap_or_else(|| exit.pair()),
+                        _ => exit.pair(),
+                    };
+                    let reduced =
+                        attention_residual::reduce(&last, pair, exit.norm_eps(), mutation)?.mixed;
+                    let final_hidden = match ops.final_norm() {
+                        Some(norm) => norm.apply(backend, &reduced),
+                        None => reduced,
+                    };
+                    let logits = ops.head_over_normed(backend, &final_hidden)?;
+                    (FinalState::Hidden(final_hidden), logits)
+                }
+                Some(_) => {
+                    let prefix = last.clone().into_prefix()?;
+                    let final_hidden = match ops.final_norm() {
+                        Some(norm) => norm.apply(backend, &prefix),
+                        None => prefix,
+                    };
+                    let logits = ops.head_over_normed(backend, &final_hidden)?;
+                    (FinalState::Hidden(final_hidden), logits)
+                }
+                None => {
+                    if ops.final_norm().is_some() || ops.output().is_some() {
+                        return Err(VindexError::Parse(
+                            "an attention-residual history reached a whole-stack exit with no \
+                             exit reduction; preparation should have refused the image"
+                                .to_string(),
+                        ));
+                    }
+                    (FinalState::History(last), None)
+                }
+            }
+        }
+        Plane::Bundles(mut bundles) => {
+            let last = bundles.pop().ok_or_else(empty)?;
+            match (ops.hyper_connection_head(), topology) {
+                (Some(head), Some(hc)) => {
+                    let reduced = hyper_connection::head_reduce(
+                        last.as_flat(),
+                        last.streams(),
+                        hidden,
+                        &head.weights(),
+                        head.norm_eps(),
+                        hc.sinkhorn_eps,
+                    );
+                    let final_hidden = match ops.final_norm() {
+                        Some(norm) => norm.apply(backend, &reduced),
+                        None => reduced,
+                    };
+                    let logits = ops.head_over_normed(backend, &final_hidden)?;
+                    (FinalState::Hidden(final_hidden), logits)
+                }
+                _ => {
+                    if ops.final_norm().is_some() || ops.output().is_some() {
+                        return Err(VindexError::Parse(
+                            "a hyper-connected bundle reached a whole-stack exit with no head \
+                             reduction; preparation should have refused the image"
+                                .to_string(),
+                        ));
+                    }
+                    (FinalState::Bundle(last), None)
+                }
+            }
+        }
     };
-    Ok(FinalOutput {
-        final_hidden,
-        logits,
-    })
+    Ok(FinalOutput { exit, logits })
 }
 
 /// Scale a sublayer's own output before its residual add, when the plan
@@ -457,26 +1027,154 @@ pub(super) fn scale_residual_delta(scale: Option<f32>, delta: &mut [f32]) {
 
 /// One decoder layer: norms and residuals exactly where the plan puts
 /// them — placement is data, not code structure.
+///
+/// **Wave 19b.** The residual is a [`Plane`]. Each sublayer is a SITE:
+/// on a bundle plane it enters through `hyper_connection::reduce`, per
+/// position, and leaves through `hyper_connection::update`, per
+/// position — while the ordinary operator in between runs exactly once
+/// over `[positions, hidden]`, as it always has. On a row plane the site
+/// is the identity in and the residual add out. `hidden` means the same
+/// thing on both; the stream count is a different dimension and never
+/// reaches the operator.
+#[allow(clippy::too_many_arguments)]
 fn execute_layer<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
     layer: &LayerPlan,
     prepared: &PreparedLayer,
-    h: &mut [Vec<f32>],
+    h: &mut Plane,
     hidden: usize,
     backend: &B,
     kv: Option<(&mut K, usize)>,
+    topology: Option<HyperConnection>,
+    // The declared block period, `None` on every other topology — the
+    // ONE fact the attention-residual schedule needs.
+    block_size: Option<usize>,
+    index: usize,
+    sink: &mut dyn FnMut(PlaneEvent) -> Result<(), VindexError>,
+    mutation: Mutation,
 ) -> Result<LayerTrace, VindexError> {
+    // ── Attention site: enter ──
+    //
     // The attention input is normalised here, once, and handed to the
     // backend — the judged gate reads the same vector, so producing it
-    // in one place is what keeps the two from drifting apart.
+    // in one place is what keeps the two from drifting apart. On a
+    // bundle the norm reads the REDUCED vector, never the bundle.
     //
     // Position loops below run in parallel. Each position's arithmetic
     // is untouched and rows are disjoint, so the result is bit-identical
     // to the serial order — parallelism here is an execution strategy,
     // never a reassociation.
-    let inputs: Vec<Vec<f32>> = h
-        .par_iter()
-        .map(|row| prepared.pre_attention.apply(backend, row))
-        .collect();
+    // Under post-norm placement the sublayer reads the RAW residual; the
+    // wrap norm applies to its output before the update. Same program as
+    // the decode path, which must not be able to disagree with this one.
+    // The entering prefix states, captured BEFORE the site reads
+    // anything: they are what the boundary event snapshots, per
+    // position, and capturing them later would snapshot whatever the
+    // site had already done.
+    let entering_prefixes: Option<Vec<Vec<f32>>> = match &*h {
+        Plane::Histories(histories) => Some(
+            histories
+                .iter()
+                .map(|history| history.prefix().unwrap_or_default().to_vec())
+                .collect(),
+        ),
+        _ => None,
+    };
+    let boundary = matches!(&*h, Plane::Histories(_))
+        && block_size.is_some_and(|size| attention_residual::is_block_boundary(index, size));
+    if boundary {
+        batch_boundary_event(
+            h,
+            BoundaryPhase::BeforeAttentionReduce,
+            entering_prefixes.as_deref().unwrap_or_default(),
+            &[],
+            index,
+            mutation,
+            sink,
+        )?;
+    }
+    // The attention site, and — on a history plane — the boundary event
+    // that falls between its reduction and its branch. Written as two
+    // paths rather than one because of a borrow that is not incidental:
+    // on a ROW plane the site's inputs BORROW the plane (the branch reads
+    // the residual itself, and cloning `[positions, hidden]` twice per
+    // layer is megabytes of copying on a real model), while the event
+    // needs the plane mutably. On a HISTORY plane the inputs are already
+    // owned, so taking them out of the `Cow` ends the borrow and costs
+    // nothing. The row path keeps its borrow and never has a boundary.
+    let (branch_inputs, reductions, attn_res) = if boundary {
+        let entry = enter_batch_site(
+            h,
+            BatchSite {
+                layer: index,
+                which: HcSite::Attention,
+                hyper_connection: prepared.hyper_connection.as_ref().map(|hc| &hc.attention),
+                attention_residual: prepared.attention_residual.as_ref().map(|a| &a.attention),
+            },
+            topology,
+            layer.declared_norm_eps,
+            mutation,
+        )?;
+        // Destructured in full, so the borrowing `Cow` field is CONSUMED
+        // here rather than living on inside `entry` across the mutable
+        // call below.
+        let BatchSiteEntry {
+            branch_inputs,
+            reductions,
+            attn_res,
+        } = entry;
+        let inputs = branch_inputs.into_owned();
+        // The mixed vectors come from the OWNED reductions, which is
+        // also the exact source: where the site did not reduce (layer
+        // 0), there are none and the event falls back to the entering
+        // prefix — which IS what the branch receives there.
+        let mixed: Vec<Vec<f32>> = attn_res
+            .as_ref()
+            .map(|entry| entry.reductions.iter().map(|r| r.mixed.clone()).collect())
+            .unwrap_or_default();
+        // **Where the reference puts it** — between the attention site's
+        // reduction and the attention branch.
+        batch_boundary_event(
+            h,
+            BoundaryPhase::AfterAttentionReduce,
+            entering_prefixes.as_deref().unwrap_or_default(),
+            &mixed,
+            index,
+            mutation,
+            sink,
+        )?;
+        (Cow::Owned(inputs), reductions, attn_res)
+    } else {
+        let entry = enter_batch_site(
+            h,
+            BatchSite {
+                layer: index,
+                which: HcSite::Attention,
+                hyper_connection: prepared.hyper_connection.as_ref().map(|hc| &hc.attention),
+                attention_residual: prepared.attention_residual.as_ref().map(|a| &a.attention),
+            },
+            topology,
+            layer.declared_norm_eps,
+            mutation,
+        )?;
+        (entry.branch_inputs, entry.reductions, entry.attn_res)
+    };
+    // The (c) controls feed the pre-attention norm a stream instead.
+    let norm_source: Cow<'_, [Vec<f32>]> = match (mutation, &*h) {
+        (Mutation::PreNormOnStreamZero, Plane::Bundles(bundles)) => {
+            Cow::Owned(bundles.iter().map(|x| x.stream(0).to_vec()).collect())
+        }
+        (Mutation::PreNormOnStreamMean, Plane::Bundles(bundles)) => {
+            Cow::Owned(bundles.iter().map(Bundle::stream_mean).collect())
+        }
+        _ => Cow::Borrowed(&branch_inputs),
+    };
+    let inputs: Vec<Vec<f32>> = match &prepared.pre_attention {
+        Some(norm) => norm_source
+            .par_iter()
+            .map(|row| norm.apply(backend, row))
+            .collect(),
+        None => norm_source.into_owned(),
+    };
     // V3-SERVE-2: the attention realisation and the K/V behaviour are
     // separate decisions. Wanting a populated provider does not mean
     // wanting per-position arithmetic — the batched pass computes the
@@ -517,6 +1215,119 @@ fn execute_layer<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
             )
             .output
         }
+        PreparedAttention::Mamba2(ops) => {
+            let Some((provider, layer_index)) = kv else {
+                return Err(VindexError::Parse(format!(
+                    "layer {} runs a recurrence, which needs durable continuation state, \
+                     and this traversal was given no provider to hold it",
+                    layer.layer
+                )));
+            };
+            let state = provider.recurrent_state(layer_index)?;
+            mamba2::layer_forward_with(
+                &ops.op,
+                &ops.weights()?,
+                &inputs,
+                state,
+                backend.dense_projector(),
+            )
+            .output
+        }
+        PreparedAttention::Kda(ops) => {
+            let Some((provider, layer_index)) = kv else {
+                return Err(VindexError::Parse(format!(
+                    "layer {} runs a recurrence, which needs durable continuation state, \
+                     and this traversal was given no provider to hold it",
+                    layer.layer
+                )));
+            };
+            let state = provider.recurrent_state(layer_index)?;
+            // The batch is the sequence, flat: KDA's reference consumes
+            // positions one after another because the recurrence IS
+            // sequential, and this traversal differs from the decode
+            // path only in how many positions it hands over.
+            let flat: Vec<f32> = inputs.concat();
+            let hidden_width = inputs.first().map_or(0, Vec::len);
+            let planes = kda::layer_forward_with(
+                &kda::BackendKdaProjections(backend.dense_projector()),
+                &flat,
+                hidden_width,
+                ops.weights()?,
+                ops.op.geometry(),
+                state,
+                kda::Mutation::None,
+            );
+            planes
+                .output
+                .chunks_exact(hidden_width.max(1))
+                .map(<[f32]>::to_vec)
+                .collect()
+        }
+        PreparedAttention::Mla(ops) => {
+            let Some((provider, layer_index)) = kv else {
+                return Err(VindexError::Parse(format!(
+                    "layer {} keeps a per-position latent cache, and this traversal was \
+                     given no provider to hold it",
+                    layer.layer
+                )));
+            };
+            let weights = ops.weights()?;
+            let geometry = ops.op.geometry();
+            let projector = backend.dense_projector();
+            let latent = provider.latent_state(layer_index)?;
+            // Position by position, appending each one's latent before
+            // reading the prefix back — the same call the decode path
+            // makes, run `inputs.len()` times. A whole-sequence form
+            // would need its own explicit causal mask; this one's
+            // causality is the append-then-read order itself.
+            inputs
+                .iter()
+                .map(|x| {
+                    mla::mla_forward_with(
+                        projector,
+                        x,
+                        x.len(),
+                        weights,
+                        geometry,
+                        latent,
+                        mla::Mutation::None,
+                    )
+                    .output
+                })
+                .collect()
+        }
+        PreparedAttention::ConvQkv(ops) => {
+            let Some((provider, layer_index)) = kv else {
+                return Err(VindexError::Parse(format!(
+                    "layer {} keeps a KV cache and a conv history, and this traversal \
+                     was given no provider to hold either",
+                    layer.layer
+                )));
+            };
+            // Two regions, one provider, borrowed in phases: the rows
+            // already persisted are copied out first (the reference
+            // executor is deliberately literal — speed is a later
+            // rung's problem), the conv history is advanced by the
+            // forward, and the batch's new rows are appended after.
+            let past_keys: Vec<Vec<f32>> = provider.keys(layer_index).to_vec();
+            let past_values: Vec<Vec<f32>> = provider.values(layer_index).to_vec();
+            let base = provider.position();
+            let state = provider.recurrent_state(layer_index)?;
+            let planes = conv_qkv::layer_forward_with(
+                &ops.op,
+                &ops.weights()?,
+                &inputs,
+                state,
+                &past_keys,
+                &past_values,
+                base,
+                backend.dense_projector(),
+            );
+            for (key, value) in planes.keys.into_iter().zip(planes.values) {
+                provider.append(layer_index, key, value);
+            }
+            planes.output
+        }
         PreparedAttention::Softmax(ops) => {
             let attention_op = layer
                 .attention
@@ -527,7 +1338,7 @@ fn execute_layer<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
                     let out = backend.attention(ops.call(
                         attention_op,
                         &inputs,
-                        layer.pre_attention_norm.eps,
+                        layer.declared_norm_eps,
                         hidden,
                     ))?;
                     for (key, value) in out.keys.into_iter().zip(out.values) {
@@ -535,22 +1346,25 @@ fn execute_layer<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
                     }
                     out.outputs
                 }
-                Some((kv, layer_index)) => attention_into_kv(
-                    attention_op,
-                    ops,
-                    &inputs,
-                    layer.pre_attention_norm.eps,
-                    hidden,
-                    backend,
-                    kv,
-                    layer_index,
-                )?,
+                Some((kv, layer_index)) => {
+                    let _site = cpu::ledger::in_site(cpu::ledger::Site::Attention);
+                    attention_into_kv(
+                        attention_op,
+                        ops,
+                        &inputs,
+                        layer.declared_norm_eps,
+                        hidden,
+                        backend,
+                        kv,
+                        layer_index,
+                    )?
+                }
                 None => {
                     backend
                         .attention(ops.call(
                             attention_op,
                             &inputs,
-                            layer.pre_attention_norm.eps,
+                            layer.declared_norm_eps,
                             hidden,
                         ))?
                         .outputs
@@ -558,50 +1372,603 @@ fn execute_layer<B: PlanBackend + ?Sized, K: KvState + ?Sized>(
             }
         }
     };
-    h.par_iter_mut()
-        .zip(attn_out.par_iter())
-        .try_for_each(|(row, out)| {
+    // The tail every position shares: post-norm and residual scaling,
+    // then the site's update — the residual add on rows, stage five on
+    // bundles.
+    let deltas: Vec<Vec<f32>> = attn_out
+        .into_par_iter()
+        .map(|out| {
             let mut out = match &prepared.post_attention {
-                Some(norm) => norm.apply(backend, out),
-                None => out.clone(),
+                Some(norm) => norm.apply(backend, &out),
+                None => out,
             };
             scale_residual_delta(layer.residual_scale, &mut out);
-            backend.residual_add(row, &out);
-            Ok::<(), VindexError>(())
-        })?;
-    let post_attention = h.to_vec();
+            out
+        })
+        .collect();
+    leave_batch_site(
+        backend,
+        h,
+        deltas,
+        reductions,
+        attn_res,
+        BatchSiteContext {
+            layer: index,
+            site: HcSite::Attention,
+            mutation,
+        },
+        sink,
+    )?;
+    if boundary {
+        batch_boundary_event(
+            h,
+            BoundaryPhase::AfterAttentionBranch,
+            entering_prefixes.as_deref().unwrap_or_default(),
+            &[],
+            index,
+            mutation,
+            sink,
+        )?;
+    }
+    let post_attention = h.clone();
 
-    // FFN operands are resident on the prepared image — the bulk of a
-    // decoder layer's weight, lowered once for the model rather than
-    // once per layer per traversal.
-    let ffn = &prepared.ffn;
+    // A mixer-only (Mamba2) layer carries no FFN program: its one
+    // residual update happened above, and the layer is complete.
+    // Presence follows the program at execution time too.
+    // The FFN OP is the discriminator, never its pre-norm — see the
+    // decode path's note. A post-norm layer has no pre-FFN norm and must
+    // still run its FFN, over the raw residual.
+    let (Some(ffn), Some(ffn_op)) = (&prepared.ffn, &layer.ffn) else {
+        return Ok(LayerTrace {
+            post_attention,
+            ffn_input: Vec::new(),
+            post_layer: h.clone(),
+        });
+    };
+    // ── FFN site: enter ──
+    let BatchSiteEntry {
+        branch_inputs: ffn_branch_inputs,
+        reductions: ffn_reductions,
+        attn_res: ffn_attn_res,
+    } = enter_batch_site(
+        h,
+        BatchSite {
+            layer: index,
+            which: HcSite::Ffn,
+            hyper_connection: prepared.hyper_connection.as_ref().map(|hc| &hc.ffn),
+            attention_residual: prepared.attention_residual.as_ref().map(|a| &a.ffn),
+        },
+        topology,
+        layer.declared_norm_eps,
+        mutation,
+    )?;
     // The normed FFN inputs are computed once here (same values the
     // in-loop computation produced — one deterministic norm per row)
     // so the trace can carry the tap without a second norm pass.
-    let ffn_inputs: Vec<Vec<f32>> = h
-        .par_iter()
-        .map(|row| prepared.pre_ffn.apply(backend, row))
-        .collect();
-    h.par_iter_mut()
-        .zip(&ffn_inputs)
-        .try_for_each(|(row, normed)| {
-            let ffn_out = ffn.apply_from_residual(&layer.ffn, backend, row, normed, hidden)?;
-            let mut ffn_out = match &prepared.post_ffn {
-                Some(norm) => norm.apply(backend, &ffn_out),
-                None => ffn_out,
+    let ffn_inputs: Vec<Vec<f32>> = match &prepared.pre_ffn {
+        Some(pre_ffn) => ffn_branch_inputs
+            .par_iter()
+            .map(|row| pre_ffn.apply(backend, row))
+            .collect(),
+        None => ffn_branch_inputs.to_vec(),
+    };
+    // The FFN's raw residual — what a hybrid's router and expert
+    // pre-norm read — is the vector the branch sees: the reduced one on
+    // a bundle, never a stream of it (the (d) controls hand it one).
+    let residual_source: Cow<'_, [Vec<f32>]> = match (mutation, &*h) {
+        (Mutation::HybridResidualFromStreamZero, Plane::Bundles(bundles)) => {
+            Cow::Owned(bundles.iter().map(|x| x.stream(0).to_vec()).collect())
+        }
+        (Mutation::HybridResidualFromStreamMean, Plane::Bundles(bundles)) => {
+            Cow::Owned(bundles.iter().map(Bundle::stream_mean).collect())
+        }
+        _ => Cow::Borrowed(&ffn_branch_inputs),
+    };
+    let ffn_outs: Vec<Vec<f32>> = if multi_position_ffn() {
+        // **CPU-7C2.** One call for every position, rather than a parallel
+        // loop over positions each re-entering the executor.
+        //
+        // The previous shape ran positions through `par_iter_mut`, so
+        // every projection inside saw `caller_owns_the_machine` and
+        // collapsed to a single worker. CPU-7C1 measured that as
+        // `slabs/call` 5.03 -> 2.81 and a 42% loss against serial decode.
+        // Here the executor partitions ROWS across its workers and the
+        // positions live inside that traversal, which is the ownership
+        // rule this module already states.
+        let _site = cpu::ledger::in_site(cpu::ledger::Site::Ffn);
+        let residuals: Vec<&[f32]> = residual_source.iter().map(Vec::as_slice).collect();
+        let normed: Vec<&[f32]> = ffn_inputs.iter().map(Vec::as_slice).collect();
+        ffn.apply_from_residual_many(ffn_op, backend, &residuals, &normed, hidden)?
+    } else {
+        // **Arm B.** The pre-CPU-7C2 shape, kept in the SAME binary so the
+        // regression it exhibits is measured beside its fix rather than
+        // carried in from another run — the anchor defect CPU-5's G1 was.
+        residual_source
+            .par_iter()
+            .zip(&ffn_inputs)
+            .map(|(residual, normed)| {
+                // Inside the closure on purpose: this body runs on a
+                // rayon worker with its own thread-local, so a guard
+                // taken by the caller would attribute none of it.
+                let _site = cpu::ledger::in_site(cpu::ledger::Site::Ffn);
+                ffn.apply_from_residual(ffn_op, backend, residual, normed, hidden)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    // The glue AFTER it stays position-parallel: norms, scaling and the
+    // update are elementwise and issue no projections, so there is no
+    // ownership to collapse.
+    let deltas: Vec<Vec<f32>> = ffn_outs
+        .into_par_iter()
+        .map(|out| {
+            let mut out = match &prepared.post_ffn {
+                Some(norm) => norm.apply(backend, &out),
+                None => out,
             };
-            scale_residual_delta(layer.residual_scale, &mut ffn_out);
-            backend.residual_add(row, &ffn_out);
-            if let Some(scale) = prepared.layer_scale {
-                backend.scale_row(row, scale);
+            scale_residual_delta(layer.residual_scale, &mut out);
+            out
+        })
+        .collect();
+    leave_batch_site(
+        backend,
+        h,
+        deltas,
+        ffn_reductions,
+        ffn_attn_res,
+        BatchSiteContext {
+            layer: index,
+            site: HcSite::Ffn,
+            mutation,
+        },
+        sink,
+    )?;
+    if let Some(scale) = prepared.layer_scale {
+        match h {
+            Plane::Rows(rows) => rows
+                .par_iter_mut()
+                .for_each(|row| backend.scale_row(row, scale)),
+            // Preparation refuses this combination; reaching it is an
+            // executor bug, not a model.
+            Plane::Bundles(_) | Plane::Histories(_) => {
+                return Err(VindexError::Parse(format!(
+                    "layer {index} carries a layer scale on a component whose residual is not \
+                     one vector; preparation should have refused it"
+                )))
             }
-            Ok::<(), VindexError>(())
-        })?;
+        }
+    }
     Ok(LayerTrace {
         post_attention,
         ffn_input: ffn_inputs,
-        post_layer: h.to_vec(),
+        post_layer: h.clone(),
     })
+}
+
+/// What entering one site produced for the whole batch: the `[hidden]`
+/// vector each position's branch sees, and the reductions the update
+/// needs afterwards — `None` on rows, where the update is the residual
+/// add. The inputs BORROW a row plane (the branch reads the residual
+/// itself) and are owned on a bundle plane (the branch reads what the
+/// site reduced).
+struct BatchSiteEntry<'a> {
+    branch_inputs: Cow<'a, [Vec<f32>]>,
+    reductions: Option<Vec<SiteReduction>>,
+    /// One reduction per position on a history plane, present exactly
+    /// when the site reduced. `None` where the reference does not reduce
+    /// — layer 0's attention site — and the branch input is then each
+    /// position's own prefix.
+    ///
+    /// The "did it reduce" decision is per LAYER, not per position:
+    /// every position snapshots at the same layers, so their histories
+    /// always hold the same COUNT. What differs between positions is the
+    /// snapshots' values, which is exactly what the swap and broadcast
+    /// controls attack.
+    attn_res: Option<AttnResBatchEntry>,
+}
+
+/// What one attention-residual site read on the way in, per position.
+///
+/// The state is captured HERE, at entry, and carried to the record
+/// emitted on the way out — the same two-point capture the decode
+/// traversal performs. It exists so that a batch record and a decode
+/// record describe the same moment of the same site, which is the
+/// premise A7 rests on.
+struct AttnResBatchEntry {
+    reductions: Vec<attention_residual::Reduction>,
+    prefixes_before: Vec<Vec<f32>>,
+    snapshot_counts_before: Vec<usize>,
+}
+
+/// Which site a batch record belongs to, and under which control.
+#[derive(Clone, Copy)]
+struct BatchSiteContext {
+    layer: usize,
+    site: HcSite,
+    mutation: Mutation,
+}
+
+/// Which site of which layer is being entered, and the operands that
+/// describe it under each topology that has any.
+///
+/// One value rather than four parameters because they are one fact: a
+/// site is identified by its layer and its half of the layer, and the
+/// two operand slots are the SAME site seen by two topologies, at most
+/// one of which a component declares. Passing them separately let a
+/// caller name one site in `which` and hand over another's operands.
+struct BatchSite<'p> {
+    layer: usize,
+    which: HcSite,
+    hyper_connection: Option<&'p PreparedHcSite>,
+    attention_residual: Option<&'p PreparedAttnResSite>,
+}
+
+/// Enter one site for every position. Stages one to three run per
+/// position, in parallel; the carrier, the layer's site operands and the
+/// topology must agree three ways, which preparation guarantees.
+fn enter_batch_site<'a>(
+    h: &'a Plane,
+    at: BatchSite<'_>,
+    topology: Option<HyperConnection>,
+    norm_eps: f64,
+    mutation: Mutation,
+) -> Result<BatchSiteEntry<'a>, VindexError> {
+    let BatchSite {
+        layer,
+        which,
+        hyper_connection: site,
+        attention_residual: attn_res,
+    } = at;
+    // The attention-residual arm first: each position reduces from its
+    // OWN history, in parallel, and the ordinary operator downstream
+    // still runs once over the resulting `[positions, hidden]`. That
+    // split is the invariant — batching vectorises the branch, never the
+    // state.
+    if let Plane::Histories(histories) = h {
+        let Some(site) = attn_res else {
+            return Err(VindexError::Parse(format!(
+                "layer {layer} carries a residual-history plane and no attention-residual \
+                 sites; preparation should have refused the image"
+            )));
+        };
+        let guarded = match which {
+            HcSite::Attention => {
+                histories.first().is_some_and(|h| h.snapshot_count() > 0)
+                    || mutation == Mutation::AttnResLayer0AttentionSiteRuns
+            }
+            HcSite::Ffn => match mutation {
+                Mutation::AttnResMlpSiteGuardedOnNonEmpty => {
+                    histories.first().is_some_and(|h| h.snapshot_count() > 0)
+                }
+                Mutation::AttnResMlpSiteSkippedAtLayer0 if layer == 0 => false,
+                _ => true,
+            },
+        };
+        if !guarded {
+            let prefixes: Result<Vec<Vec<f32>>, VindexError> = histories
+                .iter()
+                .map(|history| {
+                    history.prefix().map(<[f32]>::to_vec).ok_or_else(|| {
+                        VindexError::Parse(format!(
+                            "layer {layer} entered a site with no prefix at some position"
+                        ))
+                    })
+                })
+                .collect();
+            return Ok(BatchSiteEntry {
+                branch_inputs: Cow::Owned(prefixes?),
+                reductions: None,
+                attn_res: None,
+            });
+        }
+        // Captured BEFORE the reduction and before this layer's boundary
+        // event, so the record describes the state the site was entered
+        // on rather than the state it left behind.
+        let prefixes_before: Vec<Vec<f32>> = histories
+            .iter()
+            .map(|history| history.prefix().unwrap_or_default().to_vec())
+            .collect();
+        let snapshot_counts_before: Vec<usize> =
+            histories.iter().map(History::snapshot_count).collect();
+        let pair = site.pair();
+        let mut reductions: Vec<attention_residual::Reduction> = histories
+            .par_iter()
+            .map(|history| attention_residual::reduce(history, pair, norm_eps, mutation))
+            .collect::<Result<_, _>>()?;
+        if mutation == Mutation::AttnResHistoryFromPositionZero {
+            // The BROADCAST control: position 0's reduction applied to
+            // every row — what a traversal that built one shared history
+            // would produce. Invisible at batch size one, which is why
+            // the witness runs three distinguishable positions.
+            if let Some(first) = reductions.first().cloned() {
+                for reduction in reductions.iter_mut() {
+                    *reduction = first.clone();
+                }
+            }
+        }
+        let branch_inputs = reductions.iter().map(|r| r.mixed.clone()).collect();
+        return Ok(BatchSiteEntry {
+            branch_inputs: Cow::Owned(branch_inputs),
+            reductions: None,
+            attn_res: Some(AttnResBatchEntry {
+                reductions,
+                prefixes_before,
+                snapshot_counts_before,
+            }),
+        });
+    }
+    match (h, site, topology) {
+        (Plane::Rows(rows), None, None) => Ok(BatchSiteEntry {
+            branch_inputs: Cow::Borrowed(rows),
+            reductions: None,
+            attn_res: None,
+        }),
+        (Plane::Bundles(bundles), Some(site), Some(hc)) => {
+            if mutation == Mutation::BypassComposition {
+                // The control: stream 0 stands in for every bundle and
+                // no split exists to report.
+                return Ok(BatchSiteEntry {
+                    branch_inputs: Cow::Owned(
+                        bundles.iter().map(|x| x.stream(0).to_vec()).collect(),
+                    ),
+                    reductions: None,
+                    attn_res: None,
+                });
+            }
+            let weights = site.weights();
+            let mut reductions: Vec<SiteReduction> = bundles
+                .par_iter()
+                .map(|x| hyper_connection::reduce(x, &weights, hc, norm_eps, mutation))
+                .collect();
+            if mutation == Mutation::SplitFromPositionZero {
+                // The control: one position's state applied to every row
+                // — invisible at batch size one, which is why the witness
+                // runs three distinguishable positions.
+                if let Some(first) = reductions.first().cloned() {
+                    for reduction in reductions.iter_mut() {
+                        *reduction = first.clone();
+                    }
+                }
+            }
+            let branch_inputs = reductions.iter().map(|r| r.reduced.clone()).collect();
+            Ok(BatchSiteEntry {
+                branch_inputs: Cow::Owned(branch_inputs),
+                reductions: Some(reductions),
+                attn_res: None,
+            })
+        }
+        _ => Err(VindexError::Parse(
+            "the residual plane, the layer's hyper-connection sites and the declared topology \
+             disagree; preparation should have refused the image"
+                .to_string(),
+        )),
+    }
+}
+
+/// The block-boundary event across every position — the batch form of
+/// the decode traversal's third contract point.
+///
+/// Offered at each of the three points a snapshot could be taken; does
+/// something only at the point this run's control selects, the
+/// reference's being [`BoundaryPhase::AfterAttentionReduce`]. The prefix
+/// RESET always happens at the reference's point whatever the snapshot's
+/// phase, because the reference resets in the same statement it appends.
+///
+/// **Every position appends its OWN entering state.** A traversal that
+/// appended one position's vector to every history would produce a
+/// plausible plane and a wrong model; that is what the broadcast control
+/// exists to catch, and why the values are recorded per position here
+/// rather than as one shared vector.
+fn batch_boundary_event(
+    h: &mut Plane,
+    phase: BoundaryPhase,
+    entering_prefixes: &[Vec<f32>],
+    mixed: &[Vec<f32>],
+    layer: usize,
+    mutation: Mutation,
+    sink: &mut dyn FnMut(PlaneEvent) -> Result<(), VindexError>,
+) -> Result<(), VindexError> {
+    let Plane::Histories(histories) = h else {
+        return Ok(());
+    };
+    let snapshot_phase = match mutation {
+        Mutation::AttnResSiteOverNewSnapshots => BoundaryPhase::BeforeAttentionReduce,
+        Mutation::AttnResSnapshotAfterAttention => BoundaryPhase::AfterAttentionBranch,
+        _ => BoundaryPhase::AfterAttentionReduce,
+    };
+    if phase == snapshot_phase {
+        let before = histories.first().map_or(0, |h| h.snapshot_count());
+        let mut values: Vec<Vec<f32>> = Vec::with_capacity(histories.len());
+        for (position, history) in histories.iter_mut().enumerate() {
+            let entering = entering_prefixes
+                .get(position)
+                .cloned()
+                .unwrap_or_else(|| history.prefix().unwrap_or_default().to_vec());
+            let value = match (mutation, phase) {
+                (Mutation::AttnResSnapshotIsMixedVector, _) => {
+                    mixed.get(position).cloned().unwrap_or(entering)
+                }
+                (_, BoundaryPhase::AfterAttentionBranch) => {
+                    history.prefix().map(<[f32]>::to_vec).unwrap_or(entering)
+                }
+                _ => entering,
+            };
+            history.push_snapshot(value.clone());
+            values.push(value);
+        }
+        let after = histories.first().map_or(0, |h| h.snapshot_count());
+        sink(PlaneEvent::AttentionResidualBoundary(
+            AttnResBoundaryPlane {
+                layer,
+                snapshots_before: before,
+                snapshots_after: after,
+                values: &values,
+                entering_prefixes,
+            },
+        ))?;
+    }
+    if phase == BoundaryPhase::AfterAttentionReduce {
+        for history in histories.iter_mut() {
+            history.reset_prefix();
+        }
+    }
+    Ok(())
+}
+
+/// Leave one site for every position: fold each position's `[hidden]`
+/// delta back into the carrier. On rows that is the residual add; on
+/// bundles it is stage five per position — one operation, not an add —
+/// and the sink sees every position's state the moment it exists.
+fn leave_batch_site<B: PlanBackend + ?Sized>(
+    backend: &B,
+    h: &mut Plane,
+    deltas: Vec<Vec<f32>>,
+    reductions: Option<Vec<SiteReduction>>,
+    attn_res: Option<AttnResBatchEntry>,
+    context: BatchSiteContext,
+    sink: &mut dyn FnMut(PlaneEvent) -> Result<(), VindexError>,
+) -> Result<(), VindexError> {
+    // Each branch row updates ONLY its originating history. The delta at
+    // index i is the branch's output for position i, and it goes into
+    // position i's own state — never into a shared one, and never into
+    // another position's.
+    if let Plane::Histories(histories) = &mut *h {
+        if context.mutation == Mutation::AttnResSwapPositionHistories && histories.len() >= 2 {
+            // The SWAP control: positions 0 and 1 exchange histories
+            // between the reduction and the update, so each write lands
+            // in the other position's state. Catches loss of positional
+            // identity, which the broadcast control cannot see.
+            histories.swap(0, 1);
+        }
+        // The WRITE-OFFSET control: send each branch row into the NEXT
+        // position's history, dropping the last. Distinct from the swap,
+        // which is an involution on two rows and leaves the multiset of
+        // (history, delta) pairings intact at every other position; this
+        // one misaligns the whole plane by one and leaves position 0
+        // unwritten, which is the shape an off-by-one in a batched write
+        // actually takes.
+        let deltas: Vec<Vec<f32>> =
+            if context.mutation == Mutation::AttnResWriteOffsetByOne && histories.len() >= 2 {
+                let mut shifted = vec![vec![0.0; deltas.first().map_or(0, Vec::len)]];
+                shifted.extend(deltas.iter().take(deltas.len() - 1).cloned());
+                shifted
+            } else {
+                deltas
+            };
+        for (history, delta) in histories.iter_mut().zip(&deltas) {
+            history.write(delta);
+        }
+        if let Some(entry) = attn_res {
+            sink(PlaneEvent::AttentionResidualSite(AttnResSitePlane {
+                layer: context.layer,
+                site: context.site,
+                reductions: &entry.reductions,
+                prefixes_before: &entry.prefixes_before,
+                snapshot_counts_before: &entry.snapshot_counts_before,
+                branch_outputs: &deltas,
+                histories_out: histories,
+            }))?;
+        }
+        return Ok(());
+    }
+    match (h, reductions) {
+        (Plane::Rows(rows), None) => {
+            rows.par_iter_mut()
+                .zip(deltas.par_iter())
+                .for_each(|(row, delta)| backend.residual_add(row, delta));
+            Ok(())
+        }
+        (Plane::Bundles(bundles), Some(reductions)) => {
+            if context.mutation == Mutation::SwapPositionsBeforeUpdate && bundles.len() >= 2 {
+                // The control: positions 0 and 1 exchange their bundles
+                // between the reduction and the update, so the update
+                // carries the wrong position's state forward.
+                bundles.swap(0, 1);
+            }
+            let (splits, reduced): (Vec<SinkhornSplit>, Vec<Vec<f32>>) =
+                reductions.into_iter().map(|r| (r.split, r.reduced)).unzip();
+            let next: Vec<Bundle> = bundles
+                .par_iter()
+                .zip(deltas.par_iter())
+                .zip(splits.par_iter())
+                .map(|((x, delta), split)| {
+                    hyper_connection::update(x, delta, split, context.mutation)
+                })
+                .collect();
+            *bundles = next;
+            sink(PlaneEvent::HyperConnectionSite(HcSitePlane {
+                layer: context.layer,
+                site: context.site,
+                splits: &splits,
+                reduced: &reduced,
+                branch_outputs: &deltas,
+                bundles_out: bundles,
+            }))
+        }
+        (Plane::Bundles(bundles), None) => {
+            // The bypass control: the delta lands in stream 0 alone and
+            // no record is emitted, exactly what a traversal that never
+            // ran the topology would do.
+            debug_assert_eq!(context.mutation, Mutation::BypassComposition);
+            bundles
+                .par_iter_mut()
+                .zip(deltas.par_iter())
+                .for_each(|(x, delta)| backend.residual_add(x.stream_mut(0), delta));
+            Ok(())
+        }
+        (Plane::Rows(_), Some(_)) => Err(VindexError::Parse(
+            "a row plane received site reductions; preparation should have refused the image"
+                .to_string(),
+        )),
+        // A history plane returns above; reaching here means its entry
+        // was lost on the way in.
+        (Plane::Histories(_), _) => Err(VindexError::Parse(
+            "an attention-residual plane left a site through the bundle path; the traversal \
+             handles it before this match"
+                .to_string(),
+        )),
+    }
+}
+
+/// Whether the FFN runs as ONE multi-position call (CPU-7C2) or as the
+/// pre-C2 parallel loop over positions.
+///
+/// A CPU-7C2 arm switch, and it exists so arm B and arms C/E/D live in one
+/// binary. The alternative — comparing against CPU-7C1's banked
+/// `B/(2A) = 1.422` — would anchor a gate on a number measured in another
+/// run, on another build, which is exactly the defect that cost CPU-5 its
+/// Bank 2.
+///
+/// Default ON: the multi-position shape is the one that respects this
+/// module's own ownership rule, and a default that did not would make
+/// every other measurement in the repo a measurement of the defect.
+/// Only `0` and `off` select the legacy shape.
+pub const MULTI_POSITION_FFN_ENV: &str = "LARQL_FFN_MULTI_POSITION";
+
+static FFN_SHAPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn multi_position_ffn() -> bool {
+    match FFN_SHAPE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = !matches!(
+                std::env::var(MULTI_POSITION_FFN_ENV)
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
+                Some("0") | Some("off")
+            );
+            FFN_SHAPE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Select the FFN shape explicitly, for a harness running both arms in one
+/// process. Not for production code, for the reason [`multi_position_ffn`]
+/// gives.
+pub fn set_multi_position_ffn(on: bool) {
+    FFN_SHAPE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// One layer's attention operands, loaded once in the backend's
@@ -635,10 +2002,10 @@ impl AttentionOperands {
         // V before conditioning Q/K, and apply the parameter-free V norm
         // to it when the op carries one.
         Ok(Self {
-            w_q: load_weight(store, &op.q, format(&op.q))?,
-            w_k: load_weight(store, &op.k, format(&op.k))?,
-            w_v: load_weight(store, &op.v, format(&op.v))?,
-            w_o: load_weight(store, &op.o, format(&op.o))?,
+            w_q: load_weight(store, &op.q, format(&op.q)?)?,
+            w_k: load_weight(store, &op.k, format(&op.k)?)?,
+            w_v: load_weight(store, &op.v, format(&op.v)?)?,
+            w_o: load_weight(store, &op.o, format(&op.o)?)?,
             qk_weights: match &op.qk_norm {
                 Some(qk) => Some((store.load(&qk.q)?, store.load(&qk.k)?)),
                 None => None,
@@ -658,7 +2025,7 @@ impl AttentionOperands {
             // unrelated loader change broke the aliasing.
             gate: match &op.output_gate {
                 Some(gate) if gate.spec.source != GateSource::FusedQueryProjection => Some(
-                    load_weight(store, &gate.projection, format(&gate.projection))?,
+                    load_weight(store, &gate.projection, format(&gate.projection)?)?,
                 ),
                 _ => None,
             },
@@ -690,6 +2057,20 @@ impl AttentionOperands {
     /// Every matrix operand this attention holds, for residency
     /// preparation.
     /// Every matrix operand, for residency accounting.
+    /// Each matrix paired with the operand it binds, field by field.
+    pub(super) fn bound<'a>(&'a self, op: &'a AttentionOp) -> Vec<accounting::Bound<'a>> {
+        let mut out = vec![
+            accounting::Bound::one(&op.q, &self.w_q),
+            accounting::Bound::one(&op.k, &self.w_k),
+            accounting::Bound::one(&op.v, &self.w_v),
+            accounting::Bound::one(&op.o, &self.w_o),
+        ];
+        if let (Some(gate), Some(weight)) = (&op.output_gate, &self.gate) {
+            out.push(accounting::Bound::one(&gate.projection, weight));
+        }
+        out
+    }
+
     pub(super) fn loaded_matrices(&self) -> Vec<&LoadedWeight> {
         let mut all = vec![&self.w_q, &self.w_k, &self.w_v, &self.w_o];
         if let Some(gate) = &self.gate {

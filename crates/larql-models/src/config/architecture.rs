@@ -17,9 +17,11 @@
 use crate::validation::ConfigValidationResult;
 
 use super::{
-    layer_types, rope_types, Activation, EmbeddingNorm, ExpertFormat, ExpertGatePolicy,
-    ExpertRoutingPolicy, FfnType, GateUpLayout, Llama3RopeScaling, ModelConfig, NormSpec, NormType,
-    PositionPolicy, PostNormEps, QkNormScope, RotaryFrequencyBasis, YarnRopeScaling,
+    layer_types, rope_types, Activation, ActivationDeclaration, DeclaredRopeScaling, EmbeddingNorm,
+    ExpertFormat, ExpertGatePolicy, ExpertRoutingPolicy, FfnType, GateUpLayout, HyperConnection,
+    LatentNormSpec, LayerKind, Llama3RopeScaling, MlaQueryForm, ModelConfig, NormSpec, NormType,
+    PositionPolicy, PostNormEps, QkNormScope, ResidualTopology, RotaryFrequencyBasis,
+    RoutedExpertForm, SharedExpertGateSpec, YarnRopeScaling, SITU_NAME,
 };
 
 /// The multiplier that leaves a value unchanged.
@@ -28,6 +30,18 @@ use super::{
 /// as the deliberate identity it is, and cannot be mistaken for a magic
 /// constant standing in for an unread config fact.
 const IDENTITY_SCALE: f32 = 1.0;
+
+/// SiTU-GLU's gate softcap when the checkpoint declares none — the
+/// reference's `beta or 1.0` (`modeling_kimi_linear.py` L91). Named
+/// because `1.0` here is a transcribed fallback from one line of one
+/// file, not a neutral scale that happens to be one.
+const SITU_DEFAULT_BETA: f32 = 1.0;
+
+/// The position divisor of an unscaled rotary: positions enter the
+/// rotation as declared. What `rope_position_divisor_for_layer` answers
+/// for every layer of a checkpoint without linear scaling, and for the
+/// layers a family's override leaves plain (Gemma 3's sliding layers).
+pub const UNSCALED_POSITION_DIVISOR: f64 = 1.0;
 
 /// Attention score scale from a declared `query_pre_attn_scalar` (or any
 /// other scalar the score is `1/sqrt` of, e.g. `head_dim`).
@@ -386,20 +400,106 @@ pub trait ModelArchitecture: Send + Sync {
         None
     }
 
+    /// What this checkpoint's `hidden_act` declaration says — silent, a
+    /// judged nonlinearity, the name of a gate policy, or a name this
+    /// build has never judged.
+    ///
+    /// The judgment every FFN decision reads. Overriding it is asserting
+    /// the architecture knows better than its own checkpoint.
+    fn activation_declaration(&self) -> ActivationDeclaration {
+        ActivationDeclaration::judge(self.config().hidden_act.as_deref())
+    }
+
     /// Activation function for the FFN.
     ///
-    /// The default reads the checkpoint's declared `hidden_act` /
-    /// `hidden_activation` name when present (through the one mapping in
-    /// [`Activation::from_hf_name`]) and falls back to SiLU only when the
-    /// config is silent. A family override that ignores the config is
-    /// asserting it knows better than the checkpoint — every current
-    /// override's family also declares the matching name.
+    /// SiLU when the config is **silent** — that is a checked default,
+    /// and the only branch that takes it. A judged name maps through the
+    /// one table in [`Activation::from_hf_name`].
+    ///
+    /// The two remaining declarations have no nonlinearity to return, and
+    /// this method deliberately does not invent one:
+    ///
+    /// - [`ActivationDeclaration::NamesGatePolicy`] — the whole combine is
+    ///   named, not just the gate's nonlinearity, and
+    ///   [`Self::expert_gate_policy`] carries it. The value returned here
+    ///   is INERT: [`ExpertGatePolicy`]'s non-`Gated` arms consume no
+    ///   `Activation` at all, which
+    ///   `situ_policy_makes_the_activation_field_inert` pins.
+    /// - [`ActivationDeclaration::Unjudged`] — nothing in this build knows
+    ///   what the name means. The value returned here is likewise never
+    ///   executed: [`Self::gate_up_is_gelu_tanh`] refuses by name before
+    ///   any kernel is selected, which is where the refusal belongs.
+    ///
+    /// Before K3-ACT-1 this method collapsed *silent* and *unjudged* into
+    /// one `unwrap_or(Silu)`, so a checkpoint declaring `situ` or `relu2`
+    /// was silently executed as SwiGLU. Two rows in the conformance
+    /// estate were in exactly that state.
     fn activation(&self) -> Activation {
-        self.config()
-            .hidden_act
-            .as_deref()
-            .and_then(Activation::from_hf_name)
-            .unwrap_or(Activation::Silu)
+        match self.activation_declaration() {
+            ActivationDeclaration::Nonlinearity(activation) => activation,
+            ActivationDeclaration::Absent
+            | ActivationDeclaration::NamesGatePolicy(_)
+            | ActivationDeclaration::Unjudged(_) => Activation::Silu,
+        }
+    }
+
+    /// Which of the two gate/up kernel families this checkpoint's FFN uses
+    /// on the walk / kquant / dense-weight paths — the ONE call those
+    /// paths make.
+    ///
+    /// **Panics, by name, when the declaration cannot be served there**:
+    /// a gate policy that is not plain gating
+    /// ([`ExpertGatePolicy::SituGlu`], [`ExpertGatePolicy::ClampedGlu`]),
+    /// or an activation name this build has never judged. Those paths
+    /// compute `act(gate) * up` and nothing else, and handing them a bool
+    /// for a declaration they cannot serve is precisely the silent
+    /// substitution this refuses.
+    ///
+    /// A panic rather than a `Result` because that is already the
+    /// established contract at this exact seam —
+    /// [`Activation::uses_gelu_tanh_gate_up`] panics for
+    /// [`Activation::Relu`] with the same reasoning — and because these
+    /// paths are reached only after a plan has admitted the model. The
+    /// planner refuses both known specimens, so this is a backstop, which
+    /// is what it should be.
+    fn gate_up_is_gelu_tanh(&self) -> bool {
+        let policy = self.expert_gate_policy();
+        assert!(
+            matches!(policy, ExpertGatePolicy::Gated),
+            "the walk/kquant gate-up paths compute `act(gate) * up` and have no kernel for              {policy:?}; refusing rather than substituting plain gating for it"
+        );
+        // The DECLARATION decides whether to refuse; [`Self::activation`]
+        // supplies the answer. Those are two different questions and
+        // answering both from the declaration was a real defect: StarCoder2
+        // overrides `activation()` to tanh-GELU and declares no
+        // `hidden_act` at all, so a derivation reading the config alone
+        // silently replaced a family's own judgment with the SiLU
+        // fallback — the same shape of bug this rung exists to remove, one
+        // level up.
+        match self.activation_declaration() {
+            ActivationDeclaration::Absent | ActivationDeclaration::Nonlinearity(_) => {
+                self.activation().uses_gelu_tanh_gate_up()
+            }
+            // Unreachable while the policy is `Gated` (a policy name
+            // resolves to a non-`Gated` policy above), but stated rather
+            // than collapsed into the arm below: the two declarations are
+            // different facts and a future policy name must not silently
+            // inherit an `unjudged` message.
+            ActivationDeclaration::NamesGatePolicy(name) => panic!(
+                "`hidden_act: \"{name}\"` names a gate policy, and the walk/kquant gate-up \
+                 paths have no kernel for it; refusing rather than substituting plain gating"
+            ),
+            // Refused even where a family overrides `activation()`: the
+            // checkpoint declared a name this build cannot read, the
+            // family's answer and the declaration disagree, and the plan
+            // already grades that leaf `mismatched`. Computing anything
+            // here would be picking a side silently. No in-tree
+            // architecture is in this state.
+            ActivationDeclaration::Unjudged(name) => panic!(
+                "`hidden_act: \"{name}\"` is an activation this build has never judged; the \
+                 walk/kquant gate-up paths refuse it rather than computing SiLU in its place"
+            ),
+        }
     }
 
     /// FFN type (gated vs standard).
@@ -423,13 +523,64 @@ pub trait ModelArchitecture: Send + Sync {
     ///
     /// See [`super::layer_types`] for why this default is not `false`.
     fn is_sliding_window_layer(&self, layer: usize) -> bool {
+        // The enable flag first: a checkpoint that declares the feature
+        // off means it, whatever its interleave says. Qwen2.5 ships
+        // `sliding_window: 32768` AND a `use_sliding_window: false`, and
+        // a family that also declared sliding `layer_types` would
+        // otherwise have the window applied against its own instruction.
+        if self.sliding_window_size().is_none() {
+            return false;
+        }
+        // `max_window_layers` bounds which layers slide when the feature
+        // is on: the bottom `n` use the window, the rest attend fully.
+        if let Some(bound) = self.config().max_window_layers {
+            if layer >= bound {
+                return false;
+            }
+        }
         layer_types::is_sliding_from_layer_types(self.config().layer_types.as_ref(), layer)
             .unwrap_or(false)
     }
 
-    /// Sliding window size (None = full attention).
+    /// The **effective** sliding window (None = full attention).
+    ///
+    /// One place resolves the three declarations a checkpoint can make
+    /// about this feature, so nothing downstream can honour one while
+    /// ignoring another:
+    ///
+    /// ```text
+    /// sliding_window       the window, when there is one
+    /// use_sliding_window   whether it applies at all
+    /// max_window_layers    how far up the stack it applies
+    /// ```
+    ///
+    /// An explicit `use_sliding_window: false` yields `None` even when a
+    /// window is declared beside it. That is not a special case for Qwen
+    /// — it is what the checkpoint says, and reading the size without the
+    /// flag is how a declared-inactive feature becomes an active wrong
+    /// answer. A family whose config states no flag is unaffected: `None`
+    /// is not `Some(false)`.
     fn sliding_window_size(&self) -> Option<usize> {
+        if self.config().use_sliding_window == Some(false) {
+            return None;
+        }
         self.config().sliding_window
+    }
+
+    /// The per-layer kind this family declares for EVERY layer of its
+    /// stack, when the declaration is the `model_type` itself rather than
+    /// an interleave key. A pure-SSM checkpoint (mamba2) writes no
+    /// `layer_types` — there is no interleave to state — and its
+    /// `model_type` is the whole-stack declaration that every layer runs
+    /// the family's mixer.
+    ///
+    /// `None` (the default) means the family makes no such uniform claim
+    /// and the declared interleave, or its absence, answers as before.
+    /// This is a *declaration*, not an operator identification: which
+    /// recurrence actually runs is still resolved from the declared
+    /// geometry downstream, exactly as for an interleaved hybrid.
+    fn declared_uniform_layer_kind(&self) -> Option<LayerKind> {
+        None
     }
 
     /// RoPE base frequency for a given layer.
@@ -461,36 +612,7 @@ pub trait ModelArchitecture: Send + Sync {
     /// forward path and dropped by everything else ([`Self::yarn_rope_scaling`]
     /// is the config read; this is where it becomes per-layer policy).
     fn position_policy_for_layer(&self, layer: usize) -> PositionPolicy {
-        let yarn = self.yarn_rope_scaling();
-        match self
-            .config()
-            .layer_rope_theta
-            .as_ref()
-            .and_then(|thetas| thetas.get(layer))
-        {
-            Some(&declared) => {
-                // A per-layer theta states WHICH base this layer rotates
-                // at. It does not state that the layer stops being a
-                // partial or multi-axis rotary, so the config's rotary
-                // shape is re-applied at that theta. Without this, any
-                // checkpoint declaring `layer_rope_theta` alongside
-                // `partial_rotary_factor` would silently rotate the whole
-                // head — the same drop this rung exists to close, one
-                // branch over.
-                match PositionPolicy::from_declared_theta_with_yarn(declared, yarn) {
-                    PositionPolicy::Rope { theta } => self.rotary_policy(theta),
-                    // NoPE has no rotary shape, and YaRN carries its own.
-                    resolved => resolved,
-                }
-            }
-            None => match yarn {
-                Some(scaling) => PositionPolicy::Yarn {
-                    theta: self.rope_base_for_layer(layer),
-                    scaling,
-                },
-                None => self.rotary_policy(self.rope_base_for_layer(layer)),
-            },
-        }
+        default_position_policy_for_layer(self, layer)
     }
 
     /// The unscaled rotary policy at `theta`: plain, partial, or
@@ -913,23 +1035,34 @@ pub trait ModelArchitecture: Send + Sync {
     }
 
     /// Whether this model uses Mixture of Experts.
+    ///
+    /// Answered from the **declaration**, not from a family list: a
+    /// checkpoint that states a routed-expert count is an MoE whether or
+    /// not this build has a registry entry for it. The previous `false`
+    /// default meant an unregistered MoE resolved as dense — Kimi Linear,
+    /// with 256 experts per layer and top-8 routing, produced an execution
+    /// surface saying `ffn: dense, intermediate_size 9216`, which is the
+    /// dense-layer width of one layer out of twenty-seven.
+    ///
+    /// Losing an MoE this way is not a gap in a report. It is a container
+    /// that would describe the wrong model.
     fn is_moe(&self) -> bool {
-        false
+        self.config().num_experts.is_some_and(|experts| experts > 0)
     }
 
     /// Number of routed experts per layer.
     fn num_experts(&self) -> usize {
-        0
+        self.config().num_experts.unwrap_or(0)
     }
 
     /// Number of experts activated per token.
     fn num_experts_per_token(&self) -> usize {
-        0
+        self.config().num_experts_per_token.unwrap_or(0)
     }
 
     /// Number of shared (always-active) experts.
     fn num_shared_experts(&self) -> usize {
-        0
+        self.config().num_shared_experts.unwrap_or(0)
     }
 
     /// Router weight key for expert selection.
@@ -944,7 +1077,19 @@ pub trait ModelArchitecture: Send + Sync {
     /// layer `match` exhaustively instead of comparing strings and falling
     /// back silently on any value it has not heard of.
     fn moe_router_kind(&self) -> super::MoeRouterKind {
-        super::MoeRouterKind::default()
+        // The declared scoring function decides the rule. Answering the
+        // softmax default for a checkpoint that declares `sigmoid` states
+        // a routing rule the model does not use — and it is not a small
+        // difference: sigmoid scores are independent, so the selected
+        // weights do not sum to 1.
+        //
+        // An unrecognised spelling keeps the default here and is caught by
+        // the plan's declared-vs-resolved comparison instead, which can
+        // refuse where this signature cannot.
+        match self.config().router_activation.as_deref() {
+            Some(super::moe_router::ROUTER_ACTIVATION_SIGMOID) => super::MoeRouterKind::Sigmoid,
+            _ => super::MoeRouterKind::default(),
+        }
     }
 
     /// Router algorithm identifier written into `MoeConfig.router_type` in a
@@ -1018,7 +1163,68 @@ pub trait ModelArchitecture: Send + Sync {
     /// projection's input. Defaults to the plain gated FFN every other
     /// MoE architecture in the support table uses.
     fn expert_gate_policy(&self) -> ExpertGatePolicy {
-        ExpertGatePolicy::Gated
+        // Deliberately NOT derived from `swiglu_limit`.
+        //
+        // A declared clamp says a bound exists; it does not say the layer
+        // computes [`ExpertGatePolicy::ClampedGlu`], which is a specific
+        // formula — `glu = g·sigmoid(alpha·g)`, `out = (u+1)·glu`, with
+        // `alpha = 1.702` — transcribed from GPT-OSS's reference. GLM-5.3-
+        // Flash and Inkling-Small both declare a `swiglu_limit` too, and
+        // nothing on hand says they share that activation.
+        //
+        // **That caution was right, and GLM has now been read.** Its
+        // reference clamps exactly as GPT-OSS does and then computes
+        // `silu(g) * u`, not `(u+1) * g * sigmoid(alpha*g)` — which is
+        // why [`ExpertGatePolicy::ClampedGated`] exists as its own
+        // variant. Deriving either from `swiglu_limit` would have picked
+        // the wrong one for one of the two families, at a measured
+        // relative 31.7 on GLM's real expert bank.
+        //
+        // Resolving the policy from the bound alone would claim they do,
+        // on the strength of one shared field name. That is the same
+        // inference `layer_types` → Gated DeltaNet made, and it is wrong
+        // for the same reason: a declared parameter is not evidence of the
+        // operator that consumes it. An architecture that has been judged
+        // against its own reference overrides this.
+        //
+        // `situ` IS read here, and the distinction is exactly the one the
+        // paragraph above draws. `swiglu_limit` is a PARAMETER, and a
+        // parameter names no operator. `hidden_act: "situ"` is the
+        // operator's own NAME — the checkpoint's own module registers it
+        // as `ACT2FN["situ"] = SituAndMul` — which is the standing `silu`
+        // and `gelu_pytorch_tanh` already have in `HF_ACTIVATION_NAMES`,
+        // and the standing `swiglu`/`geglu` already have in
+        // `HF_GLU_NAMES`, where one word names a shape AND a
+        // nonlinearity. Reading a declared name is not inferring an
+        // operator from an adjacent value.
+        match self.activation_declaration() {
+            ActivationDeclaration::NamesGatePolicy(SITU_NAME) => self.situ_gate_policy(),
+            _ => ExpertGatePolicy::Gated,
+        }
+    }
+
+    /// SiTU-GLU's two softcaps, resolved from the config exactly once.
+    ///
+    /// `beta` goes through the reference's `beta or 1.0`
+    /// (`_get_situ_activation_params`, `modeling_kimi_linear.py` L91),
+    /// which is Python truthiness — absent, null AND `0.0` all resolve to
+    /// `1.0`. Every consumer downstream therefore receives a `beta` it can
+    /// divide by, and none of them repeats this rule.
+    ///
+    /// `linear_beta` has no such fallback in the reference (L80 branches
+    /// on `is not None`), so absence is carried as `None` — the up branch
+    /// untouched, a different function from an infinite bound — and a
+    /// declared `0.0` is carried verbatim.
+    fn situ_gate_policy(&self) -> ExpertGatePolicy {
+        let config = self.config();
+        let beta = match config.activation_situ_beta {
+            Some(declared) if declared != 0.0 => declared as f32,
+            _ => SITU_DEFAULT_BETA,
+        };
+        ExpertGatePolicy::SituGlu {
+            beta,
+            linear_beta: config.activation_situ_linear_beta.map(|v| v as f32),
+        }
     }
 
     /// How the router's top-k weights are normalised.
@@ -1062,6 +1268,112 @@ pub trait ModelArchitecture: Send + Sync {
         None
     }
 
+    /// The always-on shared branch's intermediate width — `None` when the
+    /// judgment declares no shared expert at all.
+    ///
+    /// Two conventions, one answer, so that no caller has to know the
+    /// lineage to size the branch:
+    ///
+    /// - a family that DECLARES the width writes it
+    ///   (`shared_expert_intermediate_size` on Qwen MoE,
+    ///   `moe_shared_expert_intermediate_size` on Nemotron-H);
+    /// - the DeepSeek/Kimi lineage declares a shared-expert COUNT instead
+    ///   and sizes one wider FFN at `moe_intermediate_size * count`
+    ///   (`KimiMLP`'s `intermediate_size` in `KimiSparseMoeBlock.__init__`).
+    ///
+    /// The declaration wins where both are present: it is the checkpoint
+    /// speaking rather than this build's arithmetic, and the two disagree
+    /// on every checkpoint that states both — Qwen1.5-MoE declares 5632
+    /// against a routed 1408, Nemotron-3 Nano 3712 against 1856.
+    fn shared_expert_intermediate_size(&self) -> Option<usize> {
+        let count = self.num_shared_experts();
+        if count == 0 {
+            // `None` iff there is no branch. A width beside a zero count
+            // would be a size for something nothing builds, and the two
+            // fields would disagree about whether the branch exists.
+            return None;
+        }
+        self.config()
+            .shared_expert_intermediate_size
+            .or_else(|| Some(self.moe_intermediate_size() * count))
+    }
+
+    /// How this component's residual stream is shaped and recombined.
+    ///
+    /// Resolved once, here, so that no caller has to decide what an
+    /// absent `hc_mult` means. The Sinkhorn-split reference reads
+    /// `hc_mult`, `hc_sinkhorn_iters` and `hc_eps` together, so a
+    /// checkpoint declaring them apart is one this build has not judged
+    /// rather than one to be completed with defaults — it REFUSES rather
+    /// than filling in the missing halves.
+    ///
+    /// **It is not judged INCOMPLETE.** Hy4-preview declares `hc_mult`
+    /// and `hc_eps` with no iteration count because its topology runs no
+    /// Sinkhorn at all: its `hc_pre.hc_fn` is `[2 * hc, hc * d]` against
+    /// the Sinkhorn form's `[(2 + hc) * hc, hc * d]`, it carries two
+    /// scales rather than three, no combination block, and an explicit
+    /// `hc_magnitude` where the Sinkhorn kernel hardcodes a factor of
+    /// two. Recognising that variant needs positive evidence this build
+    /// does not yet parse; until then the honest statement is that the
+    /// combination is unjudged, not that it is half-written.
+    ///
+    /// The third judged topology, attention residuals, is read from ONE
+    /// key — `attn_res_block_size` — because the reference takes only
+    /// one: the snapshot schedule, every layer's read of the history and
+    /// the stack's exit reduction all follow from the period. Declaring
+    /// it BESIDE the hyper-connection keys is a third thing again, and
+    /// refuses for the same reason a partial Sinkhorn declaration does:
+    /// a component runs ONE residual programme, and reading either would
+    /// discard what the other declares.
+    fn residual_topology(&self) -> Result<ResidualTopology, String> {
+        let cfg = self.config();
+        let sinkhorn = (cfg.hc_streams, cfg.hc_sinkhorn_iters, cfg.hc_eps);
+        match (cfg.attn_res_block_size, sinkhorn) {
+            (Some(block_size), (None, None, None)) => {
+                Ok(ResidualTopology::AttentionResidual { block_size })
+            }
+            (Some(block_size), (streams, iters, eps)) => Err(format!(
+                "two residual topologies declared together (attn_res_block_size \
+                 {block_size}, hc_mult {streams:?}, hc_sinkhorn_iters {iters:?}, hc_eps \
+                 {eps:?}) — a component runs ONE residual programme, and reading either \
+                 would discard what the other declares, so this build chooses neither"
+            )),
+            (None, (None, None, None)) => Ok(ResidualTopology::SingleStream),
+            (None, (Some(streams), Some(sinkhorn_iters), Some(sinkhorn_eps))) => {
+                Ok(ResidualTopology::HyperConnection(HyperConnection {
+                    streams,
+                    sinkhorn_iters,
+                    sinkhorn_eps,
+                }))
+            }
+            (None, (streams, iters, eps)) => Err(format!(
+                "unjudged hyper-connection declaration (hc_mult {streams:?}, \
+                 hc_sinkhorn_iters {iters:?}, hc_eps {eps:?}) — this build lowers only the \
+                 Sinkhorn-split form, which reads all three together, and declaring them \
+                 apart may mean a DIFFERENT topology rather than an incomplete one, so this \
+                 build chooses neither"
+            )),
+        }
+    }
+
+    /// The gate on the shared branch's output, where the family runs one.
+    ///
+    /// `None` is the DeepSeek/Kimi form — the branch is summed unscaled —
+    /// and it is a judgment, not an absence of information: adding a gate
+    /// nothing declared, or dropping one that exists, both produce fluent
+    /// wrong answers rather than a failure.
+    fn shared_expert_branch_gate(&self) -> Option<SharedExpertGateSpec> {
+        None
+    }
+
+    /// The `[1, hidden_size]` projection operand that
+    /// [`Self::shared_expert_branch_gate`] reads. Paired with it: a family
+    /// declaring the gate must name the operand, and one declaring no gate
+    /// has none to name.
+    fn shared_expert_branch_gate_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
     // ── Hybrid MoE (Gemma 4 A4B: dense MLP + expert block summed per layer) ──
 
     /// Whether this model has a hybrid dense-MLP + expert block per layer.
@@ -1072,7 +1384,11 @@ pub trait ModelArchitecture: Send + Sync {
 
     /// Per-expert intermediate (hidden) dimension. 0 for non-MoE models.
     fn moe_intermediate_size(&self) -> usize {
-        0
+        // The declared expert width. `0` was the old default and it is not
+        // a width — an MoE surface carrying it states that each expert
+        // projects to nothing, which no closure check can satisfy and no
+        // reader can act on.
+        self.config().moe_intermediate_size.unwrap_or(0)
     }
 
     /// Packed stacked gate+up projection key (Gemma 4 PackedBF16 format).
@@ -1169,6 +1485,60 @@ pub trait ModelArchitecture: Send + Sync {
         false
     }
 
+    /// Where this family's ROUTED experts run — at `hidden_size`, or
+    /// behind a bottleneck of their own.
+    ///
+    /// Read from the DECLARATION: `routed_expert_hidden_size`'s
+    /// PRESENCE, exactly the reference's `is not None`. Never inferred
+    /// from which tensors a checkpoint ships — a `routed_expert_down_proj`
+    /// may CONFIRM this form, it must never select it, or a checkpoint
+    /// with a stray operand would be executed as a different model.
+    ///
+    /// The norm is nested inside the latent variant because the reference
+    /// nests it: `if self.use_latent_moe:` encloses
+    /// `if self.latent_moe_use_norm:`, so a config setting the flag
+    /// without the width builds no norm at all. That state is
+    /// unrepresentable here rather than merely discouraged.
+    fn routed_expert_form(&self) -> RoutedExpertForm {
+        match self.config().routed_expert_hidden_size {
+            None => RoutedExpertForm::Uniform,
+            Some(width) => RoutedExpertForm::Latent {
+                width,
+                norm: self.latent_moe_uses_norm().then(|| LatentNormSpec {
+                    eps: self.routed_expert_norm_eps(),
+                }),
+            },
+        }
+    }
+
+    /// Whether the latent routed branch normalises its weighted
+    /// aggregate.
+    ///
+    /// TRUTHINESS, not presence: the reference reads
+    /// `getattr(config, "latent_moe_use_norm", False)` and consumes it
+    /// in a plain `if`, so absent, `null` and `false` are all "no norm"
+    /// and differ only in what the plan reports as declared.
+    fn latent_moe_uses_norm(&self) -> bool {
+        self.config().latent_moe_use_norm.unwrap_or(false)
+    }
+
+    /// The epsilon `routed_expert_norm` runs at.
+    ///
+    /// The LAYER's eps, because the reference passes it explicitly:
+    /// `KimiRMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)`.
+    ///
+    /// This is deliberately NOT [`Self::mla_q_a_norm_eps`]'s answer and
+    /// not a shared "low-rank norm epsilon" accessor. The two
+    /// neighbouring low-rank norms in this same family — `q_a_layernorm`
+    /// and `kv_a_layernorm` — are constructed with no override and run
+    /// at `KimiRMSNorm`'s class default `1e-6`, a factor of ten away.
+    /// Two rungs in a row established that class default; this one
+    /// inverts it, and the inversion is transcribed from the
+    /// constructor rather than inherited from the neighbours.
+    fn routed_expert_norm_eps(&self) -> f64 {
+        self.norm_eps() as f64
+    }
+
     /// MLA compressed KV dimension.
     fn kv_lora_rank(&self) -> usize {
         0
@@ -1211,6 +1581,99 @@ pub trait ModelArchitecture: Send + Sync {
 
     /// DS-V3 MLA: V head dim (after absorption may differ from qk dims).
     fn mla_v_head_dim(&self) -> Option<usize> {
+        None
+    }
+
+    /// The epsilon MLA's QUERY-side norm (`q_a_layernorm`) runs at, when
+    /// this family factorises its query and its reference fixes one.
+    ///
+    /// Its own accessor, deliberately not the KV one and deliberately not
+    /// a shared "MLA low-rank norm epsilon". The two are equal today —
+    /// `1e-6` — because they share a CAUSE: `KimiRMSNorm(width)` with no
+    /// `eps` argument, twice, in the same `__init__`
+    /// (`modeling_kimi_linear.py` L368 and L383). They do not share an
+    /// AUTHORITY. A family that overrode one and left the other at the
+    /// class default would be silently wrong under a shared accessor, and
+    /// the coincidence would have been promoted to a contract nobody
+    /// checked.
+    ///
+    /// `None` means **unjudged** — never "use the KV one", never "use the
+    /// layer eps". A declared low-rank query with no judged epsilon must
+    /// reach a named refusal, not a plausible number.
+    fn mla_q_a_norm_eps(&self) -> Option<f64> {
+        None
+    }
+
+    /// Which query this family's MLA layers build.
+    ///
+    /// Read from the DECLARATION — `q_lora_rank`'s presence, exactly the
+    /// `is not None` the reference branches on (`modeling_kimi_linear.py`
+    /// L364, L418) — and never from which tensors a checkpoint happens to
+    /// ship. `q_proj` and `q_b_proj` share a row count and differ only in
+    /// their column count, so an operand-sniffing default would pick the
+    /// form from the very thing the form is supposed to decide.
+    ///
+    /// A declared `0` selects the factorised form, because `0 is not
+    /// None`. Transcription, not endorsement: the geometry it then
+    /// describes is degenerate, and closure refuses it by name.
+    ///
+    /// The epsilon is fetched here so that a family declaring the form
+    /// without judging its norm produces a `LowRank` closure can refuse
+    /// by name. An architecture may override this whole method; one that
+    /// does still gets its own [`Self::mla_q_a_norm_eps`] honoured,
+    /// because the declaration chooses the FORM and the override chooses
+    /// the semantics WITHIN it.
+    fn mla_query_form(&self) -> MlaQueryForm {
+        match self.config().q_lora_rank {
+            None => MlaQueryForm::Direct,
+            Some(rank) => MlaQueryForm::LowRank {
+                rank,
+                norm_eps: self.mla_q_a_norm_eps(),
+            },
+        }
+    }
+
+    /// The epsilon MLA's latent norm (`kv_a_layernorm`) runs at, when this
+    /// family's own reference code fixes one.
+    ///
+    /// `None` — the default — means **unjudged**, never "use the layer
+    /// eps". The two are genuinely different numbers: Kimi Linear
+    /// constructs `kv_a_layernorm = KimiRMSNorm(self.kv_lora_rank)` with
+    /// no override, so it runs at `KimiRMSNorm.__init__`'s class default
+    /// `1e-6` while every other norm in the same layer runs at
+    /// `config.rms_norm_eps` (`1e-5`) — a factor of ten, on the one norm
+    /// standing between the compressed cache and its decompression.
+    ///
+    /// This is an ARCHITECTURE fact, not a config fact: no checkpoint
+    /// declares it, the family's modeling code does. So it is one of the
+    /// legitimate overrides — a default that answered `Some(rms_norm_eps)`
+    /// here would be the silent-wrong-serving shape the trait-default rule
+    /// exists to prevent, and a family whose reference has not been read
+    /// must reach an executor's named refusal rather than a plausible
+    /// number.
+    fn mla_kv_a_norm_eps(&self) -> Option<f64> {
+        None
+    }
+
+    // ── KDA (Kimi Delta Attention) ──
+
+    /// Which decay gate this family's KDA recurrence computes.
+    ///
+    /// `None` — the default — means **unjudged**, and an executor must
+    /// refuse rather than pick a form. It is not a formality: Kimi Linear
+    /// and GLM-5.3-Flash both declare
+    /// `linear_attn_config.gate_lower_bound: -5.0`, and Kimi's reference
+    /// reads it nowhere while GLM's applies it. A default here — either
+    /// form — would silently serve one family's arithmetic to the other,
+    /// with every shape closing. Measured cost of getting it wrong:
+    /// relative 2.50e-2 on a real GLM layer's output, from a 2.8× error in
+    /// the mean per-step decay (see [`KdaGateForm`]).
+    ///
+    /// The same architecture fact as [`Self::mla_kv_a_norm_eps`], for the
+    /// same reason: no checkpoint declares which branch its reference
+    /// takes, so the declaration lives with the family that owns the
+    /// reference.
+    fn kda_gate_form(&self) -> Option<crate::config::KdaGateForm> {
         None
     }
 
@@ -1273,23 +1736,78 @@ pub trait ModelArchitecture: Send + Sync {
         crate::defaults::DEFAULT_NORM_EPS
     }
 
-    /// Per-layer RoPE position divisor from `rope_scaling`. Used to honour
-    /// linear rope-scaling and the Gemma 3 per-layer-type structured form.
-    /// Default: 1.0 (no scaling).
+    /// Per-layer RoPE position divisor from `rope_scaling`: the linear
+    /// `factor` when the checkpoint declares `rope_type: "linear"`,
+    /// [`UNSCALED_POSITION_DIVISOR`] otherwise.
     ///
-    /// Gemma 3 overrides this to return the linear `factor` on global
-    /// layers only and 1.0 on sliding layers, matching the HF
-    /// `Gemma3TextConfig.rope_scaling.full_attention` structure.
+    /// **The read lives in the trait default**, for the reason recorded
+    /// on [`Self::yarn_rope_scaling`]: `rope_type: "linear"` is a config
+    /// fact, and HF's `_compute_linear_scaling_rope_parameters` applies
+    /// it to every rotating layer of any family that declares it. This
+    /// used to return `1.0` unconditionally and let Gemma 3 opt in, which
+    /// is the shape that doc-comment warns about — a Llama-2 long-context
+    /// checkpoint declaring `{type: linear, factor: 2}` was served
+    /// unscaled.
+    ///
+    /// Gemma 3 overrides this to return the `factor` on global layers
+    /// only and `1.0` on sliding layers, matching the HF
+    /// `Gemma3TextConfig.rope_scaling.full_attention` structure — the
+    /// legitimate override: which layers the block reaches is fixed by
+    /// the architecture, not by the config.
     fn rope_position_divisor_for_layer(&self, _layer: usize) -> f64 {
-        1.0
+        self.linear_rope_scaling()
+            .unwrap_or(UNSCALED_POSITION_DIVISOR)
     }
 
-    /// `llama3` RoPE scaling parameters when the architecture uses them.
-    /// Default: `None`. Llama 3.x overrides to return the parsed factor
-    /// and frequency-band thresholds. Consumed by
-    /// `larql-inference::attention::rope::apply_rope_partial_at_full`.
+    /// The linear position divisor when the checkpoint declares
+    /// `rope_scaling = {rope_type: linear, factor}`; `None` for every
+    /// other scaling family and for no block at all.
+    ///
+    /// The checkpoint-wide declaration. Which layers it reaches is
+    /// [`Self::rope_position_divisor_for_layer`]'s answer.
+    fn linear_rope_scaling(&self) -> Option<f64> {
+        let rs = self.config().rope_scaling.as_ref()?;
+        rs.scaling_type
+            .eq_ignore_ascii_case(rope_types::ROPE_TYPE_LINEAR)
+            .then_some(rs.factor)
+    }
+
+    /// `llama3` RoPE scaling parameters when the checkpoint declares them.
+    ///
+    /// **The read lives in the trait default**, for the reason recorded on
+    /// [`Self::yarn_rope_scaling`] below. This used to return `None` and
+    /// make each family opt in, which is the shape that doc-comment warns
+    /// about: `rope_type: "llama3"` is a *config fact*, and a checkpoint
+    /// declaring it was served the wrong frequencies unless its
+    /// architecture happened to have overridden this method. Only
+    /// `llama.rs` had, so a family arriving with Llama-3 scaling under any
+    /// other `model_type` silently lost it.
+    ///
+    /// The band factors default because HF defaults them; the pre-trained
+    /// context window does too — unlike YaRN, whose correction bounds are
+    /// undefined without it, `_compute_llama3_parameters` reads
+    /// `original_max_position_embeddings` from the config proper when the
+    /// block omits it.
     fn llama3_rope_scaling(&self) -> Option<Llama3RopeScaling> {
-        None
+        let rs = self.config().rope_scaling.as_ref()?;
+        if !rs
+            .scaling_type
+            .eq_ignore_ascii_case(rope_types::ROPE_TYPE_LLAMA3)
+        {
+            return None;
+        }
+        Some(Llama3RopeScaling {
+            factor: rs.factor,
+            low_freq_factor: rs
+                .llama3_low_freq_factor
+                .unwrap_or(crate::defaults::LLAMA3_LOW_FREQ_FACTOR_DEFAULT),
+            high_freq_factor: rs
+                .llama3_high_freq_factor
+                .unwrap_or(crate::defaults::LLAMA3_HIGH_FREQ_FACTOR_DEFAULT),
+            original_max_position_embeddings: rs
+                .llama3_original_max_position_embeddings
+                .unwrap_or(crate::defaults::LLAMA3_ORIGINAL_MAX_POSITION_EMBEDDINGS_DEFAULT),
+        })
     }
 
     /// `yarn` RoPE scaling parameters when the checkpoint declares them.
@@ -1327,6 +1845,25 @@ pub trait ModelArchitecture: Send + Sync {
             mscale: rs.yarn_mscale,
             mscale_all_dim: rs.yarn_mscale_all_dim,
         })
+    }
+
+    /// Which frequency-scaling family this checkpoint declares.
+    ///
+    /// The one place the question is answered. `rope_type` holds a single
+    /// value, so the families are alternatives, not a set — asking the two
+    /// accessors separately at each call site would invent a "both" state
+    /// and leave every site to pick a precedence of its own.
+    fn declared_rope_scaling(&self) -> DeclaredRopeScaling {
+        if let Some(yarn) = self.yarn_rope_scaling() {
+            return DeclaredRopeScaling::Yarn(yarn);
+        }
+        if let Some(llama3) = self.llama3_rope_scaling() {
+            return DeclaredRopeScaling::Llama3(llama3);
+        }
+        if let Some(factor) = self.linear_rope_scaling() {
+            return DeclaredRopeScaling::Linear { factor };
+        }
+        DeclaredRopeScaling::None
     }
 
     /// Multi-modal contract for this architecture, if any.
@@ -1368,4 +1905,157 @@ pub trait ModelArchitecture: Send + Sync {
         let norm_stateless = matches!(self.norm_type(), NormType::RmsNorm | NormType::LayerNorm);
         norm_stateless && self.position_embed_key().is_none() && !self.uses_mla()
     }
+}
+
+/// The family-agnostic position policy — what
+/// [`ModelArchitecture::position_policy_for_layer`] resolves unless a
+/// family overrides it.
+///
+/// A free function as well as a trait default so that an override can
+/// **narrow** the decision and then defer to it. A family whose config
+/// gates rotation on its own key — `granitemoehybrid`'s
+/// `position_embedding_type` — has to answer that question first and
+/// this one second, and Rust gives an override no way to call the
+/// default it replaced. Copying the body into the override instead
+/// would leave two resolvers to keep in agreement, which is the exact
+/// shape [`PositionPolicy`] exists to prevent.
+pub fn default_position_policy_for_layer<A: ModelArchitecture + ?Sized>(
+    arch: &A,
+    layer: usize,
+) -> PositionPolicy {
+    // A declared relative scheme decides the policy outright. Checked
+    // before every rotary branch because `rope_base` carries a
+    // DEFAULT: without this, a checkpoint that declares no rope key at
+    // all still resolves to `Rope { theta: 10000 }`, which is a
+    // rotation the author never asked for on every layer.
+    if let (Some(d_rel), Some(extent)) = (arch.config().d_rel, arch.config().rel_extent) {
+        return PositionPolicy::Relative { d_rel, extent };
+    }
+    // `mla_use_nope` means what it says: the MLA block applies no
+    // positional rotation at all.
+    //
+    // Judged from Kimi Linear's own `modeling_kimi.py`, not from the
+    // flag's name, because the config looks self-contradictory — it
+    // declares `mla_use_nope: true` *and* `qk_rope_head_dim: 64`. The
+    // reference settles it two ways:
+    //
+    //   1. the file contains **no rotary code whatsoever** — `q_rot`
+    //      and `k_rot` are split out and concatenated straight back,
+    //      unrotated;
+    //   2. `arch.use_nope` is read exactly once, as `assert
+    //      arch.use_nope` — the flag is a *precondition*, not a
+    //      switch, and the class refuses to run without it.
+    //
+    // So `qk_rope_head_dim` is a **structural width**, not a rotary
+    // subspace: it splits `q_head_dim = 128 + 64 = 192` (q_proj rows
+    // 32·192 = 6144, as stored) and gives `kv_a_proj_with_mqa` its
+    // extra 64 outputs, broadcast across heads as a shared unrotated K
+    // component. The key name is actively misleading and only the
+    // reference could settle it.
+    //
+    // Deliberately keyed on `Some(true)`. `false` is a combination the
+    // reference does not implement — its assert fires — so this build
+    // has no ground truth for it and must not answer.
+    if arch.config().mla_use_nope == Some(true) {
+        return PositionPolicy::None;
+    }
+    // The per-layer rotary SCHEDULE, asked before the rotary SHAPE.
+    // `no_rope_layers` says whether this layer rotates at all; everything
+    // below says how a rotating layer rotates. Composed rather than
+    // branched so a scheduled layer still picks up YaRN, a partial
+    // rotary, or a per-layer theta — the drop `layer_rope_theta`'s branch
+    // already guards against, one key over.
+    if !rope_scheduled_for_layer(arch.config(), layer) {
+        return PositionPolicy::None;
+    }
+    // One resolution of "which scaling family did this checkpoint
+    // declare", asked once and composed with the per-layer theta below.
+    let scaling = arch.declared_rope_scaling();
+    // Linear scaling is declared once for the checkpoint but REACHES a
+    // layer by the architecture's answer: HF applies Gemma 3's block to
+    // its full-attention layers only. Resolved per layer here, before
+    // the two branches below, so each sees the divisor this layer
+    // actually runs under — `None` on a layer the family leaves plain.
+    let scaling = match scaling {
+        DeclaredRopeScaling::Linear { .. } => {
+            let divisor = arch.rope_position_divisor_for_layer(layer);
+            if divisor == UNSCALED_POSITION_DIVISOR {
+                DeclaredRopeScaling::None
+            } else {
+                DeclaredRopeScaling::Linear { factor: divisor }
+            }
+        }
+        declared => declared,
+    };
+    match arch
+        .config()
+        .layer_rope_theta
+        .as_ref()
+        .and_then(|thetas| thetas.get(layer))
+    {
+        Some(&declared) => {
+            // A per-layer theta states WHICH base this layer rotates
+            // at. It does not state that the layer stops being a
+            // partial or multi-axis rotary, so the config's rotary
+            // shape is re-applied at that theta. Without this, any
+            // checkpoint declaring `layer_rope_theta` alongside
+            // `partial_rotary_factor` would silently rotate the whole
+            // head — the same drop this rung exists to close, one
+            // branch over.
+            match PositionPolicy::from_declared_theta_with_scaling(declared, scaling) {
+                PositionPolicy::Rope { theta } => arch.rotary_policy(theta),
+                // NoPE has no rotary shape, and YaRN carries its own.
+                resolved => resolved,
+            }
+        }
+        None => match scaling {
+            DeclaredRopeScaling::Yarn(scaling) => PositionPolicy::Yarn {
+                theta: arch.rope_base_for_layer(layer),
+                scaling,
+            },
+            DeclaredRopeScaling::Llama3(scaling) => PositionPolicy::Llama3 {
+                theta: arch.rope_base_for_layer(layer),
+                scaling,
+            },
+            // Composed with the rotary SHAPE, not built over it: a linear
+            // divisor on a partial or multi-axis rotary has no variant,
+            // so that layer keeps its shape and the plan's carriage gate
+            // refuses the unpaired `factor` — the same fallthrough
+            // `from_declared_theta_with_scaling` takes, so the two
+            // branches of this function cannot disagree.
+            DeclaredRopeScaling::Linear { factor } => {
+                match arch.rotary_policy(arch.rope_base_for_layer(layer)) {
+                    PositionPolicy::Rope { theta } => PositionPolicy::Linear { theta, factor },
+                    shaped => shaped,
+                }
+            }
+            DeclaredRopeScaling::None => arch.rotary_policy(arch.rope_base_for_layer(layer)),
+        },
+    }
+}
+
+/// Whether the declared rotary schedule rotates `layer` at all.
+///
+/// Two spellings of one fact, and they are NOT equal partners: both
+/// SmolLM3 and Llama 4 build the mask from the interval only
+/// `if no_rope_layers is None`, so an explicit mask SUPERSEDES a declared
+/// interval rather than being cross-checked against it. Preferring the
+/// interval — or reconciling the two — would put this build on a
+/// schedule the reference never runs.
+///
+/// A mask shorter than the stack makes no statement about the layers past
+/// its end (both references document "at least the same length as the
+/// number of layers" and index it directly), so those layers keep the
+/// unscheduled behaviour rather than acquiring a guessed one.
+fn rope_scheduled_for_layer(cfg: &ModelConfig, layer: usize) -> bool {
+    if let Some(mask) = cfg.no_rope_layers.as_ref() {
+        return mask
+            .get(layer)
+            .copied()
+            .is_none_or(PositionPolicy::rope_enabled_by_flag);
+    }
+    if let Some(interval) = cfg.no_rope_layer_interval {
+        return PositionPolicy::rope_enabled_by_interval(layer, interval);
+    }
+    true
 }

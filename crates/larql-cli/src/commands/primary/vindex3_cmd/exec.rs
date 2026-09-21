@@ -10,7 +10,9 @@
 //! Token ids are given explicitly rather than tokenised here. A tokenizer
 //! is part of the fixture, and only one side of a parity comparison may
 //! choose it — `scripts/capture_glimmer_oracle.py` already recorded the
-//! ids this reads back.
+//! ids this reads back. `larql run <container> [prompt]` is the text
+//! shell over the same preparation (`prepare`) and the same interpreter;
+//! its `--emit-ids` prints the ids this verb would be given.
 //!
 //! The backend is a flag over the same plan. That is the point of the
 //! seam: `--backend reference` and `--backend production` execute one
@@ -28,31 +30,29 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use larql_vindex::error::VindexError;
-use larql_vindex::format::vindex3::inspect::inspect_container;
 use larql_vindex::format::vindex3::opplan::exec::backend::PlanBackend;
-use larql_vindex::format::vindex3::opplan::exec::operands::{OperandStore, RepresentationSource};
-use larql_vindex::format::vindex3::opplan::exec::production::ProductionBackend;
-use larql_vindex::format::vindex3::opplan::exec::reference::ReferenceBackend;
+use larql_vindex::format::vindex3::opplan::exec::operands::OperandStore;
+use larql_vindex::format::vindex3::opplan::exec::prepared::ExecutionSlice;
 use larql_vindex::format::vindex3::opplan::exec::{
-    execute_plan, execute_plan_streaming, ExecutionTrace, PlaneEvent, ResumePoint,
+    execute_plan_streaming, execute_slice, ExecutionTrace, Plane, PlaneEvent, ResumePoint,
 };
-use larql_vindex::format::vindex3::opplan::plan_component_ops;
 use larql_vindex::format::vindex3::opplan::ComponentOpPlan;
 use ndarray::Array2;
 
 use super::super::shannon_trace::dump::{
     plane_name, write_plane, LayerDumpManifest, MANIFEST_NAME, PLANE_DTYPE,
 };
-use super::{ExecArgs, ExecBackend};
+use larql_inference::vindex3::OpenedComponent;
+
+use super::prepare::{
+    parse_representation_source, prepare, with_plan_backend, BackendVisitor, ENGINE_PREFIX,
+};
+use super::ExecArgs;
 
 /// Extra planes beyond the layer table, matching
 /// `scripts/capture_glimmer_oracle.py`.
 const FINAL_NORM_PLANE: &str = "final_norm.f32";
 const LOGITS_PLANE: &str = "logits.f32";
-
-/// Engine tag prefix; the backend name completes it so a dump can never
-/// be mistaken for one produced by the other realisation.
-const ENGINE_PREFIX: &str = "vindex3";
 
 /// Sidecar recording what fixture an interrupted dump was running, so
 /// `--resume` can refuse to splice two different runs. Written at start;
@@ -73,46 +73,15 @@ pub(super) struct ResumeSidecar {
 
 pub fn run_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     let tokens = parse_tokens(&args.tokens)?;
-    let inspection = inspect_container(&args.container, false)?;
-    let outcome = plan_component_ops(&inspection, &args.container, &args.component)?;
-    if !outcome.defects.is_empty() {
-        for defect in &outcome.defects {
-            eprintln!("defect: {defect}");
-        }
-        return Err(format!(
-            "component `{}` does not close: {} defect(s)",
-            args.component,
-            outcome.defects.len()
-        )
-        .into());
-    }
-    let plan = outcome
-        .plan
-        .ok_or_else(|| format!("component `{}` produced no plan", args.component))?;
-    // What execution wants, and whether it may be manufactured now, are
-    // separate questions — see `--representation-source`.
-    let source = match args.representation_source.as_str() {
-        "auto" => RepresentationSource::Auto,
-        "stored" => RepresentationSource::Stored,
-        "transient" => RepresentationSource::Transient,
-        other => {
-            return Err(format!(
-                "unknown --representation-source `{other}`; expected auto, stored or transient"
-            )
-            .into())
-        }
-    };
-    // The encoding a compiled pack would have to carry for this backend.
-    // `None` on arms that execute the canonical bytes directly, which then
-    // never look for a pack.
-    let want = wanted_representation(args.backend);
-    let store = OperandStore::open_for(&args.container, &inspection, want, source)?;
+    let source = parse_representation_source(&args.representation_source)?;
+    let OpenedComponent {
+        plan, store, want, ..
+    } = prepare(&args.container, &args.component, args.backend, source)?;
 
     let from_pack = store.selection().values().filter(|s| s.stored).count();
-    if want.is_some() {
+    if let Some(want) = &want {
         println!(
-            "representation: {}  source: {}  objects from a compiled pack: {}/{}",
-            want.unwrap_or("-"),
+            "representation: {want}  source: {}  objects from a compiled pack: {}/{}",
             args.representation_source,
             from_pack,
             store.selection().len()
@@ -121,176 +90,39 @@ pub fn run_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(all(feature = "gpu", target_os = "macos"))]
     {
-        use larql_vindex::format::vindex3::opplan::exec::backend::{WeightFormat, WeightFormats};
-        // The lowered path's per-class policy. Same scheduling for every
-        // arm — one command buffer per token — so a comparison between
-        // them prices the *representation*, which the pre-lowering
-        // numbers could not (they mixed kernel families and starvation).
-        let lowered = match args.backend {
-            ExecBackend::MetalLowered => {
-                Some((WeightFormats::uniform(WeightFormat::Nvfp4), "nvfp4-all"))
-            }
-            ExecBackend::MetalLoweredFfn => Some((
-                WeightFormats {
-                    attention: WeightFormat::F16,
-                    ffn: WeightFormat::Nvfp4,
-                    head: WeightFormat::F16,
-                },
-                "nvfp4-ffn",
-            )),
-            ExecBackend::MetalLoweredNoHead => Some((
-                WeightFormats {
-                    attention: WeightFormat::Nvfp4,
-                    ffn: WeightFormat::Nvfp4,
-                    head: WeightFormat::F16,
-                },
-                "nvfp4-no-head",
-            )),
-            ExecBackend::MetalLoweredMxfp4 => {
-                Some((WeightFormats::uniform(WeightFormat::Mxfp4), "mxfp4-all"))
-            }
-            ExecBackend::MetalLoweredF16 => {
-                Some((WeightFormats::uniform(WeightFormat::F16), "f16-all"))
-            }
-            ExecBackend::MetalLoweredMxfp4Ffn => Some((
-                WeightFormats {
-                    attention: WeightFormat::F16,
-                    ffn: WeightFormat::Mxfp4,
-                    head: WeightFormat::F16,
-                },
-                "mxfp4-ffn",
-            )),
-            _ => None,
-        };
-        if let Some((formats, label)) = lowered {
+        if let Some((formats, label)) = super::prepare::lowered_formats(args.backend) {
             let r = super::lowered::run_lowered(&args, &tokens, &plan, &store, formats, label);
-            report_representation_work(&store, want, r.is_ok());
+            report_representation_work(&store, want.as_deref(), r.is_ok());
             return r;
         }
     }
-    let outcome = match args.backend {
-        ExecBackend::Reference => run_on(&ReferenceBackend::new(), &args, &tokens, &plan, &store),
-        ExecBackend::Production => run_on(&ProductionBackend::new(), &args, &tokens, &plan, &store),
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        ExecBackend::MetalMxfp4 => {
-            let gpu = larql_compute_metal::MetalBackend::new()
-                .ok_or("no Metal device available for --backend metal-mxfp4")?;
-            // FFN-only MXFP4 — the gpt-oss precedent. The gates
-            // falsified the wider presets on the 6-token fixture:
-            // all-MXFP4 flipped the argmax (top-2 gap 0.08 vs
-            // upstream's 1.13) and an f16 head alone did not recover
-            // it (gap 0.01) — 4-bit attention projections accumulate
-            // ~14% rel_rms across 52 layers. Attention and head stay
-            // f16; the FFN bulk (~3/4 of the bytes) is quantised.
-            use larql_vindex::format::vindex3::opplan::exec::backend::{
-                WeightFormat, WeightFormats,
-            };
-            let backend =
-                larql_vindex::format::vindex3::opplan::exec::device::DevicePlanBackend::with_formats(
-                    gpu,
-                    "metal-q1-mxfp4-ffn",
-                    WeightFormats {
-                        attention: WeightFormat::F16,
-                        ffn: WeightFormat::Mxfp4,
-                        head: WeightFormat::F16,
-                    },
-                );
-            run_on(&backend, &args, &tokens, &plan, &store)
-        }
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        ExecBackend::MetalLowered
-        | ExecBackend::MetalLoweredFfn
-        | ExecBackend::MetalLoweredNoHead
-        | ExecBackend::MetalLoweredMxfp4
-        | ExecBackend::MetalLoweredMxfp4Ffn
-        | ExecBackend::MetalLoweredF16 => unreachable!("handled above"),
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        ExecBackend::MetalMxfp4All => {
-            let gpu = larql_compute_metal::MetalBackend::new()
-                .ok_or("no Metal device available for --backend metal-mxfp4-all")?;
-            // The control arm: the preset Q1 falsified. Its job is to
-            // fail, so that a Q2 arm holding the prediction is evidence
-            // about the format rather than about the harness.
-            use larql_vindex::format::vindex3::opplan::exec::backend::{
-                WeightFormat, WeightFormats,
-            };
-            let backend =
-                larql_vindex::format::vindex3::opplan::exec::device::DevicePlanBackend::with_formats(
-                    gpu,
-                    "metal-q1-mxfp4-all",
-                    WeightFormats::uniform(WeightFormat::Mxfp4),
-                );
-            run_on(&backend, &args, &tokens, &plan, &store)
-        }
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        ExecBackend::MetalNvfp4 | ExecBackend::MetalNvfp4Ffn | ExecBackend::MetalNvfp4NoHead => {
-            let gpu = larql_compute_metal::MetalBackend::new()
-                .ok_or("no Metal device available for the nvfp4 backends")?;
-            // The VINDEX3-Q2 ladder. Q1 established that *this model's*
-            // attention does not survive MXFP4; NVFP4 keeps the same
-            // e2m1 elements and changes only the scale geometry, which a
-            // weight-reconstruction sweep with an equal-bit-budget
-            // control (E8M0 at group 16) isolated as the whole source of
-            // the difference. Arm A is the one that matters — it is the
-            // ~17 GB regime — and B and C exist so a failure says which
-            // class it came from rather than only that it failed.
-            use larql_vindex::format::vindex3::opplan::exec::backend::{
-                WeightFormat, WeightFormats,
-            };
-            let (name, formats) = match args.backend {
-                // A — everything 4-bit.
-                ExecBackend::MetalNvfp4 => (
-                    "metal-q2-nvfp4-all",
-                    WeightFormats::uniform(WeightFormat::Nvfp4),
-                ),
-                // B — attention and FFN 4-bit, head wide. Isolates the
-                // head, which Q1's second rung showed was not the whole
-                // story under MXFP4.
-                ExecBackend::MetalNvfp4NoHead => (
-                    "metal-q2-nvfp4-no-head",
-                    WeightFormats {
-                        attention: WeightFormat::Nvfp4,
-                        ffn: WeightFormat::Nvfp4,
-                        head: WeightFormat::F16,
-                    },
-                ),
-                // C — the Q1-passing partition, re-run under NVFP4, so
-                // the two formats are compared at the same class split.
-                _ => (
-                    "metal-q2-nvfp4-ffn",
-                    WeightFormats {
-                        attention: WeightFormat::F16,
-                        ffn: WeightFormat::Nvfp4,
-                        head: WeightFormat::F16,
-                    },
-                ),
-            };
-            let backend =
-                larql_vindex::format::vindex3::opplan::exec::device::DevicePlanBackend::with_formats(
-                    gpu, name, formats,
-                );
-            run_on(&backend, &args, &tokens, &plan, &store)
-        }
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        ExecBackend::Metal => {
-            // vindex never links Metal: the CLI injects the concrete
-            // device through larql-compute's MatMul seam. f16 weights so
-            // the Metal buffer cache keeps the model resident (r2); the
-            // engine tag names the realisation so a dump can never be
-            // mistaken for the f32 r1 lowering.
-            let gpu = larql_compute_metal::MetalBackend::new()
-                .ok_or("no Metal device available for --backend metal")?;
-            let backend =
-                larql_vindex::format::vindex3::opplan::exec::device::DevicePlanBackend::new(
-                    gpu,
-                    "metal-r3-f16",
-                    larql_vindex::format::vindex3::opplan::exec::backend::WeightFormat::F16,
-                );
-            run_on(&backend, &args, &tokens, &plan, &store)
-        }
-    };
-    report_representation_work(&store, want, outcome.is_ok());
+    let outcome = with_plan_backend(
+        args.backend,
+        ExecVisitor {
+            args: &args,
+            tokens: &tokens,
+            plan: &plan,
+            store: &store,
+        },
+    );
+    report_representation_work(&store, want.as_deref(), outcome.is_ok());
     outcome
+}
+
+/// The exec verb's work, once the backend is a concrete type.
+struct ExecVisitor<'a> {
+    args: &'a ExecArgs,
+    tokens: &'a [u32],
+    plan: &'a ComponentOpPlan,
+    store: &'a OperandStore,
+}
+
+impl BackendVisitor for ExecVisitor<'_> {
+    type Out = ();
+
+    fn visit<B: PlanBackend>(self, backend: &B) -> Result<(), Box<dyn std::error::Error>> {
+        run_on(backend, self.args, self.tokens, self.plan, self.store)
+    }
 }
 
 /// Say how much of the representation the runtime had to manufacture.
@@ -323,6 +155,37 @@ fn report_representation_work(store: &OperandStore, want: Option<&str>, ok: bool
              (the pack's precision map)"
         );
     }
+    report_projection_plans();
+}
+
+/// Bytes per gigabyte, as the projection ledger reports traffic.
+const BYTES_PER_GB: f64 = 1e9;
+
+/// Which projection plans actually ran, from the executor's own ledger.
+///
+/// The representation line says what the backend ASKED for; this says
+/// what the bytes were consumed by. PARETO-1 needs the second: a stored
+/// K-quant pack can be executed in place (`FusedKQuant`) or decoded and
+/// run as f32 (`BlasF32`), and both bind the same pack, both report
+/// `runtime compile: 0`, and they differ in every logit. A guard that
+/// read only the first line could not tell them apart — which is how the
+/// format-cap confound went unseen.
+fn report_projection_plans() {
+    let rows: Vec<String> = larql_vindex::format::vindex3::opplan::exec::cpu::ledger()
+        .all()
+        .iter()
+        .filter(|(_, t)| t.calls > 0)
+        .map(|(plan, t)| {
+            format!(
+                "{plan:?} {} calls {:.2} GB",
+                t.calls,
+                t.bytes as f64 / BYTES_PER_GB
+            )
+        })
+        .collect();
+    if !rows.is_empty() {
+        println!("projection plans: {}", rows.join(", "));
+    }
 }
 
 /// One monomorphised run: the backend is chosen exactly once, above.
@@ -347,16 +210,40 @@ fn run_on<B: PlanBackend>(
             .collect::<Result<_, _>>()?;
         return super::bank::run_bank(backend, &engine, plan, store, &entries, &dump);
     }
+    // One flag, one meaning. A depth deeper than the model is refused by
+    // the slice itself rather than clamped: a run that silently served a
+    // different depth than it was asked for would poison a ladder.
+    let slice = match args.draft_depth {
+        Some(end) => ExecutionSlice::Draft { end },
+        None => ExecutionSlice::Full,
+    };
     if let Some(out) = &args.logit_dump {
-        return super::teacher_force::run_teacher_force(backend, &engine, tokens, plan, store, out);
+        return super::teacher_force::run_teacher_force(
+            backend, &engine, tokens, plan, store, out, slice,
+        );
     }
     match (&args.dump_layers, args.generate) {
         (Some(dir), _) => run_dump(dir, &engine, args, tokens, plan, store, backend),
         (None, Some(new_tokens)) => {
+            if args.residency_curve {
+                return super::generate::run_residency_curve(
+                    backend,
+                    &engine,
+                    tokens,
+                    new_tokens,
+                    plan,
+                    store,
+                    args.repeat,
+                    args.warmup,
+                    args.unquiet_ok,
+                    &args.expert_access,
+                );
+            }
             super::generate::run_generate(backend, &engine, tokens, new_tokens, plan, store)
+                .map(|_generated| ())
         }
         (None, None) => {
-            let trace = execute_plan(plan, store, tokens, backend)?;
+            let trace = execute_slice(plan, store, tokens, backend, slice)?;
             summarise(&engine, &trace);
             Ok(())
         }
@@ -407,15 +294,18 @@ fn run_dump<B: PlanBackend>(
     let mut layer_started = Instant::now();
     let out = execute_plan_streaming(plan, store, tokens, backend, resume, &mut |event| {
         match event {
-            PlaneEvent::Embedded(rows) => {
-                write_rows(&dir.join(plane_name(0)), rows)?;
+            PlaneEvent::Embedded(plane) => {
+                write_rows(&dir.join(plane_name(0)), plane.try_rows()?)?;
                 eprintln!(
                     "plane 000 (embedding)  {:.1}s",
                     started.elapsed().as_secs_f64()
                 );
             }
             PlaneEvent::Layer { index, trace } => {
-                write_rows(&dir.join(plane_name(index + 1)), &trace.post_layer)?;
+                write_rows(
+                    &dir.join(plane_name(index + 1)),
+                    trace.post_layer.try_rows()?,
+                )?;
                 eprintln!(
                     "layer {:>3}/{}  {:.1}s  (elapsed {:.0}s)",
                     index + 1,
@@ -424,14 +314,23 @@ fn run_dump<B: PlanBackend>(
                     started.elapsed().as_secs_f64(),
                 );
             }
+            PlaneEvent::HyperConnectionSite(_)
+            | PlaneEvent::AttentionResidualSite(_)
+            | PlaneEvent::AttentionResidualBoundary(_) => {}
         }
         layer_started = Instant::now();
         Ok(())
     })?;
+    // (A site's state and a block-boundary event are the witness's taps,
+    // not planes; the dump persists layer boundaries only. A dump of an
+    // attention-residual component does not reach here anyway — its
+    // planes hold histories, and `try_rows` refuses them by name above
+    // rather than flattening a prefix-plus-snapshots state into a file
+    // whose format nothing could read back.)
 
     write_rows(
         &dir.join(FINAL_NORM_PLANE),
-        std::slice::from_ref(&out.final_hidden),
+        &[out.exit.try_hidden()?.to_vec()],
     )?;
     if let Some(logits) = &out.logits {
         write_rows(&dir.join(LOGITS_PLANE), std::slice::from_ref(logits))?;
@@ -493,7 +392,7 @@ pub(super) fn prepare_resume(
             );
             Ok(Some(ResumePoint {
                 next_layer: plane,
-                hidden: rows,
+                hidden: Plane::Rows(rows),
             }))
         }
         None => Ok(None),
@@ -599,36 +498,25 @@ fn summarise(engine: &str, trace: &ExecutionTrace) {
     println!(
         "layers: {}  seq: {}  hidden: {}",
         trace.layers.len(),
-        trace.embedded.len(),
-        trace.embedded.first().map(Vec::len).unwrap_or(0),
+        trace.embedded.positions(),
+        match &trace.embedded {
+            Plane::Rows(rows) => rows.first().map(Vec::len).unwrap_or(0),
+            Plane::Bundles(bundles) => bundles.first().map(|b| b.hidden()).unwrap_or(0),
+            // A residual history's width is its prefix's; the snapshot
+            // count is depth, not width, and reporting it here would
+            // call a history a wider hidden state than it is.
+            Plane::Histories(histories) => {
+                histories.first().map(|h| h.hidden()).unwrap_or(0)
+            }
+        },
     );
     match &trace.logits {
-        Some(logits) => match super::generate::argmax(logits) {
+        Some(logits) => match super::decode::argmax(logits) {
             Some((best, value)) => {
                 println!("logits: {}, argmax {best} ({value:+.4})", logits.len());
             }
             None => println!("logits: empty"),
         },
         None => println!("logits: none (plan carries no output head)"),
-    }
-}
-
-/// The stored encoding a backend could be served from, if one is compiled.
-///
-/// Only the NVFP4 arms have a compiled counterpart today. Arms that run
-/// the canonical bytes return `None` and never look for a pack, so adding
-/// packs to a container cannot change what they execute.
-fn wanted_representation(backend: ExecBackend) -> Option<&'static str> {
-    #[cfg(all(feature = "gpu", target_os = "macos"))]
-    use larql_vindex::format::vindex3::represent::nvfp4_pack::DTYPE_NVFP4;
-    match backend {
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        ExecBackend::MetalNvfp4
-        | ExecBackend::MetalNvfp4Ffn
-        | ExecBackend::MetalNvfp4NoHead
-        | ExecBackend::MetalLowered
-        | ExecBackend::MetalLoweredFfn
-        | ExecBackend::MetalLoweredNoHead => Some(DTYPE_NVFP4),
-        _ => None,
     }
 }

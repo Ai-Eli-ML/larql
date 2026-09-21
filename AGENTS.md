@@ -50,6 +50,11 @@ larql-vindex      vindex lifecycle: extract, load, query, mutate, patch, save,
                   VINDEX3 container format lives in `src/format/vindex3/`
                   (plan/encode/verify/execute; spec in
                   docs/vindex3-format-spec.md + docs/vindex3-format.md).
+                  Payload sources are a trait (`encode/source`): a local
+                  checkpoint dir, or an `hf://` repo read by byte range —
+                  `plan`/`encode` admit a repo from its staged safetensors
+                  headers and never download the checkpoint
+                  (docs/vindex3-remote-source.md).
     ↓
 larql-core        graph algorithms (merge, diff, BFS, pagerank, shortest-path)
 larql-inference   engines (Standard, MarkovResidual, Apollo, etc.), chat,
@@ -134,7 +139,7 @@ LQL parser and executor are split: [crates/larql-lql/src/parser/](crates/larql-l
 
 ## Build, test, run
 
-**The toolchain is pinned.** [rust-toolchain.toml](rust-toolchain.toml) fixes it at **1.98.0** with clippy and rustfmt; rustup fetches that version automatically, so do not override it with your own `stable`. This exists because CI installs the newest stable while a developer's `stable` is whenever they last ran `rustup update` — the two drifted to 1.95 vs 1.98, and clippy failed in CI on lints that could not be reproduced locally. (`Cargo.toml`'s `rust-version = 1.88` is the MSRV — a different thing, and not what you build with.)
+**The toolchain is pinned.** [rust-toolchain.toml](rust-toolchain.toml) fixes it at **1.98.0** with clippy and rustfmt; rustup fetches that version automatically, so do not override it with your own `stable`. This exists because CI installs the newest stable while a developer's `stable` is whenever they last ran `rustup update` — the two drifted to 1.95 vs 1.98, and clippy failed in CI on lints that could not be reproduced locally. (`Cargo.toml`'s `rust-version` is the MSRV — a different claim, checked by the `quality` workflow's MSRV job under an explicit `RUSTUP_TOOLCHAIN`, because the toolchain file otherwise overrides the installed MSRV compiler and the gate ran at 1.98 while claiming 1.88 for weeks. Today the two coincide at 1.98: the NEON dot-product intrinsics the VINDEX3 CPU integer path uses stabilised there.)
 
 ```bash
 cargo build --release                             # optimised build
@@ -186,6 +191,8 @@ Or via the Makefile: `make python-setup | python-build | python-test | python-cl
 - LQL language spec: [crates/larql-lql/docs/spec.md](crates/larql-lql/docs/spec.md) (v0.4)
 - Vindex file format: [crates/larql-vindex/docs/format-spec.md](crates/larql-vindex/docs/format-spec.md) (VINDEX2); VINDEX3: [crates/larql-vindex/docs/vindex3-format-spec.md](crates/larql-vindex/docs/vindex3-format-spec.md) (container ABI) + [docs/vindex3-format.md](docs/vindex3-format.md) (model-system spec) + [docs/vindex3-runtime.md](docs/vindex3-runtime.md) (runtime/serving)
 - Operations + patches: [crates/larql-vindex/docs/operations-spec.md](crates/larql-vindex/docs/operations-spec.md)
+- Representation/execution contract (`RepresentationCodec`, the codec registry, the four-proofs programme): [docs/represent-codec-contract.md](docs/represent-codec-contract.md)
+- Lowering plane (the `PlanBackend` seam, what is closed and what goes around it, the LOWERING-PLUGIN-1 programme): [docs/lowering-plane-inventory.md](docs/lowering-plane-inventory.md)
 - Ecosystem (HF publish, Vindexfile): [crates/larql-vindex/docs/ecosystem-spec.md](crates/larql-vindex/docs/ecosystem-spec.md)
 - Inference engine internals: [docs/inference-engine.md](docs/inference-engine.md), [docs/ffn-graph-layer.md](docs/ffn-graph-layer.md)
 - Trace format (.bin/.bndx/.ctxt): [crates/larql-inference/docs/trace-format.md](crates/larql-inference/docs/trace-format.md), [docs/residual-trace.md](docs/residual-trace.md)

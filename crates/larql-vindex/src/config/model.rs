@@ -36,6 +36,50 @@ pub struct VindexModelConfig {
     pub rope_base: f64,
     #[serde(default)]
     pub sliding_window: Option<usize>,
+    /// The window's explicit enable flag, persisted separately from the
+    /// window itself because they are separate declarations: Qwen2.5
+    /// ships a 32768 window beside `use_sliding_window: false`. Dropping
+    /// the flag on the way into a vindex would serve the window against
+    /// the checkpoint's instruction.
+    #[serde(default)]
+    pub use_sliding_window: Option<bool>,
+    /// How far up the stack an enabled window applies.
+    #[serde(default)]
+    pub max_window_layers: Option<usize>,
+    /// The declared positional scheme, verbatim.
+    ///
+    /// Persisted because on `granitemoehybrid` it is what turns rotation
+    /// on at all — a container that dropped it would rebuild the model as
+    /// a NoPE model, or as a rotating one, depending only on which side of
+    /// the boundary the question was asked.
+    #[serde(default)]
+    pub position_embedding_type: Option<String>,
+    /// The per-layer rotary schedule, in the checkpoint's own polarity:
+    /// `1` rotates, `0` is NoPE.
+    ///
+    /// Persisted because it decides which layers encode position at all.
+    /// Dropping it would rebuild SmolLM3 as a model that rotates
+    /// everywhere — fluent, and wrong on 9 of 36 layers.
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<i64>>,
+    /// The interval fallback, persisted so a container that carried no
+    /// explicit mask still knows the schedule it was compiled under.
+    #[serde(default)]
+    pub no_rope_layer_interval: Option<usize>,
+    /// The declared rotary pairing, persisted so the container records
+    /// what the checkpoint claimed rather than what this build does.
+    #[serde(default)]
+    pub rope_interleaved: Option<bool>,
+    /// The declared multi-axis flag, persisted for the same reason.
+    #[serde(default)]
+    pub use_mrope: Option<bool>,
+    /// Falcon's one-word FFN shape (`activation`), persisted so the
+    /// container records the claim the boundary checked.
+    #[serde(default)]
+    pub ffn_shape_name: Option<String>,
+    /// The declared `is_llama_config` flag, persisted for the same reason.
+    #[serde(default)]
+    pub is_llama_config: Option<bool>,
     /// MoE configuration (None for dense models).
     #[serde(default)]
     pub moe: Option<MoeConfig>,
@@ -104,6 +148,24 @@ pub struct VindexModelConfig {
     /// FFN activation name, verbatim (`hidden_act`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_act: Option<String>,
+    /// SiTU-GLU's two softcaps (`activation_situ_beta`,
+    /// `activation_situ_linear_beta`), verbatim.
+    ///
+    /// They are parameters of the combine `hidden_act: "situ"` names, and
+    /// a container that carried the name without them would rebuild the
+    /// FFN at the reference's `beta or 1.0` fallback — a different
+    /// function, with every shape still closing and no parity arm able to
+    /// see it, since both arms would read the same index.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_situ_beta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_situ_linear_beta: Option<f64>,
+    /// One FFN intermediate width per layer (`larql_ffn_intermediate_size_by_layer`),
+    /// verbatim, for checkpoints whose gate/up/down projections were sliced
+    /// to different widths in different layers. A vindex that dropped it
+    /// would rebuild every layer at the dense width and refuse its own tensors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffn_intermediate_size_by_layer: Option<Vec<usize>>,
     /// Declared context bound (`max_position_embeddings`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_position_embeddings: Option<usize>,
@@ -187,6 +249,14 @@ pub struct MoeConfig {
     /// Whether there's a shared expert always active (DeepSeek V2/V3).
     #[serde(default)]
     pub shared_expert: bool,
+    /// That branch's intermediate width, where the judgment declares one.
+    /// Carried beside the boolean rather than derived from
+    /// [`Self::moe_intermediate_size`]: the DeepSeek/Kimi lineage sizes
+    /// the branch as one wider FFN at `moe_intermediate_size * count`
+    /// while Qwen sizes it from its own key, and on Qwen1.5-MoE the two
+    /// answers differ fourfold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_expert_intermediate_size: Option<usize>,
     /// Router type (e.g., "top_k_softmax", "gemma4_top_k_softmax").
     #[serde(default = "default_router_type")]
     pub router_type: String,
@@ -217,11 +287,21 @@ impl VindexModelConfig {
             num_kv_heads: cfg.num_kv_heads,
             rope_base: cfg.rope_base,
             sliding_window: cfg.sliding_window,
+            use_sliding_window: cfg.use_sliding_window,
+            max_window_layers: cfg.max_window_layers,
+            position_embedding_type: cfg.position_embedding_type.clone(),
+            no_rope_layers: cfg.no_rope_layers.clone(),
+            no_rope_layer_interval: cfg.no_rope_layer_interval,
+            rope_interleaved: cfg.rope_interleaved,
+            use_mrope: cfg.use_mrope,
+            ffn_shape_name: cfg.ffn_shape_name.clone(),
+            is_llama_config: cfg.is_llama_config,
             moe: if arch.is_moe() {
                 Some(MoeConfig {
                     num_experts: arch.num_experts(),
                     top_k: arch.num_experts_per_token(),
                     shared_expert: arch.num_shared_experts() > 0,
+                    shared_expert_intermediate_size: arch.shared_expert_intermediate_size(),
                     router_type: arch.moe_router_type().into(),
                     moe_intermediate_size: if arch.moe_intermediate_size() > 0 {
                         Some(arch.moe_intermediate_size())
@@ -251,6 +331,9 @@ impl VindexModelConfig {
             post_norm_eps: cfg.post_norm_eps,
             attention_bias: cfg.attention_bias,
             hidden_act: cfg.hidden_act.clone(),
+            activation_situ_beta: cfg.activation_situ_beta,
+            activation_situ_linear_beta: cfg.activation_situ_linear_beta,
+            ffn_intermediate_size_by_layer: cfg.ffn_intermediate_size_by_layer.clone(),
             max_position_embeddings: cfg.max_position_embeddings,
             final_logit_softcapping: cfg.final_logit_softcapping,
             attention_multiplier: cfg.attention_multiplier,
@@ -298,13 +381,54 @@ mod tests {
             "num_experts",
             "num_experts_per_token",
             "num_shared_experts",
+            "shared_expert_intermediate_size",
             "enable_moe_block",
             "top_k_experts",
             "moe_intermediate_size",
+            // K3-LATENTMOE-1: both reach the surface through
+            // `MoeExecution.routed_expert_form` — the width as the
+            // variant that selects the latent branch, the flag as the
+            // norm nested inside it. Carried as a FORM rather than two
+            // fields, so a norm without a width cannot be expressed.
+            "routed_expert_hidden_size",
+            "latent_moe_use_norm",
+        ];
+        // Read only to RESOLVE another field that IS carried, and
+        // deliberately not persisted itself: persisting both the input and
+        // the conclusion would give one fact two sources of truth, and a
+        // reader would have to know which one the executor honours.
+        const RESOLVED_INTO_ANOTHER_FIELD: &[&str] = &[
+            // `linear_attn_config.safe_gate` is an input to
+            // `ModelArchitecture::kda_gate_form`, whose CONCLUSION —
+            // `ExecutionSurface.kda_gate_form`, and `KdaOp.gate_form` —
+            // is what the container carries and the executor reads. The
+            // form is the forward-affecting fact; `safe_gate` is one of
+            // two config values the family combines to reach it.
+            "kda_safe_gate",
         ];
         // Genuinely not persisted yet. Each entry is a known gap, not an
         // exemption: no vindex-served model can use these today.
         const KNOWN_GAPS: &[&str] = &[
+            // Hyper-connections. The residual topology is REPRESENTED on
+            // the execution surface (wave 16) and explicitly not
+            // executable, so no vindex-served model can use it — and
+            // persisting it in the model config would claim a serving
+            // path that refuses. It moves here when wave 17 lowers it.
+            "hc_streams",
+            "hc_sinkhorn_iters",
+            "hc_eps",
+            // Attention residuals, and the same status for a sharper
+            // reason: the VINDEX3 execution surface carries the declared
+            // period (K3-ATTNRES-1) and the executor refuses the topology
+            // by name at preparation, so no vindex-served model can use
+            // it. Persisting the period in the legacy model config would
+            // claim a serving path that refuses.
+            "attn_res_block_size",
+            // The two K3 attention output gates (K3-REP-GATE-1): the KDA
+            // gate's FORM and MLA's gate reach VINDEX3 through the
+            // execution surface, never through this legacy round-trip.
+            "use_full_rank_gate",
+            "mla_use_output_gate",
             // Multi-head latent attention (DeepSeek V2/V3). No MLA model
             // is served from a vindex yet; serving one without these
             // would silently rebuild the wrong attention geometry.
@@ -349,6 +473,64 @@ mod tests {
             // `format::vindex3::plan::semantics::EXECUTION_SEMANTIC_KEYS`)
             // rather than answering for it, which is what this list
             // exists to force a decision about.
+            // The interleave itself, in the index-set spelling. Same
+            // status as the geometry beside it — VINDEX1/2 cannot execute
+            // a recurrent layer, so a container that dropped it could not
+            // mis-serve one. It reaches VINDEX3 through the resolved
+            // per-layer table (`LayerPolicy::declared_span`), not through
+            // this legacy round-trip.
+            "linear_attn_interleave",
+            // The hybrid Mamba2Attn estate (OuteAI): the conv-QKV
+            // attention geometry and the mamba_ssm lineage's MLP
+            // declaration (`mlp_intermediate_size: 0` = no MLP blocks,
+            // plus its padding/bias parameters). Same status as the
+            // linear-attention geometry above — VINDEX1/2 cannot execute
+            // a hybrid layer, so a container dropping these could not
+            // mis-serve one. They reach VINDEX3 through
+            // `ExecutionSurface.conv_qkv` and the per-layer operator
+            // table.
+            "conv_qkv_attn",
+            "conv_qkv_provenance",
+            "attn_causal",
+            "pad_vocab_size_multiple",
+            "fused_add_norm",
+            "mlp_intermediate_size",
+            "mlp_padding_size",
+            "use_mlp_bias",
+            // The MTP sub-stack's interleave. VINDEX1/2 has no MTP object
+            // at all, so a container dropping it could not mis-serve one.
+            "mtp_interleave",
+            // The relative-position scheme. VINDEX1/2's forward rotates or
+            // does not; it has no relative term, so a container dropping
+            // these could not serve one wrongly — it could not serve one
+            // at all. VINDEX3 carries it on the per-layer position policy.
+            // Router scoring function, carried verbatim beside the typed
+            // kind. VINDEX1/2 dispatches on the typed kind.
+            "router_activation",
+            // Declared MoE facts VINDEX1/2 has no field for. Its MoE
+            // config carries expert count, top-k and the router type; a
+            // branch scale, expert grouping, a dense prefix or a cadence
+            // period would each change the forward and none has a home
+            // here. Read so the plan can judge them, not so this path can
+            // serve them.
+            "routed_scaling_factor",
+            "expert_groups",
+            "topk_group",
+            "use_grouped_topk",
+            "moe_layer_freq",
+            "first_k_dense_replace",
+            "mla_use_nope",
+            "model_max_length",
+            "d_rel",
+            "rel_extent",
+            // KDA's geometry and decay clamp. Same status: VINDEX1/2
+            // cannot execute a recurrence, so a container dropping these
+            // could not mis-serve one. They reach VINDEX3 through the
+            // execution surface, not through this legacy round-trip.
+            "kda_geometry",
+            "kda_gate_lower_bound",
+            "kda_use_full_rank_gate",
+            "mla_use_output_gate",
             "linear_conv_kernel_dim",
             "linear_key_head_dim",
             "linear_value_head_dim",
@@ -408,6 +590,7 @@ mod tests {
             let known = persisted.contains(f)
                 || CARRIED_AT_TOP_LEVEL.contains(f)
                 || CARRIED_IN_MOE.contains(f)
+                || RESOLVED_INTO_ANOTHER_FIELD.contains(f)
                 || KNOWN_GAPS.contains(f)
                 // `model_type` / geometry share names across both structs.
                 || ["model_type", "head_dim", "num_q_heads", "num_kv_heads",
@@ -432,6 +615,15 @@ mod tests {
             num_kv_heads: 4,
             rope_base: 10000.0,
             sliding_window: None,
+            use_sliding_window: None,
+            max_window_layers: None,
+            position_embedding_type: None,
+            no_rope_layers: None,
+            no_rope_layer_interval: None,
+            rope_interleaved: None,
+            use_mrope: None,
+            ffn_shape_name: None,
+            is_llama_config: None,
             moe: None,
             global_head_dim: None,
             num_global_kv_heads: None,
@@ -496,6 +688,7 @@ mod tests {
             num_experts: 8,
             top_k: 2,
             shared_expert: false,
+            shared_expert_intermediate_size: None,
             router_type: "top_k_softmax".into(),
             moe_intermediate_size: Some(2048),
             hybrid: false,
@@ -635,6 +828,7 @@ mod tests {
             num_experts: 64,
             top_k: 6,
             shared_expert: true,
+            shared_expert_intermediate_size: None,
             router_type: "top_k_softmax".into(),
             moe_intermediate_size: None,
             hybrid: false,
@@ -709,6 +903,8 @@ mod tests {
         cfg.post_norm_eps = Some(1e-8);
         cfg.attention_bias = Some(false);
         cfg.hidden_act = Some("silu".to_string());
+        cfg.activation_situ_beta = Some(4.0);
+        cfg.activation_situ_linear_beta = Some(25.0);
         cfg.max_position_embeddings = Some(131072);
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -718,6 +914,8 @@ mod tests {
         assert_eq!(back.post_norm_eps, Some(1e-8));
         assert_eq!(back.attention_bias, Some(false));
         assert_eq!(back.hidden_act.as_deref(), Some("silu"));
+        assert_eq!(back.activation_situ_beta, Some(4.0));
+        assert_eq!(back.activation_situ_linear_beta, Some(25.0));
         assert_eq!(back.max_position_embeddings, Some(131072));
     }
 

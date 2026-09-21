@@ -10,10 +10,16 @@
 //! entry point joins the equality chain the SERVE-1 gates established.
 
 use larql_inference::layer_graph::generate::detok::Detokenizer;
-use larql_inference::vindex3::{continue_session, plan_kv_geometry, Vindex3Runtime};
+use larql_inference::vindex3::{continue_session, Vindex3Runtime};
 use larql_inference::{EosConfig, SamplingConfig};
 use larql_kv::CanonicalKvState;
-use larql_vindex::format::vindex3::opplan::exec::production::ProductionBackend;
+use larql_vindex::format::vindex3::opplan::exec::continuation::{
+    plan_continuation_geometry, LayerContinuationGeometry,
+};
+use larql_vindex::format::vindex3::opplan::exec::lowering::{
+    LoweringIdentity, LoweringRegistry, SharedProvider,
+};
+use larql_vindex::format::vindex3::opplan::LayerAttention;
 use larql_vindex::tokenizers::Tokenizer;
 
 use crate::error::LqlError;
@@ -35,7 +41,9 @@ pub(crate) const SUPPORTED: &str = "SELECT, DESCRIBE, WALK, EXPLAIN WALK, \
 /// Component id a container's text stack is bound under.
 pub(crate) const V3_COMPONENT: &str = "target";
 
-pub(crate) type V3Runtime = Vindex3Runtime<ProductionBackend>;
+/// The served realisation, resolved from the shipped registry by
+/// identity rather than constructed here (LOWERING-PLUGIN-1, L3).
+pub(crate) type V3Runtime = Vindex3Runtime<SharedProvider>;
 
 /// The capability refusal for statements a V3 binding does not serve.
 pub(crate) fn unsupported(what: &str) -> LqlError {
@@ -253,12 +261,101 @@ impl Session {
             unreachable!("caller matched the backend");
         };
         let plan = runtime.plan();
-        let geometry = plan_kv_geometry(plan);
-        let sliding = geometry.iter().filter(|g| g.window.is_some()).count();
-        let full = geometry.len() - sliding;
-        let kv_dims: std::collections::BTreeSet<usize> =
-            geometry.iter().map(|g| g.kv_dim).collect();
+        // Read the layers themselves, not `plan_kv_geometry` — that
+        // adapter refuses (formerly: panicked, drill F8) on any model
+        // carrying recurrent continuation, and a pure-SSM binding is
+        // exactly such a model. A recurrence has no KV row to report;
+        // the honest line counts it as what it is.
+        let mut sliding = 0usize;
+        let mut full = 0usize;
+        let mut kv_dims: std::collections::BTreeSet<usize> = Default::default();
+        for layer in &plan.layers {
+            if let Some(op) = layer.attention.softmax() {
+                if op.window.is_some() {
+                    sliding += 1;
+                } else {
+                    full += 1;
+                }
+                kv_dims.insert(op.num_kv_heads * op.head_dim);
+            }
+        }
+        // **The continuation summary comes from the continuation
+        // planner**, never from "which layers are not softmax". That
+        // shortcut was true while a recurrence was the only alternative
+        // to rows, and became a false claim the moment MLA executed: its
+        // layers are not recurrent, and its cache is not constant in
+        // sequence length. Read off the wrong axis, this line reported a
+        // 27-layer Kimi stack as "recurrent state only … constant in
+        // sequence length" while 7 of those layers grew a cache with
+        // every position. A summary is exactly where such a claim goes
+        // unnoticed, so it is derived from the same seam the executor
+        // allocates from.
+        let regions = plan_continuation_geometry(plan);
+        let (mut recurrent, mut latent, mut state_elements) = (0usize, 0usize, 0usize);
+        let mut latent_widths: std::collections::BTreeSet<usize> = Default::default();
+        if let Ok(regions) = &regions {
+            for region in regions {
+                match region {
+                    LayerContinuationGeometry::Recurrent(r)
+                    | LayerContinuationGeometry::KvAndRecurrent { recurrent: r, .. } => {
+                        recurrent += 1;
+                        state_elements += r.elements();
+                    }
+                    LayerContinuationGeometry::LatentKv(l) => {
+                        latent += 1;
+                        latent_widths.insert(l.width);
+                    }
+                    LayerContinuationGeometry::Kv(_) | LayerContinuationGeometry::Stateless => {}
+                }
+            }
+        }
         let kv_dims: Vec<String> = kv_dims.iter().map(usize::to_string).collect();
+        let mut spans = vec![format!("{sliding} sliding"), format!("{full} full")];
+        if latent > 0 {
+            spans.push(format!("{latent} latent-cache"));
+        }
+        if recurrent > 0 {
+            spans.push(format!("{recurrent} recurrent"));
+        }
+        let attention_line = format!(
+            "Attention:       {} (windows from the plan)",
+            spans.join(" / ")
+        );
+        // One clause per region the program actually declares — nothing
+        // asserted about a region that is absent, and the growth
+        // behaviour stated per clause rather than for the stack as a
+        // whole, which is what made the old line wrong on a hybrid.
+        let continuation_line = match &regions {
+            Err(refusal) => format!("Continuation:    cannot be sized: {refusal}"),
+            Ok(_) => {
+                let mut parts: Vec<String> = Vec::new();
+                if !kv_dims.is_empty() {
+                    parts.push(format!(
+                        "KV rows (kv_dim {}), growing with the prefix",
+                        kv_dims.join(", ")
+                    ));
+                }
+                if latent > 0 {
+                    let widths: Vec<String> = latent_widths.iter().map(usize::to_string).collect();
+                    parts.push(format!(
+                        "latent cache on {latent} layer(s) ({} elements per position), growing \
+                         with the prefix",
+                        widths.join(", ")
+                    ));
+                }
+                if recurrent > 0 {
+                    parts.push(format!(
+                        "recurrent state on {recurrent} layer(s) ({state_elements} elements), \
+                         constant in sequence length"
+                    ));
+                }
+                if parts.is_empty() {
+                    "Continuation:    nothing survives a step".to_string()
+                } else {
+                    format!("Continuation:    {}", parts.join("; "))
+                }
+            }
+        };
 
         Ok(vec![
             format!("Model:           {} (VINDEX3)", runtime.model_name()),
@@ -267,11 +364,8 @@ impl Session {
             format!("Component:       {V3_COMPONENT}"),
             "Execution:       closed (operand-verified executable plan)".into(),
             format!("Layers:          {}", plan.layers.len()),
-            format!("Attention:       {sliding} sliding / {full} full (windows from the plan)"),
-            format!(
-                "KV geometry:     plan-derived; kv_dim {}",
-                kv_dims.join(", ")
-            ),
+            attention_line,
+            continuation_line,
             format!(
                 "Output head:     {}",
                 if plan.output.is_some() {
@@ -325,8 +419,19 @@ impl Session {
                     op.num_kv_heads.to_string(),
                     op.head_dim.to_string(),
                 ),
+                // Name the operator, not the coarse family: "linear"
+                // said only what the layer is NOT. The columns still read
+                // `-` — a recurrence's head counts describe a fixed-size
+                // state, not retained positions.
                 None => (
-                    "linear",
+                    match &layer.attention {
+                        LayerAttention::GatedDelta(_) => "gated-delta",
+                        LayerAttention::Kda(_) => "kda",
+                        LayerAttention::Mamba2(_) => "mamba2",
+                        LayerAttention::Mla(_) => "mla",
+                        LayerAttention::ConvQkv(_) => "conv-qkv",
+                        LayerAttention::Softmax(_) => unreachable!("softmax handled above"),
+                    },
                     dash.clone(),
                     dash.clone(),
                     dash.clone(),
@@ -460,7 +565,7 @@ impl Session {
     /// gate pins that tracing never changes arithmetic, and the LQL
     /// gate pins that the reported token equals INFER's.
     pub(crate) fn exec_v3_trace(&self, prompt: &str) -> Result<Vec<String>, LqlError> {
-        use larql_inference::vindex3::{RecordingObserver, StepEvent};
+        use larql_inference::vindex3::{CarrierForm, RecordingObserver, StepEvent, SublayerSite};
         let Backend::Vindex3 {
             runtime,
             tokenizer,
@@ -498,9 +603,29 @@ impl Session {
                         out.push(format!("  layer {layer}: attention"))
                     }
                     StepEvent::FfnDone { layer } => out.push(format!("  layer {layer}: ffn")),
+                    StepEvent::CarrierWrite {
+                        layer,
+                        site,
+                        carrier,
+                    } => {
+                        let site = match site {
+                            SublayerSite::Attention => "attention",
+                            SublayerSite::Ffn => "ffn",
+                        };
+                        let carrier = match carrier {
+                            CarrierForm::Single => "single",
+                            CarrierForm::Bundle => "bundle",
+                            CarrierForm::History => "history",
+                        };
+                        out.push(format!("  layer {layer}: {site} write ({carrier} carrier)"))
+                    }
                     StepEvent::Logits { vocab } => {
                         out.push(format!("  output_head (vocab {vocab})"))
                     }
+                    // The executor may learn new events before TRACE
+                    // learns to print them; an unprinted event is not
+                    // an error.
+                    _ => {}
                 }
             }
         }
@@ -729,8 +854,13 @@ pub(crate) type V3Knowledge = larql_vindex::format::vindex3::knowledge::Knowledg
 pub(crate) fn bind(
     path: &std::path::Path,
 ) -> Result<(V3Runtime, Option<Tokenizer>, Option<V3Knowledge>), LqlError> {
-    let runtime = Vindex3Runtime::open(path, V3_COMPONENT, ProductionBackend::new())
-        .map_err(|e| LqlError::exec("failed to open VINDEX3 container", e))?;
+    let runtime = Vindex3Runtime::open_via(
+        path,
+        V3_COMPONENT,
+        std::sync::Arc::new(LoweringRegistry::shipped()),
+        &LoweringIdentity::cpu_production(),
+    )
+    .map_err(|e| LqlError::exec("failed to open VINDEX3 container", e))?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(path).ok();
     // The browse view needs the tokenizer (feature annotations decode
     // token ids); a tokenizer-less container binds without it.

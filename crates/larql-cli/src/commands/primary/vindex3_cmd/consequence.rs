@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::Args;
-use larql_vindex::format::vindex3::inspect::inspect_container;
+use larql_inference::vindex3::{open_component, OpenPolicy, OpenedComponent};
 use larql_vindex::format::vindex3::opplan::exec::operands::{OperandStore, RepresentationSource};
 use larql_vindex::format::vindex3::opplan::OperandRef;
 use larql_vindex::format::vindex3::represent::policy::{classify_in, Role};
@@ -179,7 +179,21 @@ pub fn run(args: ConsequenceArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let inspection = inspect_container(&args.container, false)?;
+    // The opener is the one authority on inspect → plan → open; the
+    // provenance checks below read the inspection it judged.
+    let OpenedComponent {
+        inspection,
+        store,
+        plan,
+        ..
+    } = open_component(
+        &args.container,
+        "target",
+        OpenPolicy {
+            want: None,
+            source: RepresentationSource::Transient,
+        },
+    )?;
     if inspection.index.model != moments.container.model {
         return Err(format!(
             "REFUSED: container is not the one the moments were captured from.\n  \
@@ -216,18 +230,6 @@ pub fn run(args: ConsequenceArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ---- the operands --------------------------------------------------
-    let store = OperandStore::open_for(
-        &args.container,
-        &inspection,
-        None,
-        RepresentationSource::Transient,
-    )?;
-    let outcome = larql_vindex::format::vindex3::opplan::plan_component_ops(
-        &inspection,
-        &args.container,
-        "target",
-    )?;
-    let plan = outcome.plan.ok_or("component produced no plan")?;
     let activation = ffn_activation(&plan)?;
     println!("ffn activation {activation:?}  (from the plan the executor runs)");
 
@@ -548,11 +550,27 @@ fn ffn_activation(
 ) -> Result<larql_models::config::activation::Activation, Box<dyn std::error::Error>> {
     use larql_vindex::format::vindex3::opplan::LayerFfn;
     for layer in &plan.layers {
-        match &layer.ffn {
-            LayerFfn::Dense(f) => return Ok(f.activation),
-            LayerFfn::Routed(r) => return Ok(r.activation),
-            LayerFfn::Hybrid(_) => continue,
+        let (activation, gate_policy) = match &layer.ffn {
+            Some(LayerFfn::Dense(f)) => (f.activation, f.gate_policy),
+            Some(LayerFfn::Routed(r)) => (r.activation, r.gate_policy),
+            Some(LayerFfn::Hybrid(_)) | None => continue,
+        };
+        // This command's reconstruction is `activate(gate) * up`, written
+        // out at `down_input`. A gate policy that is not plain gating
+        // computes something else entirely, and reconstructing it as
+        // plain gating would put a wrong denominator under every
+        // consequence this command reports — quietly, and with every
+        // shape still closing. Refuse by name instead.
+        if !matches!(gate_policy, larql_models::ExpertGatePolicy::Gated) {
+            return Err(format!(
+                "layer {} carries {gate_policy:?}; this command reconstructs the FFN as \
+                 `activation(gate) * up` and has no form for that combine, so it refuses \
+                 rather than reporting consequences computed from the wrong one",
+                layer.layer,
+            )
+            .into());
         }
+        return Ok(activation);
     }
     Err("plan carries no FFN op to read an activation from".into())
 }

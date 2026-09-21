@@ -18,7 +18,7 @@
 //! `[q_h0 | gate_h0 | q_h1 | …]` rather than the equally well-shaped
 //! `[all q | all gate]`. Said plainly so the coverage is not overread.
 
-use crate::format::vindex3::encode::encode_system;
+use crate::format::vindex3::encode::encode_system_unenforced as encode_system;
 use crate::format::vindex3::fixtures::{gated_q_f32_model, DENSE_HEAD_DIM, DENSE_Q_HEADS};
 use crate::format::vindex3::inspect::inspect_container;
 use crate::format::vindex3::opplan::plan_component_ops;
@@ -163,11 +163,11 @@ mod mutation_table {
             op,
             (&store).into(),
             &|_: &crate::format::vindex3::opplan::OperandRef| {
-                crate::format::vindex3::opplan::exec::backend::WeightFormat::F32
+                Ok(crate::format::vindex3::opplan::exec::backend::WeightFormat::F32)
             },
         )
         .unwrap();
-        let call = operands.call(op, &inputs, layer.pre_attention_norm.eps, hidden);
+        let call = operands.call(op, &inputs, layer.declared_norm_eps, hidden);
         ReferenceBackend
             .attention_mutated(call, mutation)
             .unwrap()

@@ -88,7 +88,19 @@ pub use surface::ExecutionSurface;
 /// (0.0 vs 1.0, centred layers vs an ordinary final norm). A v4 graph
 /// records one offset for every site, which is simply wrong for any
 /// such family and unrecoverable from the graph alone.
-pub const GRAPH_SCHEMA: u32 = 5;
+///
+/// v6: **presence means semantic presence** (§17.4's schema-6 delta, both
+/// lifts in one intentional break). `ExecutionSurface.attention` and
+/// `.ffn` are optional and present iff the component's program runs those
+/// operations — a pure-SSM stack (mamba2) carries neither, where v5
+/// *required* an attention surface and so fabricated one for a model
+/// that never attends (ontology drill F1). The per-layer `operator` is
+/// explicit — no absent-means-softmax serde default (F7). A v5 graph is
+/// unrecoverable by reinterpretation: every v5 surface carries an
+/// attention group whether or not the model attends, so its presence is
+/// ambiguous between "this model attends" and "the file was written" —
+/// exactly the ambiguity v6 removes. Refuse and re-encode.
+pub const GRAPH_SCHEMA: u32 = 6;
 
 /// The complete executable-system description.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +133,53 @@ pub enum GraphDefect {
     ObjectUnbound(String),
 }
 
+/// Why [`SystemGraph::primary_text_component`] could not answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrimaryTextLookup {
+    /// No component carries the role.
+    Absent,
+    /// More than one does. First-match selection is exactly how two
+    /// text-shaped components go quietly wrong (ontology drill F10), so
+    /// ambiguity names the candidates and refuses — it is never resolved
+    /// by position.
+    Ambiguous(Vec<String>),
+}
+
+impl std::fmt::Display for PrimaryTextLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => write!(f, "graph has no primary_text component"),
+            Self::Ambiguous(ids) => write!(
+                f,
+                "expected exactly one primary_text component; found {}: {} — refusing to pick the first",
+                ids.len(),
+                ids.join(", ")
+            ),
+        }
+    }
+}
+
 impl SystemGraph {
+    /// The unique primary-text component.
+    ///
+    /// The only sanctioned way to answer "the text model": callers that
+    /// used `find(role == PrimaryText)` got first-match semantics, which
+    /// is quiet wrongness the day a second text-shaped component exists.
+    pub fn primary_text_component(&self) -> Result<&Component, PrimaryTextLookup> {
+        let mut primaries = self.components.iter().filter(|c| {
+            c.role == crate::format::vindex3::graph::component::ComponentRole::PrimaryText
+        });
+        match (primaries.next(), primaries.next()) {
+            (Some(only), None) => Ok(only),
+            (None, _) => Err(PrimaryTextLookup::Absent),
+            (Some(first), Some(second)) => {
+                let mut ids = vec![first.id.clone(), second.id.clone()];
+                ids.extend(primaries.map(|c| c.id.clone()));
+                Err(PrimaryTextLookup::Ambiguous(ids))
+            }
+        }
+    }
+
     /// Structural validation: ids unique, every reference resolvable,
     /// every object physically bound.
     pub fn validate(&self) -> Vec<GraphDefect> {

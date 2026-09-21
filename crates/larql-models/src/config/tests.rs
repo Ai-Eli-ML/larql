@@ -7,6 +7,48 @@
 
 use super::*;
 
+/// Every [`Activation`] variant has a canonical HF spelling, and the
+/// shape vocabulary round-trips through the same two tables in both
+/// directions — so the probe that answers "what FFN runs" and the parser
+/// that reads `activation: swiglu` cannot drift apart.
+#[test]
+fn activation_names_round_trip() {
+    for activation in [
+        Activation::Silu,
+        Activation::Gelu,
+        Activation::GeluTanh,
+        Activation::Relu,
+    ] {
+        let name = activation.hf_name().expect("every variant has a row");
+        assert_eq!(Activation::from_hf_name(name), Some(activation));
+        assert_eq!(
+            ffn_shape_from_hf_name(name),
+            Some((FfnType::Standard, activation)),
+            "a plain name is the ungated shape"
+        );
+        let shape = ffn_shape_hf_name(FfnType::Gated, activation).unwrap();
+        match activation.hf_glu_name() {
+            Some(glu) => {
+                assert_eq!(shape, glu);
+                assert_eq!(
+                    ffn_shape_from_hf_name(glu),
+                    Some((FfnType::Gated, activation))
+                );
+            }
+            None => assert_eq!(shape, format!("gated-{name}")),
+        }
+    }
+    assert_eq!(
+        ffn_shape_from_hf_name("SwiGLU"),
+        Some((FfnType::Gated, Activation::Silu))
+    );
+    assert_eq!(
+        ffn_shape_from_hf_name("hyena"),
+        None,
+        "an unjudged spelling is not guessed"
+    );
+}
+
 /// The architecture that overrides nothing.
 struct DefaultsArch(ModelConfig);
 
@@ -35,6 +77,37 @@ fn base_config() -> ModelConfig {
     }))
     .config()
     .clone()
+}
+
+#[test]
+fn per_layer_ffn_width_is_parsed_verbatim_and_absent_by_default() {
+    // Absent: every layer runs at `intermediate_size`.
+    assert_eq!(base_config().ffn_intermediate_size_by_layer, None);
+    // Declared under `text_config` (multimodal nesting) and at the top
+    // level, verbatim; validation belongs to the planner.
+    let nested = crate::detect_from_json(&serde_json::json!({
+        "model_type": "gemma3",
+        "text_config": {
+            "model_type": "gemma3_text",
+            "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 3,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "vocab_size": 32,
+            "larql_ffn_intermediate_size_by_layer": [128, 48, 128]
+        }
+    }))
+    .config()
+    .clone();
+    assert_eq!(
+        nested.ffn_intermediate_size_by_layer,
+        Some(vec![128, 48, 128])
+    );
+    let flat = crate::detect_from_json(&serde_json::json!({
+        "model_type": "llama", "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "vocab_size": 32,
+        "larql_ffn_intermediate_size_by_layer": [128, 96]
+    }))
+    .config()
+    .clone();
+    assert_eq!(flat.ffn_intermediate_size_by_layer, Some(vec![128, 96]));
 }
 
 #[test]
@@ -252,6 +325,25 @@ fn rope_scaling_defaults_and_config_read() {
     let a = DefaultsArch(cfg);
     assert_eq!(a.rope_scaling_type(), Some("linear"));
     assert_eq!(a.rope_scaling_factor(), 8.0);
+    // The read lives in the trait default: a family with no override
+    // divides every layer's positions by the declared factor, as HF's
+    // `_compute_linear_scaling_rope_parameters` does. This used to be a
+    // hardcoded `1.0`, which served every non-Gemma linear-scaled
+    // checkpoint unscaled.
+    assert_eq!(a.linear_rope_scaling(), Some(8.0));
+    assert_eq!(a.rope_position_divisor_for_layer(0), 8.0);
+    assert_eq!(a.rope_position_divisor_for_layer(3), 8.0);
+    assert_eq!(
+        a.declared_rope_scaling(),
+        DeclaredRopeScaling::Linear { factor: 8.0 }
+    );
+    assert_eq!(
+        a.position_policy_for_layer(0),
+        PositionPolicy::Linear {
+            theta: a.rope_base_for_layer(0),
+            factor: 8.0
+        }
+    );
 }
 
 /// `openai/gpt-oss-20b`'s block verbatim. The scaling type is the only
@@ -411,6 +503,432 @@ fn silu_maps_to_silu_kernel() {
 #[should_panic(expected = "no gate/up FFN kernel")]
 fn relu_panics_instead_of_silently_running_silu() {
     Activation::Relu.uses_gelu_tanh_gate_up();
+}
+
+// ── ActivationDeclaration and the refusing kernel-family accessor
+//    (K3-ACT-1) ──────────────────────────────────────────────────────
+//
+// The defect these close: `activation()` used to answer SiLU to BOTH "no
+// declaration" and "a declaration this build cannot read", so a
+// checkpoint declaring `situ` or `relu2` was executed as SwiGLU. Each
+// test below names one of the four states, so a future collapse of two
+// of them fails here.
+
+/// An architecture over the default config, declaring one activation.
+fn arch_declaring(hidden_act: Option<&str>) -> DefaultsArch {
+    let mut config = base_config();
+    config.hidden_act = hidden_act.map(str::to_string);
+    DefaultsArch(config)
+}
+
+#[test]
+fn a_silent_config_takes_the_documented_silu_default() {
+    let arch = arch_declaring(None);
+    assert_eq!(arch.activation_declaration(), ActivationDeclaration::Absent);
+    assert_eq!(arch.activation(), Activation::Silu);
+    assert!(
+        !arch.gate_up_is_gelu_tanh(),
+        "silence is the one state the SiLU default is for"
+    );
+}
+
+#[test]
+fn a_judged_name_maps_through_the_one_table() {
+    let arch = arch_declaring(Some("gelu_pytorch_tanh"));
+    assert_eq!(
+        arch.activation_declaration(),
+        ActivationDeclaration::Nonlinearity(Activation::GeluTanh)
+    );
+    assert!(arch.gate_up_is_gelu_tanh());
+}
+
+#[test]
+fn situ_names_a_gate_policy_not_a_nonlinearity() {
+    let arch = arch_declaring(Some("situ"));
+    assert_eq!(
+        arch.activation_declaration(),
+        ActivationDeclaration::NamesGatePolicy(SITU_NAME)
+    );
+    assert!(
+        matches!(arch.expert_gate_policy(), ExpertGatePolicy::SituGlu { .. }),
+        "the name must resolve to the policy, not to a nonlinearity"
+    );
+}
+
+#[test]
+fn an_unjudged_name_is_kept_verbatim_and_not_mapped() {
+    // BitNet's spelling. `from_hf_name` correctly refuses it; the point
+    // of the enum is that the refusal survives to the caller instead of
+    // being flattened into the silent default.
+    assert_eq!(
+        arch_declaring(Some("relu2")).activation_declaration(),
+        ActivationDeclaration::Unjudged("relu2".to_string())
+    );
+    assert_eq!(Activation::from_hf_name("relu2"), None);
+}
+
+/// **The class this rung closes.** A declared name this build has never
+/// judged must not select a gate/up kernel at all.
+#[test]
+#[should_panic(expected = "never judged")]
+fn an_unjudged_activation_refuses_the_gate_up_kernel_by_name() {
+    arch_declaring(Some("relu2")).gate_up_is_gelu_tanh();
+}
+
+/// A combine that is not plain gating has no gate/up kernel on these
+/// paths either — the bool cannot express a third family, so it refuses
+/// rather than answering for one of the two it can.
+#[test]
+#[should_panic(expected = "SituGlu")]
+fn a_situ_policy_refuses_the_gate_up_kernel_by_name() {
+    arch_declaring(Some("situ")).gate_up_is_gelu_tanh();
+}
+
+/// The HF spelling of the combine a component computes — the function
+/// that decides whether a correctly-carried FFN *reports* as carried.
+///
+/// All three arms, because each one answers a different question the plan
+/// asks: a SiTU policy owns the whole combine and answers with its own
+/// name; a plain policy answers with its nonlinearity's; and ClampedGlu
+/// answers with NOTHING, which is why GPT-OSS's row keeps its existing
+/// behaviour rather than acquiring a resolution no HF word supports.
+#[test]
+fn the_combine_name_is_the_policys_when_the_policy_owns_the_combine() {
+    assert_eq!(
+        hf_combine_name(
+            ExpertGatePolicy::SituGlu {
+                beta: 4.0,
+                linear_beta: Some(25.0)
+            },
+            Activation::Silu
+        )
+        .as_deref(),
+        Some(SITU_NAME),
+        "a SiTU FFN answers `situ` whatever inert activation sits beside it"
+    );
+    assert_eq!(
+        hf_combine_name(
+            ExpertGatePolicy::SituGlu {
+                beta: 1.0,
+                linear_beta: None
+            },
+            Activation::GeluTanh
+        )
+        .as_deref(),
+        Some(SITU_NAME),
+        "and the parameters do not change the NAME of the combine"
+    );
+    assert_eq!(
+        hf_combine_name(ExpertGatePolicy::Gated, Activation::GeluTanh).as_deref(),
+        Activation::GeluTanh.hf_name(),
+        "plain gating answers with the gate's nonlinearity"
+    );
+    assert_eq!(
+        hf_combine_name(ExpertGatePolicy::Gated, Activation::Silu).as_deref(),
+        Some("silu")
+    );
+    assert_eq!(
+        hf_combine_name(
+            ExpertGatePolicy::ClampedGlu {
+                limit: 7.0,
+                alpha: 1.702
+            },
+            Activation::Silu
+        ),
+        None,
+        "no HF word names GPT-OSS's clamped GLU, so there is nothing to answer with — \
+         the arm that keeps that row on its existing code path"
+    );
+}
+
+/// A judged declaration names itself with its CANONICAL spelling, not the
+/// alias the checkpoint happened to use.
+///
+/// The other three arms are covered beside the refusals; this one is the
+/// success path, which is the arm a gate is most often missing
+/// (`feedback_untested_gate_success_path`).
+#[test]
+fn a_judged_declaration_names_itself_canonically() {
+    assert_eq!(
+        arch_declaring(Some("gelu_pytorch_tanh"))
+            .activation_declaration()
+            .declared_name(),
+        Activation::GeluTanh.hf_name(),
+    );
+    assert_eq!(
+        arch_declaring(Some("swish"))
+            .activation_declaration()
+            .declared_name(),
+        Some("silu"),
+        "an alias resolves to the variant's own first spelling"
+    );
+}
+
+/// **A family override of `activation()` decides the kernel, not the
+/// config the family ignored.**
+///
+/// StarCoder2 declares no `hidden_act` and overrides `activation()` to
+/// tanh-GELU. The first version of `gate_up_is_gelu_tanh` answered from
+/// the DECLARATION, so it read `Absent`, fell to SiLU, and quietly
+/// replaced a family's own judgment — the same shape of defect this rung
+/// removes, one level up, and it was caught by the walk-vs-dense parity
+/// test rather than by design. The declaration decides whether to REFUSE;
+/// `activation()` supplies the answer.
+#[test]
+fn a_family_override_decides_the_gate_up_kernel() {
+    let arch = crate::detect_from_json(&serde_json::json!({
+        "model_type": "starcoder2",
+        "hidden_size": 16,
+        "num_hidden_layers": 1,
+        "intermediate_size": 32,
+        "vocab_size": 32,
+    }));
+    assert_eq!(
+        arch.activation_declaration(),
+        ActivationDeclaration::Absent,
+        "the fixture must declare nothing, or this proves the wrong thing"
+    );
+    assert_eq!(arch.activation(), Activation::GeluTanh, "the family's own");
+    assert!(
+        arch.gate_up_is_gelu_tanh(),
+        "the kernel family must follow the override, not the absent declaration"
+    );
+}
+
+/// The declared name survives into the refusal, so a reader is told WHICH
+/// declaration was refused rather than that some declaration was.
+#[test]
+fn a_declaration_can_name_itself_for_a_refusal_message() {
+    assert_eq!(
+        arch_declaring(Some("relu2"))
+            .activation_declaration()
+            .declared_name(),
+        Some("relu2")
+    );
+    assert_eq!(
+        arch_declaring(Some("situ"))
+            .activation_declaration()
+            .declared_name(),
+        Some("situ")
+    );
+    assert_eq!(
+        arch_declaring(None)
+            .activation_declaration()
+            .declared_name(),
+        None
+    );
+}
+
+// ── MlaQueryForm — the declaration chooses the form (K3-MLA-Q-LORA-1) ─
+
+/// An architecture over the default config, declaring one `q_lora_rank`.
+fn arch_with_q_lora(rank: Option<usize>) -> DefaultsArch {
+    let mut config = base_config();
+    config.q_lora_rank = rank;
+    DefaultsArch(config)
+}
+
+#[test]
+fn an_undeclared_q_lora_rank_is_the_direct_query_form() {
+    assert_eq!(
+        arch_with_q_lora(None).mla_query_form(),
+        MlaQueryForm::Direct,
+        "absence is the reference's own default (`q_lora_rank: Optional[int] = None`)"
+    );
+}
+
+#[test]
+fn a_declared_q_lora_rank_selects_the_factorised_form() {
+    let form = arch_with_q_lora(Some(1536)).mla_query_form();
+    assert_eq!(form.rank(), Some(1536));
+    assert!(form.is_low_rank());
+}
+
+/// **The adversarial control the freeze named.** `q_lora_rank: 0`
+/// selects the factorised form, because the reference branches on `is
+/// not None` and `0 is not None`.
+///
+/// Asserted in the SAME test as `activation_situ_beta`'s opposite rule,
+/// where the same checkpoint's `beta or 1.0` turns a declared zero into
+/// one. Two adjacent fields of one config, two opposite treatments of
+/// zero — and the risk is a shared intuition, not a shared identifier,
+/// so the two rules are pinned side by side where a reader meets both.
+#[test]
+fn zero_selects_the_form_here_and_becomes_one_over_in_situ() {
+    let form = arch_with_q_lora(Some(0)).mla_query_form();
+    assert!(
+        form.is_low_rank(),
+        "`0 is not None`: a declared zero selects the factorised query"
+    );
+    assert_eq!(form.rank(), Some(0), "and the rank is carried verbatim");
+
+    let mut config = base_config();
+    config.hidden_act = Some("situ".to_string());
+    config.activation_situ_beta = Some(0.0);
+    match DefaultsArch(config).expert_gate_policy() {
+        ExpertGatePolicy::SituGlu { beta, .. } => assert_eq!(
+            beta, 1.0,
+            "`beta or 1.0`: a declared zero becomes one, the OPPOSITE rule"
+        ),
+        other => panic!("expected a SiTU policy, got {other:?}"),
+    }
+}
+
+// ── RoutedExpertForm — the latent routed branch (K3-LATENTMOE-1) ─────
+
+/// An architecture over the default config, declaring one latent branch.
+fn arch_with_latent(width: Option<usize>, use_norm: Option<bool>) -> DefaultsArch {
+    let mut config = base_config();
+    config.routed_expert_hidden_size = width;
+    config.latent_moe_use_norm = use_norm;
+    DefaultsArch(config)
+}
+
+#[test]
+fn an_undeclared_routed_expert_width_is_the_uniform_form() {
+    assert_eq!(
+        arch_with_latent(None, None).routed_expert_form(),
+        RoutedExpertForm::Uniform,
+        "absence is the reference's own default (`use_latent_moe = ... is not None`)"
+    );
+}
+
+#[test]
+fn a_declared_routed_expert_width_selects_the_latent_form() {
+    let form = arch_with_latent(Some(3584), Some(true)).routed_expert_form();
+    assert!(form.is_latent());
+    let RoutedExpertForm::Latent { width, norm } = form else {
+        panic!("expected the latent form, got {form:?}");
+    };
+    assert_eq!(width, 3584);
+    assert!(norm.is_some(), "the flag is true, so the branch normalises");
+}
+
+/// **Four adjacent leaves of one config, three different rules.**
+///
+/// The subject is the parser architecture itself, not any one leaf:
+/// adjacent config leaves do not share truthiness semantics merely
+/// because they sit beside one another, and the risk is a shared
+/// intuition rather than a shared identifier. So all four are pinned in
+/// ONE place, where a reader meets every rule at once:
+///
+/// ```text
+/// activation_situ_beta      = 0     -> 1.0                    `beta or 1.0`
+/// q_lora_rank               = 0     -> the form, then refused  `is not None`
+/// routed_expert_hidden_size = 0     -> the form, then refused  `is not None`
+/// latent_moe_use_norm       = null  -> false, no norm          plain truthiness
+/// ```
+///
+/// The last is the one a reader is most likely to get wrong by analogy
+/// with the leaf directly above it: `routed_expert_hidden_size` and
+/// `latent_moe_use_norm` are declared side by side in the SAME config and
+/// treat `null` differently, because the reference reads one with `is not
+/// None` and consumes the other in a plain `if`.
+#[test]
+fn zero_and_null_are_read_leaf_by_leaf_not_by_neighbourhood() {
+    // `0 is not None`: a declared zero SELECTS the latent form, and the
+    // degenerate geometry it then describes is refused downstream by
+    // name rather than demoted to the uniform form here.
+    let zero = arch_with_latent(Some(0), Some(true)).routed_expert_form();
+    assert!(
+        zero.is_latent(),
+        "`0 is not None`: a declared zero selects the latent branch"
+    );
+    let RoutedExpertForm::Latent { width, .. } = zero else {
+        unreachable!("asserted latent immediately above")
+    };
+    assert_eq!(width, 0, "and the width is carried verbatim, not repaired");
+
+    // `null` is absent, for THIS leaf.
+    assert_eq!(
+        arch_with_latent(None, Some(true)).routed_expert_form(),
+        RoutedExpertForm::Uniform,
+        "a null width is the same answer as an absent one"
+    );
+
+    // And for the leaf beside it, `null` is falsy — read by a
+    // `getattr(..., False)` consumed by a plain `if`, so absent, null and
+    // false are one program and differ only in what the plan reports as
+    // declared.
+    for flag in [None, Some(false)] {
+        let form = arch_with_latent(Some(3584), flag).routed_expert_form();
+        let RoutedExpertForm::Latent { norm, .. } = form else {
+            panic!("the width still selects the form, whatever the flag says");
+        };
+        assert!(
+            norm.is_none(),
+            "latent_moe_use_norm {flag:?} must build no norm"
+        );
+    }
+
+    // The two rules already pinned, restated here so the four sit
+    // together: zero selects a form on one leaf and becomes one on
+    // another, in the same checkpoint.
+    assert!(arch_with_q_lora(Some(0)).mla_query_form().is_low_rank());
+    let mut config = base_config();
+    config.hidden_act = Some("situ".to_string());
+    config.activation_situ_beta = Some(0.0);
+    match DefaultsArch(config).expert_gate_policy() {
+        ExpertGatePolicy::SituGlu { beta, .. } => assert_eq!(beta, 1.0),
+        other => panic!("expected a SiTU policy, got {other:?}"),
+    }
+}
+
+/// The norm's epsilon is the LAYER's, and this inverts what the two K3
+/// rungs before it established: `q_a_layernorm` and `kv_a_layernorm` run
+/// at `KimiRMSNorm`'s class default because their constructor passes no
+/// override, and `routed_expert_norm`'s passes one.
+///
+/// Pinned against `mla_q_a_norm_eps` in the same test, because the defect
+/// this guards against is generalising the previous result — and a build
+/// that did so would still pass every test that looked at this leaf
+/// alone.
+#[test]
+fn the_routed_expert_norm_runs_at_the_layer_epsilon_not_the_class_default() {
+    let arch = arch_with_latent(Some(3584), Some(true));
+    let RoutedExpertForm::Latent { norm, .. } = arch.routed_expert_form() else {
+        panic!("the width selects the form");
+    };
+    let eps = norm.expect("the flag declares a norm").eps;
+    assert_eq!(
+        eps,
+        arch.norm_eps() as f64,
+        "the reference passes `eps=config.rms_norm_eps` explicitly"
+    );
+    assert_ne!(
+        Some(eps),
+        arch.mla_q_a_norm_eps(),
+        "the neighbouring low-rank norm's epsilon is a DIFFERENT authority"
+    );
+}
+
+/// The epsilon is the family's, not the config's and not the KV norm's.
+///
+/// The default is `None` — unjudged — and it reaches the form as a
+/// non-executable value so that closure's refusal is what a reader meets.
+#[test]
+fn an_unjudged_q_a_epsilon_does_not_borrow_a_plausible_one() {
+    let arch = arch_with_q_lora(Some(64));
+    assert_eq!(arch.mla_q_a_norm_eps(), None, "no family judgment here");
+    let form = arch.mla_query_form();
+    assert!(
+        form.is_low_rank(),
+        "the form is declared even when unjudged"
+    );
+    assert_eq!(
+        form.norm_eps(),
+        None,
+        "an unjudged epsilon must not resolve to the layer eps or the KV one"
+    );
+}
+
+/// The direct form carries no rank and no epsilon: a norm the layer does
+/// not have cannot be described.
+#[test]
+fn the_direct_form_carries_neither_a_rank_nor_an_epsilon() {
+    let form = arch_with_q_lora(None).mla_query_form();
+    assert_eq!(form.rank(), None);
+    assert_eq!(form.norm_eps(), None);
 }
 
 // ── tie_word_embeddings ──────────────────────────────────────────────

@@ -4,34 +4,22 @@
 //! resolution — and must not take unrelated per-layer facts (rope theta)
 //! down with it.
 
-use super::support::{glimmer_shaped_target_with, FIXTURE_LAYERS};
-use crate::format::vindex3::plan::{plan_system, Finding, FindingCategory, SemanticClass};
+use super::support::{
+    declare_gated_delta_geometry, declare_hybrid_cadence, glimmer_shaped_target_with,
+    FIXTURE_LAYERS,
+};
+use crate::format::vindex3::plan::{plan_system, FindingCategory, PlannedFinding, SemanticClass};
 
 /// The Glimmer-shaped fixture with its `layer_types` swapped for a
 /// Qwen3.5-style hybrid interleave — three `linear_attention` layers to
 /// one `full_attention` layer — plus the declared-but-unexecuted hybrid
 /// linear-attention / MTP / mRoPE fields a real Qwen3.5 `config.json`
 /// carries alongside it.
-fn hybrid_findings() -> Vec<Finding> {
+fn hybrid_findings() -> Vec<PlannedFinding> {
     let dir = tempfile::tempdir().unwrap();
     let inventory = glimmer_shaped_target_with(dir.path(), |config| {
-        let layer_types: Vec<&str> = (0..FIXTURE_LAYERS)
-            .map(|i| {
-                if i % 4 == 3 {
-                    "full_attention"
-                } else {
-                    "linear_attention"
-                }
-            })
-            .collect();
-        config["text_config"]["layer_types"] = serde_json::json!(layer_types);
-        config["text_config"]["full_attention_interval"] = serde_json::json!(4);
-        config["text_config"]["linear_conv_kernel_dim"] = serde_json::json!(4);
-        config["text_config"]["linear_key_head_dim"] = serde_json::json!(16);
-        config["text_config"]["linear_value_head_dim"] = serde_json::json!(16);
-        config["text_config"]["linear_num_key_heads"] = serde_json::json!(2);
-        config["text_config"]["linear_num_value_heads"] = serde_json::json!(4);
-        config["text_config"]["mamba_ssm_dtype"] = serde_json::json!("float32");
+        declare_hybrid_cadence(config);
+        declare_gated_delta_geometry(config);
         config["text_config"]["attn_output_gate"] = serde_json::json!(true);
         config["text_config"]["output_gate_type"] = serde_json::json!("swish");
         config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
@@ -55,7 +43,7 @@ fn hybrid_findings() -> Vec<Finding> {
         .collect()
 }
 
-fn finding_for<'a>(findings: &'a [Finding], suffix: &str) -> &'a Finding {
+fn finding_for<'a>(findings: &'a [PlannedFinding], suffix: &str) -> &'a PlannedFinding {
     findings
         .iter()
         .find(|f| f.subject.ends_with(suffix))
@@ -81,7 +69,7 @@ fn finding_for<'a>(findings: &'a [Finding], suffix: &str) -> &'a Finding {
 #[test]
 fn a_declared_linear_attention_interleave_is_carried_on_both_findings() {
     let findings = hybrid_findings();
-    let layer_types_findings: Vec<&Finding> = findings
+    let layer_types_findings: Vec<&PlannedFinding> = findings
         .iter()
         .filter(|f| f.subject == "text_config.layer_types")
         .collect();
@@ -149,12 +137,12 @@ fn an_unrecognised_spelling_still_blocks_on_both_findings() {
             .collect();
         config["text_config"]["layer_types"] = serde_json::json!(layer_types);
     });
-    let findings: Vec<Finding> = plan_system(&[("target-artifact".to_string(), inventory)])
+    let findings: Vec<PlannedFinding> = plan_system(&[("target-artifact".to_string(), inventory)])
         .artifacts
         .into_iter()
         .flat_map(|a| a.findings)
         .collect();
-    let layer_types_findings: Vec<&Finding> = findings
+    let layer_types_findings: Vec<&PlannedFinding> = findings
         .iter()
         .filter(|f| f.subject == "text_config.layer_types")
         .collect();
@@ -185,17 +173,11 @@ fn the_declared_cadence_is_carried_into_the_graph_layer_by_layer() {
 
     let dir = tempfile::tempdir().unwrap();
     let inventory = glimmer_shaped_target_with(dir.path(), |config| {
-        let layer_types: Vec<&str> = (0..FIXTURE_LAYERS)
-            .map(|i| {
-                if i % 4 == 3 {
-                    "full_attention"
-                } else {
-                    "linear_attention"
-                }
-            })
-            .collect();
-        config["text_config"]["layer_types"] = serde_json::json!(layer_types);
-        config["text_config"]["full_attention_interval"] = serde_json::json!(4);
+        declare_hybrid_cadence(config);
+        // Required for the layers to grade `GatedDelta` at all — without
+        // it they are an *unidentified* recurrence, which is what
+        // `an_unidentified_recurrence_is_never_graded_gated_delta` pins.
+        declare_gated_delta_geometry(config);
     });
     let built = build_from_inventories(&[("target-artifact".to_string(), inventory)]);
     let table = built
@@ -424,7 +406,7 @@ fn full_attention_interval_is_a_non_blocking_alias() {
 /// is always emitted is one this assertion could never fail on.
 #[test]
 fn attention_policy_summary_counts_a_recurrence_and_reserves_the_disclosure() {
-    let summary_for = |findings: &[Finding]| {
+    let summary_for = |findings: &[PlannedFinding]| {
         findings
             .iter()
             .find(|f| f.subject == "attention_policy")
@@ -452,7 +434,7 @@ fn attention_policy_summary_counts_a_recurrence_and_reserves_the_disclosure() {
         config["text_config"]["layer_types"] =
             serde_json::json!(vec!["hyena_attention"; FIXTURE_LAYERS]);
     });
-    let unknown: Vec<Finding> = plan_system(&[("target-artifact".to_string(), inventory)])
+    let unknown: Vec<PlannedFinding> = plan_system(&[("target-artifact".to_string(), inventory)])
         .artifacts
         .into_iter()
         .flat_map(|a| a.findings)
@@ -481,6 +463,58 @@ fn the_rotary_facts_are_carried_into_the_position_policy() {
     let findings = hybrid_findings();
     for subject in [
         "text_config.partial_rotary_factor",
+        "text_config.rope_parameters.mrope_section",
+        "text_config.rope_parameters.mrope_interleaved",
+    ] {
+        let finding = finding_for(&findings, subject);
+        assert_eq!(
+            finding.category,
+            FindingCategory::Representable,
+            "{subject}: {}",
+            finding.detail
+        );
+        assert!(!finding.blocks(), "{subject}");
+    }
+}
+
+/// **The real Qwen3.5 shape: the fraction is declared under
+/// `rope_parameters` only, and it must still lower — with its mrope.**
+///
+/// `hybrid_findings` mirrors Qwen3.8, which writes the fraction at both
+/// spots. Every Qwen3.5 checkpoint (0.8B through 397B-A17B) writes only
+/// the nested one, and until wave 8 the parser read only the flat one:
+/// no layer carried a rotary fraction, `probe_partial_rotary_factor` and
+/// `mrope_of` both answered `None`, and three leaves refused a family
+/// whose text path this build executes. The reference reads the nested
+/// spelling (`rope_parameters_dict.get("partial_rotary_factor", 1.0)`),
+/// so this is a carriage gap on the parser side of the boundary, not a
+/// new position policy.
+#[test]
+fn the_nested_only_partial_rotary_spelling_lowers_with_its_mrope() {
+    let dir = tempfile::tempdir().unwrap();
+    let inventory = glimmer_shaped_target_with(dir.path(), |config| {
+        declare_hybrid_cadence(config);
+        declare_gated_delta_geometry(config);
+        config["text_config"]["attn_output_gate"] = serde_json::json!(true);
+        config["text_config"]["output_gate_type"] = serde_json::json!("swish");
+        // Same closing geometry as `hybrid_findings`, nested spelling only.
+        config["text_config"]["rope_parameters"]["partial_rotary_factor"] = serde_json::json!(0.5);
+        config["text_config"]["rope_parameters"]["mrope_interleaved"] = serde_json::json!(true);
+        config["text_config"]["rope_parameters"]["mrope_section"] = serde_json::json!([1, 1, 0]);
+    });
+    let findings: Vec<PlannedFinding> = plan_system(&[("target-artifact".to_string(), inventory)])
+        .artifacts
+        .into_iter()
+        .flat_map(|a| a.findings)
+        .collect();
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.subject == "text_config.partial_rotary_factor"),
+        "the fixture must not declare the flat spelling, or it proves nothing"
+    );
+    for subject in [
+        "text_config.rope_parameters.partial_rotary_factor",
         "text_config.rope_parameters.mrope_section",
         "text_config.rope_parameters.mrope_interleaved",
     ] {
@@ -548,7 +582,7 @@ fn a_section_that_does_not_close_the_arithmetic_blocks() {
         // fraction gives 4.
         config["text_config"]["rope_parameters"]["mrope_section"] = serde_json::json!([1, 1, 1]);
     });
-    let findings: Vec<Finding> = plan_system(&[("target-artifact".to_string(), inventory)])
+    let findings: Vec<PlannedFinding> = plan_system(&[("target-artifact".to_string(), inventory)])
         .artifacts
         .into_iter()
         .flat_map(|a| a.findings)
